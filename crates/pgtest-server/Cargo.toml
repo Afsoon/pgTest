@@ -1,0 +1,11 @@
+[package]
+name = "pgtest-server"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+envconfig = { workspace = true }
+pgtest-core = { path = "../pgtest-core"}

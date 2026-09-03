@@ -1,0 +1,19 @@
+[package]
+name = "pgtest-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "pgtest"
+
+
+[lints]
+workspace = true
+
+[dependencies]
+sqlx = { version = "=0.9.0", features = ["postgres", "runtime-tokio"] }
+rand = "0.10.2"
+envconfig = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

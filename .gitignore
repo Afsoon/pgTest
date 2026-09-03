@@ -1,0 +1,17 @@
+*
+
+# common files between crates and root directory
+!.gitignore
+!.gitattributes
+!justfile
+!Cargo.toml
+!Cargo.lock
+!README.md
+!rustfmt.toml
+!compose.yaml
+
+
+# allowlist `crates` directories and their children, regardless of place
+!crates/
+!crates/**/
+!crates/**/*.rs
