@@ -1,0 +1,11 @@
+[package]
+name = "pgtest-container"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+testcontainers = { version = "0.28.0", default-features = false }
+
+
+[lints]
+workspace = true

@@ -9,6 +9,7 @@ services:
       POSTGRES_USER: trust
       POSTGRES_PASSWORD: trust
       POSTGRES_DB: pgtest
+      POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - pgtest-data:/var/lib/postgresql
     healthcheck:

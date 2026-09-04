@@ -9,7 +9,9 @@
 !README.md
 !rustfmt.toml
 !compose.yaml
-
+!.cargo/
+!.cargo/config.toml
+!rust-toolchain.toml
 
 # allowlist `crates` directories and their children, regardless of place
 !crates/

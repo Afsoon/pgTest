@@ -28,3 +28,7 @@ doc:
 # Run this crate's binary, passing any extra arguments through
 run *ARGS:
     cargo run -p {{crate}} -- {{ARGS}}
+
+# Run against local PostgreSQL with the metered user and template database
+run-metered host="127.0.0.1" user="metered" template="metered" port="5432":
+    PGTEST_PG_HOST={{quote(host)}} PGTEST_PG_USER={{quote(user)}} PGTEST_PG_DATABASE={{quote(template)}} PGTEST_PG_PORT={{quote(port)}} cargo run -p {{crate}}

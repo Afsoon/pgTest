@@ -24,9 +24,10 @@ build:
 clean:
     cargo clean
 
-# Run cargo test on the workspace members
+# Run cargo test on the workspace members (both id-generation modes)
 test:
     cargo test --workspace
+    cargo test -p pgtest-core --features stable_ids
 
 # Start the development postgres container (waits until healthy)
 db-up:

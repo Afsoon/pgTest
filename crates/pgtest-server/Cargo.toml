@@ -7,5 +7,10 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 envconfig = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 pgtest-core = { path = "../pgtest-core"}
+pgtest-wire = { path = "../pgtest-wire"}

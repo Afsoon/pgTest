@@ -1,30 +1,39 @@
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow, ensure};
 use envconfig::Envconfig;
-use pgtest::postgres_manager::{PostgresConfig, PostgresManager};
+use pgtest::{
+    postgres_manager::PostgresConfig, worker_engine::core::WorkerEngineConfig,
+    worker_manager::WorkerEngineManager,
+};
+use pgtest_pg_wire::wire_listener::WireListener;
+use tracing_subscriber::EnvFilter;
 
-#[derive(Envconfig, Debug)]
-struct Config {
-    #[envconfig(from = "PGTEST_WIRE_PORT", default = "2345")]
-    pub pgtest_wire_port: u16,
-    #[envconfig(from = "PGTEST_INITIAL_POOL_SIZE", default = "16")]
-    pub pgtest_initial_pool_size: u16,
-    #[envconfig(from = "PGTEST_MAXIMUM_POOL_SIZE", default = "96")]
-    pub pgtest_maximum_pool_size: u16,
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
-    #[envconfig(nested)]
-    db_config: PostgresConfig,
-}
+    let postgres_config =
+        PostgresConfig::init_from_env().context("invalid PostgreSQL configuration")?;
+    let worker_engine_config =
+        WorkerEngineConfig::init_from_env().context("invalid worker engine configuration")?;
+    ensure!(
+        worker_engine_config.initial_slots <= worker_engine_config.maximum_slots,
+        "initial pool size must not exceed maximum pool size"
+    );
 
-fn main() {
-    let config = match Config::init_from_env() {
-        Ok(config_resolved) => config_resolved,
-        Err(config_error) => {
-            eprint!("error parrsing config {config_error}");
-            // TODO: Nice log using tracing
-            panic!("Invalid config provided")
-        }
-    };
+    let engine =
+        Arc::new(WorkerEngineManager::start(postgres_config, worker_engine_config).await.map_err(
+            |()| anyhow!("failed to start worker engine manager; see logs for details"),
+        )?);
+    let address = WireListener::run(engine).await.context("failed to start wire listener")?;
+    tracing::info!(%address, "pgtest server listening");
 
-    let postgres_client = PostgresManager::start(&config_unwrapped.db_config).await;
-
-    println!("Hello, world!");
+    tokio::signal::ctrl_c().await.context("failed to wait for Ctrl-C")?;
+    tracing::info!("Stopping pgtest server");
+    Ok(())
 }
