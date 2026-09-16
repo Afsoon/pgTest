@@ -2,6 +2,40 @@ use thiserror::Error;
 
 use crate::worker_engine::core::{LeaseId, SlotIdx};
 
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseError {
+    #[error("lease ID must contain 1 to 256 UTF-8 bytes and cannot contain '/' or NUL")]
+    InvalidLeaseId,
+    #[error("the lease record limit has been reached")]
+    LeaseRecordLimitReached,
+    #[error("the worker engine is unavailable")]
+    EngineUnavailable,
+    #[error("release acknowledgement timed out; retrying the same lease ID is safe")]
+    ReplyTimedOut,
+    #[error("the worker engine returned an unexpected release reply")]
+    UnexpectedReply,
+    #[error("the lease references an invalid database slot")]
+    InvalidSlot,
+}
+
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum AttachError {
+    #[error("invalid lease ID")]
+    InvalidLeaseId,
+    #[error("the lease record limit has been reached")]
+    LeaseRecordLimitReached,
+    #[error("the lease has been released")]
+    LeaseClosed,
+    #[error("database does not match the configured template")]
+    TemplateMismatch,
+    #[error("the worker engine is unavailable")]
+    EngineUnavailable,
+    #[error("timed out waiting for a database")]
+    TimedOut,
+    #[error("the worker engine could not attach this lease")]
+    Failed,
+}
+
 #[derive(Error, Debug)]
 pub enum LeaseSlotError {
     #[error("worker slot {0} is not initialized")]
@@ -20,18 +54,6 @@ pub enum OfferTemplateError {
 pub enum ForceRecycleError {
     #[error("no lease registered for id {0}")]
     UnknownLease(LeaseId),
-    #[error("worker slot {0} is not initialized")]
-    WorkerSlotNotInitialized(SlotIdx),
-    #[error("lost connectivity with the postgres server")]
-    DatabaseIsDown,
-}
-
-#[derive(Error, Debug)]
-pub enum RecycleError {
-    #[error("no lease registered for id {0}")]
-    UnknownLease(LeaseId),
-    #[error("lease {0} still has open connections")]
-    ConnectionNotClosedYet(LeaseId),
     #[error("worker slot {0} is not initialized")]
     WorkerSlotNotInitialized(SlotIdx),
     #[error("lost connectivity with the postgres server")]

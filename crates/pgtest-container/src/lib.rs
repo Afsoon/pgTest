@@ -146,6 +146,8 @@ impl Image for Postgres {
         vec![
             "postgres",
             "-c",
+            "file_copy_method=clone",
+            "-c",
             "fsync=off",
             "-c",
             "synchronous_commit=off",

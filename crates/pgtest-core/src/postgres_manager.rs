@@ -246,6 +246,7 @@ impl PostgresDatabaseName {
     }
 }
 
+#[hotpath::measure_all]
 impl PostgresClient for PostgresManager {
     async fn drop_database(&self, database_name: &str) -> Result<(), PostgresDDLClientError> {
         let retry_strategy = ExponentialFactorBackoff::from_millis(250, 1.0).map(jitter).take(3);
@@ -321,6 +322,7 @@ impl PostgresClient for PostgresManager {
     }
 }
 
+#[hotpath::measure_all]
 impl PostgresManager {
     pub async fn start(
         postgres_config: PostgresConfig,
@@ -406,10 +408,18 @@ impl PostgresManager {
         database_name: &str,
     ) -> Result<(), RetryError<PostgresOperationsError>> {
         let quoted_database_name = PostgresDatabaseName::quote_ident(database_name);
-        let mut query: QueryBuilder<Postgres> =
-            sqlx::QueryBuilder::new(format!("DROP DATABASE {quoted_database_name} WITH (FORCE)"));
+        let mut query: QueryBuilder<Postgres> = sqlx::QueryBuilder::new(format!(
+            "DROP DATABASE IF EXISTS {quoted_database_name} WITH (FORCE)"
+        ));
 
-        match sqlx::query(query.build().sql()).execute(&self.pg).await.map_err(|error| {
+        let result = async {
+            let mut connection = self.acquire_drop_connection().await?;
+            sqlx::query(query.build().sql()).execute(&mut *connection).await
+        }
+        .await;
+
+        match result.map_err(|error| {
+            tracing::warn!(database_name, error = ?error, "PostgreSQL DROP DATABASE failed");
             PostgresOperationsError::classify_drop(database_name.to_string(), error)
         }) {
             Ok(_) => Ok(()),
@@ -458,11 +468,32 @@ impl PostgresManager {
             query.push(format!(" STRATEGY=FILE_COPY"));
         };
 
-        sqlx::query(query.build().sql()).execute(&self.pg).await.map_err(|error| {
+        let result = async {
+            let mut connection = self.acquire_create_connection().await?;
+            sqlx::query(query.build().sql()).execute(&mut *connection).await
+        }
+        .await;
+
+        result.map_err(|error| {
             PostgresOperationsError::classify_create(database_name.clone(), error)
         })?;
 
         Ok(ReadString::from(database_name))
+    }
+
+    // Separate acquisition timings from SQLx's query timings, which start after
+    // a connection has been acquired. Keep create/drop separate to compare
+    // waits.
+    async fn acquire_create_connection(
+        &self,
+    ) -> Result<sqlx::pool::PoolConnection<Postgres>, sqlx::Error> {
+        self.pg.acquire().await
+    }
+
+    async fn acquire_drop_connection(
+        &self,
+    ) -> Result<sqlx::pool::PoolConnection<Postgres>, sqlx::Error> {
+        self.pg.acquire().await
     }
 }
 
@@ -487,6 +518,9 @@ mod postgres_manager_test {
         let now_drop = Instant::now();
         manager.drop_ddl_database(&database_name).await.unwrap();
         println!("Drop time {:.2?}", now_drop.elapsed());
+
+        // A cleanup retry may follow a lost response to a successful DROP.
+        manager.drop_ddl_database(&database_name).await.unwrap();
     }
 
     #[test]

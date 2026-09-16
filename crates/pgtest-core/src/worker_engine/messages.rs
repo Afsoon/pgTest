@@ -1,10 +1,12 @@
 use std::time::Instant;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     utils::ReadString,
     worker_engine::{
         core::{LeaseId, SlotIdx},
-        errors::PostgresDDLClientError,
+        errors::{AttachError, PostgresDDLClientError, ReleaseError},
         traits::ConsumerIO,
     },
 };
@@ -16,21 +18,25 @@ pub enum EngineMessage<C: ConsumerIO> {
         reply: C,
         message_time: Instant,
     },
+    ReleaseLease {
+        lease: LeaseId,
+        reply: C,
+    },
     TemplateCreated {
         index: SlotIdx,
         result: Result<ReadString, PostgresDDLClientError>,
     },
     Detach {
         lease: LeaseId,
-    },
-    GraceExpired {
-        lease: LeaseId,
+        generation: u64,
     },
     LeaseMaxTimeReached {
         lease: LeaseId,
+        generation: u64,
     },
     DeleteLease {
         lease: LeaseId,
+        generation: u64,
     },
     RetryDatabaseCreation {
         index: SlotIdx,
@@ -45,8 +51,10 @@ pub enum EngineMessage<C: ConsumerIO> {
 
 #[cfg_attr(test, derive(Clone, Debug))]
 pub enum ConsumerReply {
-    Attached { database_name: ReadString },
+    Attached { database_name: ReadString, generation: u64, cancellation: CancellationToken },
     FailedToAttach,
+    AttachRejected(AttachError),
+    ReleaseResult(Result<(), ReleaseError>),
 }
 
 pub enum EngineMetricMessage {}

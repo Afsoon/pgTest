@@ -7,6 +7,8 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+mimalloc = "0.1.52"
+hotpath = { workspace = true, features = ["sqlx"] }
 anyhow = { workspace = true }
 envconfig = { workspace = true }
 tokio = { workspace = true }
@@ -14,3 +16,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 pgtest-core = { path = "../pgtest-core"}
 pgtest-wire = { path = "../pgtest-wire"}
+
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "pgtest-core/hotpath", "pgtest-wire/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc", "pgtest-core/hotpath-alloc", "pgtest-wire/hotpath-alloc"]
+hotpath-prometheus = ["hotpath/hotpath-prometheus", "pgtest-core/hotpath-prometheus", "pgtest-wire/hotpath-prometheus"]

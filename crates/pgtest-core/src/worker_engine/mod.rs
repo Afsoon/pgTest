@@ -7,6 +7,9 @@ pub mod traits;
 mod test_support;
 
 #[cfg(all(test, feature = "stable_ids"))]
+mod burst_tests;
+
+#[cfg(all(test, feature = "stable_ids"))]
 mod worker_engine_test {
 
     use std::{
@@ -16,7 +19,7 @@ mod worker_engine_test {
 
     use super::test_support::*;
     use crate::worker_engine::{
-        core::{LeaseId, PoolCapacity, Slot, WorkerEngineConfig},
+        core::{LeaseId, Slot, WorkerEngineConfig},
         messages::{ConsumerReply, EngineMessage},
     };
 
@@ -37,13 +40,13 @@ mod worker_engine_test {
 
         let mut messages_received = consumer_io.messages();
 
-        let ConsumerReply::Attached { database_name: attached_database_name } =
+        let ConsumerReply::Attached { database_name: attached_database_name, .. } =
             messages_received.pop_front().unwrap()
         else {
             panic!("Unexpected response 1");
         };
 
-        let EngineOutcome { slots, leases, capacity, .. } = outcome;
+        let EngineOutcome { slots, leases, ready_slots, .. } = outcome;
 
         let worker_lease_information = leases.get(&connection_name).unwrap();
         let Slot::Leased { db_name, lease } = slots.get(worker_lease_information.slot_idx).unwrap()
@@ -53,7 +56,7 @@ mod worker_engine_test {
 
         assert_eq!(*db_name, attached_database_name);
         assert_eq!(*lease, connection_name);
-        assert_eq!(capacity.free_slots, 3);
+        assert_eq!(ready_slots.len(), 3);
     }
 
     #[tokio::test]
@@ -85,9 +88,9 @@ mod worker_engine_test {
 
         let outcome = EngineSimulator::run(messages).await.unwrap();
 
-        let EngineOutcome { capacity, .. } = outcome;
+        let EngineOutcome { ready_slots, .. } = outcome;
 
-        assert_eq!(capacity.free_slots, 9);
+        assert_eq!(ready_slots.len(), 5);
     }
 
     #[tokio::test]
@@ -114,7 +117,7 @@ mod worker_engine_test {
 
         let mut messages_received = consumer_io.messages();
 
-        let ConsumerReply::Attached { database_name: first_database_name } =
+        let ConsumerReply::Attached { database_name: first_database_name, .. } =
             messages_received.pop_front().unwrap()
         else {
             panic!("Expected Attached for the first attach");
@@ -122,20 +125,20 @@ mod worker_engine_test {
 
         assert_eq!(first_database_name, db(1));
 
-        let ConsumerReply::Attached { database_name: join_database_name } =
+        let ConsumerReply::Attached { database_name: join_database_name, .. } =
             messages_received.pop_front().unwrap()
         else {
             panic!("Expected Attached for the join");
         };
         assert_eq!(join_database_name, first_database_name);
 
-        let EngineOutcome { slots, leases, capacity, waiters, counters: _ } = outcome;
+        let EngineOutcome { slots, leases, ready_slots, waiters, counters: _, .. } = outcome;
 
         assert_eq!(leases.get(&connection_name).unwrap().conns, 2);
 
         let leased_slots = slots.iter().filter(|slot| matches!(slot, Slot::Leased { .. })).count();
         assert_eq!(leased_slots, 1);
-        assert_eq!(capacity.free_slots, 3);
+        assert_eq!(ready_slots.len(), 3);
         assert!(waiters.is_empty());
     }
 
@@ -157,12 +160,12 @@ mod worker_engine_test {
                 reply: consumer_io.clone(),
                 message_time: std::time::Instant::now(),
             },
-            EngineMessage::Detach { lease: connection_name.clone() },
+            EngineMessage::Detach { lease: connection_name.clone(), generation: 1 },
         ];
 
         let outcome = EngineSimulator::run(messages).await.unwrap();
 
-        let EngineOutcome { slots, leases, capacity, waiters: _, counters } = outcome;
+        let EngineOutcome { slots, leases, ready_slots, waiters: _, counters, .. } = outcome;
 
         let lease_entry = leases.get(&connection_name).unwrap();
         assert_eq!(lease_entry.conns, 1);
@@ -171,7 +174,7 @@ mod worker_engine_test {
             panic!("Slot must stay Leased while connections remain");
         };
         assert_eq!(*lease, connection_name);
-        assert_eq!(capacity.free_slots, 3);
+        assert_eq!(ready_slots.len(), 3);
         assert_eq!(counters.detach_on_zero, 0);
     }
 
@@ -188,49 +191,19 @@ mod worker_engine_test {
                 reply: consumer_io.clone(),
                 message_time: std::time::Instant::now(),
             },
-            EngineMessage::Detach { lease: connection_name.clone() },
-            EngineMessage::Detach { lease: connection_name.clone() },
+            EngineMessage::Detach { lease: connection_name.clone(), generation: 1 },
+            EngineMessage::Detach { lease: connection_name.clone(), generation: 1 },
         ];
 
         let outcome = EngineSimulator::run(messages).await.unwrap();
 
-        let EngineOutcome { slots, leases, capacity: _, waiters: _, counters } = outcome;
+        let EngineOutcome { slots, leases, capacity: _, waiters: _, counters, .. } = outcome;
 
         let lease_entry = leases.get(&connection_name).unwrap();
         assert_eq!(lease_entry.conns, 0);
 
         assert!(matches!(slots.get(lease_entry.slot_idx).unwrap(), Slot::Leased { .. }));
         assert_eq!(counters.detach_on_zero, 1);
-    }
-
-    #[tokio::test]
-    async fn attach_after_grace_recycle_rejected() {
-        let consumer_buffer: Arc<std::sync::Mutex<VecDeque<ConsumerReply>>> =
-            Arc::from(Mutex::new(VecDeque::new()));
-        let connection_name = LeaseId::from("connection1");
-        let consumer_io = ConsumerWorker::new(consumer_buffer.clone());
-
-        let messages = vec![
-            EngineMessage::AttachOrJoin {
-                lease: connection_name.clone(),
-                reply: consumer_io.clone(),
-                message_time: std::time::Instant::now(),
-            },
-            EngineMessage::Detach { lease: connection_name.clone() },
-            EngineMessage::GraceExpired { lease: connection_name.clone() },
-            EngineMessage::AttachOrJoin {
-                lease: connection_name.clone(),
-                reply: consumer_io.clone(),
-                message_time: std::time::Instant::now(),
-            },
-        ];
-
-        let EngineOutcome { counters, leases, slots, .. } =
-            EngineSimulator::run(messages).await.unwrap();
-
-        assert!(!leases.contains_key(&connection_name));
-        assert!(slots.iter().all(|slot| !matches!(slot, Slot::Leased { .. })));
-        assert_eq!(counters.rejected_attach_grace_expired, 1);
     }
 
     #[tokio::test]
@@ -274,7 +247,8 @@ mod worker_engine_test {
         let mut messages_received = consumer_io.messages();
 
         for expected in 1..=4 {
-            let ConsumerReply::Attached { database_name } = messages_received.pop_front().unwrap()
+            let ConsumerReply::Attached { database_name, .. } =
+                messages_received.pop_front().unwrap()
             else {
                 panic!("Expected Attached for initial claim {expected}");
             };
@@ -282,7 +256,7 @@ mod worker_engine_test {
             assert_eq!(database_name, db(expected));
         }
 
-        let ConsumerReply::Attached { database_name: waiter_database_name } =
+        let ConsumerReply::Attached { database_name: waiter_database_name, .. } =
             messages_received.pop_front().unwrap()
         else {
             panic!("Expected the parked claim to be fulfilled by TemplateCreated");
@@ -290,7 +264,7 @@ mod worker_engine_test {
 
         assert_eq!(waiter_database_name, db(5));
 
-        let EngineOutcome { slots: _, leases, capacity: _, waiters, counters: _ } = outcome;
+        let EngineOutcome { slots: _, leases, capacity: _, waiters, counters: _, .. } = outcome;
 
         assert!(waiters.is_empty());
         assert!(leases.contains_key(&waiting_connection));
@@ -344,9 +318,9 @@ mod worker_engine_test {
 
         let mut messages_received = consumer_io.messages();
 
-        let EngineOutcome { slots: _, leases, capacity: _, waiters, counters } = outcome;
+        let EngineOutcome { slots: _, leases, capacity: _, waiters, counters, .. } = outcome;
 
-        let ConsumerReply::Attached { database_name: survivor_database_name } =
+        let ConsumerReply::Attached { database_name: survivor_database_name, .. } =
             messages_received.pop_back().unwrap()
         else {
             panic!("Expected Attached for the surviving waiter");
@@ -405,7 +379,7 @@ mod worker_engine_test {
 
         let outcome = EngineSimulator::run(messages).await.unwrap();
 
-        let EngineOutcome { slots, leases, capacity: _, waiters, counters } = outcome;
+        let EngineOutcome { slots, leases, capacity: _, waiters, counters, .. } = outcome;
 
         assert!(!leases.contains_key(&waiter_a));
         assert!(!leases.contains_key(&waiter_b));
@@ -430,7 +404,7 @@ mod worker_engine_test {
                 reply: consumer_io.clone(),
                 message_time: std::time::Instant::now(),
             },
-            EngineMessage::LeaseMaxTimeReached { lease: connection_name.clone() },
+            EngineMessage::LeaseMaxTimeReached { lease: connection_name.clone(), generation: 1 },
             EngineMessage::AttachOrJoin {
                 lease: connection_name.clone(),
                 reply: consumer_io.clone(),
@@ -463,7 +437,7 @@ mod worker_engine_test {
                 reply: consumer_io.clone(),
                 message_time: std::time::Instant::now(),
             },
-            EngineMessage::Detach { lease: connection_name.clone() },
+            EngineMessage::Detach { lease: connection_name.clone(), generation: 1 },
         ];
 
         let _ = EngineSimulator::run(messages).await;
@@ -473,45 +447,37 @@ mod worker_engine_test {
         // Only the pre-shutdown attach was answered; everything after is
         // discarded.
         assert_eq!(messages_received.len(), 1);
-        let ConsumerReply::Attached { database_name: _ } = messages_received.pop_front().unwrap()
+        let ConsumerReply::Attached { database_name: _, .. } =
+            messages_received.pop_front().unwrap()
         else {
             panic!("Expected the single pre-shutdown reply to be Attached");
         };
     }
 
-    /// The race the cancellation-token design must survive: a GraceExpired
-    /// message already in flight when the lease was re-attached must be a
-    /// no-op.
     #[tokio::test]
-    async fn stale_grace_expired_ignored() {
-        let consumer_buffer: Arc<std::sync::Mutex<VecDeque<ConsumerReply>>> =
-            Arc::from(Mutex::new(VecDeque::new()));
-        let connection_name = LeaseId::from("connection1");
-        let consumer_io = ConsumerWorker::new(consumer_buffer.clone());
-
-        let messages = vec![
+    async fn duplicate_recycle_messages_create_only_one_replacement() {
+        let consumer = ConsumerWorker::new(Arc::new(Mutex::new(VecDeque::new())));
+        let lease = LeaseId::from("recycled");
+        // Both expiry messages arrive before the background DDL completion.
+        let outcome = EngineSimulator::run(vec![
             EngineMessage::AttachOrJoin {
-                lease: connection_name.clone(),
-                reply: consumer_io.clone(),
+                lease: lease.clone(),
+                reply: consumer,
                 message_time: std::time::Instant::now(),
             },
-            EngineMessage::Detach { lease: connection_name.clone() },
-            EngineMessage::AttachOrJoin {
-                lease: connection_name.clone(),
-                reply: consumer_io.clone(),
-                message_time: std::time::Instant::now(),
-            },
-            EngineMessage::GraceExpired { lease: connection_name.clone() },
-        ];
+            EngineMessage::Detach { lease: lease.clone(), generation: 1 },
+            EngineMessage::LeaseMaxTimeReached { lease: lease.clone(), generation: 1 },
+            EngineMessage::LeaseMaxTimeReached { lease, generation: 1 },
+        ])
+        .await
+        .unwrap();
 
-        let outcome = EngineSimulator::run(messages).await.unwrap();
-
-        let EngineOutcome { slots, leases, capacity: _, waiters: _, counters } = outcome;
-
-        let lease_entry = leases.get(&connection_name).unwrap();
-        assert_eq!(lease_entry.conns, 1);
-        assert!(matches!(slots.get(lease_entry.slot_idx).unwrap(), Slot::Leased { .. }));
-        assert_eq!(counters.rejected_attach_grace_expired, 0);
+        assert!(outcome.leases.is_empty());
+        assert!(
+            matches!(&outcome.slots[0], Slot::Ready { db_name } if *db_name == db(5)),
+            "duplicate expiry must not create a second replacement"
+        );
+        assert_eq!(outcome.ready_slots.len(), 4);
     }
 
     #[tokio::test]
@@ -564,7 +530,7 @@ mod worker_engine_test {
         .await
         .unwrap();
 
-        let EngineOutcome { slots: _, leases, capacity: _, waiters, counters } = outcome;
+        let EngineOutcome { slots: _, leases, capacity: _, waiters, counters, .. } = outcome;
 
         assert!(!leases.contains_key(&waiting_connection));
         assert_eq!(waiters, vec![waiting_connection]);
@@ -577,36 +543,17 @@ mod worker_engine_test {
             Arc::from(Mutex::new(VecDeque::new()));
         let consumer_io = ConsumerWorker::new(consumer_buffer.clone());
 
-        let messages = vec![EngineMessage::Detach { lease: LeaseId::from("ghost") }];
+        let messages = vec![EngineMessage::Detach { lease: LeaseId::from("ghost"), generation: 1 }];
 
         let outcome = EngineSimulator::run(messages).await.unwrap();
 
         let messages_received = consumer_io.messages();
         assert_eq!(messages_received.len(), 0);
 
-        let EngineOutcome { slots: _, leases, capacity, waiters: _, counters: _ } = outcome;
+        let EngineOutcome { slots: _, leases, ready_slots, waiters: _, counters: _, .. } = outcome;
 
         assert!(leases.is_empty());
-        assert_eq!(capacity.free_slots, 4);
-    }
-
-    #[tokio::test]
-    async fn grace_expired_unknown_lease_ignored() {
-        let consumer_buffer: Arc<std::sync::Mutex<VecDeque<ConsumerReply>>> =
-            Arc::from(Mutex::new(VecDeque::new()));
-        let consumer_io = ConsumerWorker::new(consumer_buffer.clone());
-
-        let messages = vec![EngineMessage::GraceExpired { lease: LeaseId::from("ghost") }];
-
-        let outcome = EngineSimulator::run(messages).await.unwrap();
-
-        let messages_received = consumer_io.messages();
-        assert_eq!(messages_received.len(), 0);
-
-        let EngineOutcome { slots: _, leases, capacity, waiters: _, counters: _ } = outcome;
-
-        assert!(leases.is_empty());
-        assert_eq!(capacity.free_slots, 4);
+        assert_eq!(ready_slots.len(), 4);
     }
 
     #[tokio::test]
@@ -656,26 +603,27 @@ mod worker_engine_test {
         let mut messages_received = consumer_io.messages();
 
         for expected in 1..=4 {
-            let ConsumerReply::Attached { database_name } = messages_received.pop_front().unwrap()
+            let ConsumerReply::Attached { database_name, .. } =
+                messages_received.pop_front().unwrap()
             else {
                 panic!("Expected Attached for initial claim {expected}");
             };
             assert_eq!(database_name, db(expected));
         }
 
-        let ConsumerReply::Attached { database_name } = messages_received.pop_front().unwrap()
+        let ConsumerReply::Attached { database_name, .. } = messages_received.pop_front().unwrap()
         else {
             panic!("Expected Attached for the first waiter");
         };
         assert_eq!(database_name, db(5));
 
-        let ConsumerReply::Attached { database_name } = messages_received.pop_front().unwrap()
+        let ConsumerReply::Attached { database_name, .. } = messages_received.pop_front().unwrap()
         else {
             panic!("Expected Attached for the joining waiter");
         };
         assert_eq!(database_name, db(5));
 
-        let EngineOutcome { slots, leases, capacity: _, waiters, counters: _ } = outcome;
+        let EngineOutcome { slots, leases, capacity: _, waiters, counters: _, .. } = outcome;
 
         assert_eq!(leases.get(&waiting_connection).unwrap().conns, 2);
         assert!(
@@ -738,32 +686,25 @@ mod worker_engine_test {
         let mut messages_received = consumer_io.messages();
 
         for expected in 1..=4 {
-            let ConsumerReply::Attached { database_name } = messages_received.pop_front().unwrap()
+            let ConsumerReply::Attached { database_name, .. } =
+                messages_received.pop_front().unwrap()
             else {
                 panic!("Expected Attached for initial claim {expected}");
             };
             assert_eq!(database_name, db(expected));
         }
 
-        let ConsumerReply::Attached { database_name } = messages_received.pop_front().unwrap()
+        let ConsumerReply::Attached { database_name, .. } = messages_received.pop_front().unwrap()
         else {
             panic!("Expected Attached for the first waiter only");
         };
         assert_eq!(database_name, db(5));
 
-        let EngineOutcome { slots: _, leases, capacity: _, waiters, counters: _ } = outcome;
+        let EngineOutcome { slots: _, leases, capacity: _, waiters, counters: _, .. } = outcome;
 
         assert!(leases.contains_key(&first_waiter));
         assert!(!leases.contains_key(&second_waiter));
         assert_eq!(waiters, vec![second_waiter]);
-    }
-
-    #[test]
-    fn pool_free_slots_saturates_at_zero() {
-        let mut capacity = PoolCapacity::new(WorkerEngineConfig::default());
-        capacity.free_slots = 0;
-        capacity.occupy_slot();
-        assert_eq!(capacity.free_slots, 0);
     }
 
     #[tokio::test]
@@ -792,7 +733,7 @@ mod worker_engine_test {
 
         let outcome = EngineSimulator::run(messages).await.unwrap();
 
-        let EngineOutcome { slots, leases: _, capacity, waiters: _, counters: _ } = outcome;
+        let EngineOutcome { slots, leases: _, capacity, waiters: _, counters: _, .. } = outcome;
 
         let ready_slots: Vec<usize> = slots
             .iter()
@@ -868,7 +809,8 @@ mod worker_engine_test {
         assert_eq!(messages_received.len(), 6);
 
         for expected in 1..=4 {
-            let ConsumerReply::Attached { database_name } = messages_received.pop_front().unwrap()
+            let ConsumerReply::Attached { database_name, .. } =
+                messages_received.pop_front().unwrap()
             else {
                 panic!("Expected Attached for initial claim {expected}");
             };
@@ -876,14 +818,15 @@ mod worker_engine_test {
         }
 
         for _ in 0..2 {
-            let ConsumerReply::Attached { database_name } = messages_received.pop_front().unwrap()
+            let ConsumerReply::Attached { database_name, .. } =
+                messages_received.pop_front().unwrap()
             else {
                 panic!("Expected Attached for the delivered waiters");
             };
             assert_eq!(database_name, db(5));
         }
 
-        let EngineOutcome { slots, leases, capacity: _, waiters, counters: _ } = outcome;
+        let EngineOutcome { slots, leases, capacity: _, waiters, counters: _, .. } = outcome;
 
         assert_eq!(
             leases.get(&waiting_connection).unwrap().conns,
@@ -940,7 +883,7 @@ mod worker_engine_test {
 
         assert_eq!(messages_received.len(), 4);
 
-        let EngineOutcome { slots, leases, capacity: _, waiters, counters: _ } = outcome;
+        let EngineOutcome { slots, leases, capacity: _, waiters, counters: _, .. } = outcome;
 
         assert!(
             slots.iter().any(|slot| matches!(slot, Slot::Ready { db_name } if *db_name == db(5))),
@@ -996,7 +939,7 @@ mod grow_test {
 
         let snapshot = worker.snapshot();
         assert!(
-            matches!(&snapshot.slots[1], Slot::Creating { db_name } if *db_name == ReadString::from("pending")),
+            matches!(&snapshot.slots[1], Slot::Empty),
             "slot 1 must be reverted to Empty after 3 failed attempts, got {:?}",
             snapshot.slots[1]
         );
@@ -1088,8 +1031,8 @@ mod grow_test {
         let snapshot = worker.snapshot();
         assert_eq!(snapshot.capacity.current, 4, "capacity unchanged");
         assert!(
-            snapshot.slots.iter().all(|slot| matches!(slot, Slot::Empty)),
-            "no slot may leave Empty when the capacity is at maximum"
+            snapshot.slots.iter().all(|slot| matches!(slot, Slot::Ready { .. })),
+            "initial slots must stay ready when capacity is at maximum"
         );
         assert_eq!(io.remaining(), 0);
     }

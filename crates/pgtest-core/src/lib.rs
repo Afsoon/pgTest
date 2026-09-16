@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 pub mod postgres_manager;
 pub mod utils;
 pub mod worker_engine;

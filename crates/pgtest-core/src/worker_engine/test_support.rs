@@ -125,10 +125,11 @@ impl<'a> EngineIO<ConsumerWorker, PostgresConnection> for WorkerEngineIO<'a> {
         worker_index: usize,
         _database_name: ReadString,
         lease: LeaseId,
+        generation: u64,
         _postgres_client: Arc<PostgresConnection>,
     ) -> Result<(), IOError> {
         let mut inbox = self.inbox.lock().unwrap();
-        inbox.push_back(EngineMessage::DeleteLease { lease: lease.clone() });
+        inbox.push_back(EngineMessage::DeleteLease { lease: lease.clone(), generation });
         inbox.push_back(EngineMessage::TemplateCreated {
             index: worker_index,
             result: Ok(ReadString::from(self.database_progression_name.generate_database_name())),
@@ -144,7 +145,7 @@ impl<'a> EngineIO<ConsumerWorker, PostgresConnection> for WorkerEngineIO<'a> {
         _cancel_token: CancellationToken,
     ) -> Result<(), IOError> {
         // TODO(user): timer semantics undecided — deliberately inert for now.
-        // NOTE: grace/max-lifetime timers never fire in the simulator until
+        // NOTE: max-lifetime timers never fire in the simulator until
         // this is implemented.
         Ok(())
     }
@@ -225,6 +226,7 @@ pub struct EngineOutcome {
     pub leases: FxHashMap<LeaseId, LeaseEntry>,
     pub slots: Box<[Slot]>,
     pub capacity: PoolCapacity,
+    pub ready_slots: VecDeque<usize>,
     pub waiters: Vec<LeaseId>,
 }
 
@@ -270,7 +272,8 @@ impl EngineSimulator {
             leases: engine.leases.clone(),
             slots: engine.slots.clone(),
             capacity: engine.capacity.clone(),
-            waiters: engine.waiters.iter().map(|(lease, ..)| lease.clone()).collect(),
+            ready_slots: engine.ready_slots.clone(),
+            waiters: engine.waiters.iter().map(|lease| lease.clone()).collect(),
         })
     }
 
@@ -316,7 +319,8 @@ impl EngineSimulator {
             leases: engine.leases.clone(),
             slots: engine.slots.clone(),
             capacity: engine.capacity.clone(),
-            waiters: engine.waiters.iter().map(|(lease, ..)| lease.clone()).collect(),
+            ready_slots: engine.ready_slots.clone(),
+            waiters: engine.waiters.iter().map(|lease| lease.clone()).collect(),
         })
     }
 
@@ -358,7 +362,8 @@ impl EngineSimulator {
             leases: engine.leases.clone(),
             slots: engine.slots.clone(),
             capacity: engine.capacity.clone(),
-            waiters: engine.waiters.iter().map(|(lease, ..)| lease.clone()).collect(),
+            ready_slots: engine.ready_slots.clone(),
+            waiters: engine.waiters.iter().map(|lease| lease.clone()).collect(),
         })
     }
 }
@@ -418,10 +423,11 @@ impl EngineIO<ConsumerWorker, PostgresConnection> for ScriptedWorkerIO {
         worker_index: usize,
         _database_name: ReadString,
         lease: LeaseId,
+        generation: u64,
         _postgres_client: Arc<PostgresConnection>,
     ) -> Result<(), IOError> {
         let mut inbox = self.inbox.lock().unwrap();
-        inbox.push_back(EngineMessage::DeleteLease { lease: lease.clone() });
+        inbox.push_back(EngineMessage::DeleteLease { lease: lease.clone(), generation });
         inbox.push_back(EngineMessage::TemplateCreated {
             index: worker_index,
             result: Ok(ReadString::from(format!("grow_{worker_index}"))),
@@ -457,8 +463,8 @@ pub type GrowWorker = WorkerEngine<
 pub fn grow_config() -> WorkerEngineConfig {
     WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 4,
-        starvation_threshold: 2,
+        maximum_slots: 2,
+        starvation_threshold: 1,
         grow_batch_size: 1,
         ..WorkerEngineConfig::default()
     }
@@ -481,6 +487,7 @@ pub async fn run_grow_with(
 
     let mut worker = GrowWorker::new(config, manager, engine_io.clone(), inbox);
 
+    worker.try_init().await;
     worker.grow();
     worker.run().await;
 

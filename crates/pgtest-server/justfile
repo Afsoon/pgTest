@@ -30,5 +30,10 @@ run *ARGS:
     cargo run -p {{crate}} -- {{ARGS}}
 
 # Run against local PostgreSQL with the metered user and template database
-run-metered host="127.0.0.1" user="metered" template="metered" port="5432":
-    PGTEST_PG_HOST={{quote(host)}} PGTEST_PG_USER={{quote(user)}} PGTEST_PG_DATABASE={{quote(template)}} PGTEST_PG_PORT={{quote(port)}} cargo run -p {{crate}}
+run-metered host="127.0.0.1" user="metered" template="metered" port="5432" pool="5" initial="16" maximum="94":
+    RUST_MIN_STACK=16777216 PGTEST_POOL_INITIAL_SIZE={{quote(initial)}} PGTEST_POOL_MAXIMUM_SIZE={{quote(maximum)}} PGTEST_POOL_CONNECTION={{quote(pool)}} PGTEST_PG_HOST={{quote(host)}} PGTEST_PG_USER={{quote(user)}} PGTEST_PG_DATABASE={{quote(template)}} PGTEST_PG_PORT={{quote(port)}} cargo run -p {{crate}}
+
+# Run metered with an additional Unix socket for local test clients
+run-metered-unix host="127.0.0.1" user="metered" template="metered" port="5432" pool="5" initial="16" maximum="94" socket_dir="/tmp/pgtest":
+    mkdir -p -m 700 -- {{quote(socket_dir)}}
+    PGTEST_PERF_WINDOWS=true RUST_LOG=info RUST_MIN_STACK=16777216 PGTEST_UNIX_SOCKET_DIR={{quote(socket_dir)}} PGTEST_POOL_INITIAL_SIZE={{quote(initial)}} PGTEST_POOL_MAXIMUM_SIZE={{quote(maximum)}} PGTEST_POOL_CONNECTION={{quote(pool)}} PGTEST_PG_HOST={{quote(host)}} PGTEST_PG_USER={{quote(user)}} PGTEST_PG_DATABASE={{quote(template)}} PGTEST_PG_PORT={{quote(port)}} cargo run -p {{crate}}

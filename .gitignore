@@ -17,3 +17,6 @@
 !crates/
 !crates/**/
 !crates/**/*.rs
+
+# SQL grammar
+!crates/**/*.pest

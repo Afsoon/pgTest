@@ -33,6 +33,7 @@ pub trait EngineIO<C: ConsumerIO, P: PostgresClient> {
         worker_index: usize,
         database_name: ReadString,
         lease: LeaseId,
+        generation: u64,
         postgres_client: Arc<P>,
     ) -> Result<(), IOError>;
     fn send_delayed_message(

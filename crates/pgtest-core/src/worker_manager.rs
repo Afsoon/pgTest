@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hotpath::wrap::tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::timeout_at;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -10,45 +11,86 @@ use crate::{
     postgres_manager::{PostgresClientError, PostgresConfig, PostgresManager},
     utils::ReadString,
     worker_engine::{
-        core::{LeaseId, WorkerEngine, WorkerEngineConfig},
-        errors::IOError,
-        messages::{
-            ConsumerReply::{self, Attached},
-            EngineMessage,
-        },
+        core::{LeaseId, WorkerEngine, WorkerEngineConfig, is_valid_lease_id},
+        errors::{AttachError, IOError, ReleaseError},
+        messages::{ConsumerReply, EngineMessage},
         traits::{ConsumerIO, EngineIO, EngineInbox, MetricIO, PostgresClient},
     },
 };
 
+mod database_cleanup;
+use database_cleanup::DatabaseCleanup;
+
+#[cfg(test)]
+mod cleanup_tests;
+
+#[cfg(test)]
+mod reply_tests;
+
+enum ManagerReply {
+    Attached(LeaseSession),
+    Engine(ConsumerReply),
+}
+
 struct ConsumerWorker {
-    oneshot_channel: tokio::sync::oneshot::Sender<ConsumerReply>,
+    oneshot_channel: tokio::sync::oneshot::Sender<ManagerReply>,
+    attachment: Option<(LeaseId, UnboundedSender<EngineMessage<ConsumerWorker>>)>,
 }
 
 impl ConsumerWorker {
-    pub fn new(sender_tx: tokio::sync::oneshot::Sender<ConsumerReply>) -> Self {
-        Self { oneshot_channel: sender_tx }
+    fn new(sender: tokio::sync::oneshot::Sender<ManagerReply>) -> Self {
+        Self { oneshot_channel: sender, attachment: None }
     }
 }
 
 impl ConsumerIO for ConsumerWorker {
     fn reply(self, msg: ConsumerReply) -> Result<(), ConsumerReply> {
-        self.oneshot_channel.send(msg)
+        if let (
+            Some((lease, engine_tx)),
+            ConsumerReply::Attached { database_name, generation, cancellation },
+        ) = (&self.attachment, &msg)
+        {
+            // Transfer the guard through the channel. Dropping an unread
+            // successful reply must unregister the connection just
+            // like dropping a live session.
+            let session = LeaseSession::new(
+                database_name.clone(),
+                lease.clone(),
+                *generation,
+                cancellation.clone(),
+                engine_tx.clone(),
+            );
+            self.oneshot_channel.send(ManagerReply::Attached(session)).map_err(|reply| {
+                if let ManagerReply::Attached(mut session) = reply {
+                    // The engine rolls back a failed delivery synchronously.
+                    session.detach_on_drop = false;
+                }
+                msg
+            })
+        } else {
+            self.oneshot_channel.send(ManagerReply::Engine(msg)).map_err(|reply| {
+                let ManagerReply::Engine(msg) = reply else { unreachable!() };
+                msg
+            })
+        }
     }
 }
 
 struct WorkerEngineIO {
-    send_message: tokio::sync::mpsc::UnboundedSender<EngineMessage<ConsumerWorker>>,
+    send_message: UnboundedSender<EngineMessage<ConsumerWorker>>,
     tracker: TaskTracker,
     shutdown_token: CancellationToken,
+    cleanup: DatabaseCleanup,
 }
 
 impl WorkerEngineIO {
     fn new(
-        send_message: tokio::sync::mpsc::UnboundedSender<EngineMessage<ConsumerWorker>>,
+        send_message: UnboundedSender<EngineMessage<ConsumerWorker>>,
         tracker: TaskTracker,
         shutdown_token: CancellationToken,
+        cleanup: DatabaseCleanup,
     ) -> Self {
-        Self { send_message, tracker, shutdown_token }
+        Self { send_message, tracker, shutdown_token, cleanup }
     }
 
     /// Every background task races against the shutdown token: cancelling it
@@ -68,6 +110,48 @@ impl WorkerEngineIO {
                 _ = fut => {}
             }
         });
+    }
+}
+
+async fn recreate_database<P: PostgresClient + Send + Sync + 'static>(
+    producer: UnboundedSender<EngineMessage<ConsumerWorker>>,
+    worker_index: usize,
+    database_name: ReadString,
+    lease: LeaseId,
+    generation: u64,
+    postgres_client: Arc<P>,
+    cleanup: DatabaseCleanup,
+) {
+    // Reserve cleanup capacity before creating another database. When drops
+    // fall behind, this slot stays pending instead of accumulating more clones.
+    if cleanup.enqueue(database_name, postgres_client.clone()).await.is_err() {
+        return;
+    }
+
+    // Replacement retires the old lease even if its database could not be
+    // dropped. Otherwise that lease can attach to or recycle the replacement.
+
+    if producer.send(EngineMessage::DeleteLease { lease, generation }).is_err() {
+        tracing::error!("Unable to communicate with the worker to delete an unused lease");
+        return;
+    }
+
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        match postgres_client.create_database().await {
+            Ok(database) => {
+                let _ = producer.send(EngineMessage::TemplateCreated {
+                    index: worker_index,
+                    result: Ok(database),
+                });
+                return;
+            }
+            Err(error) => {
+                tracing::error!(worker_index, %error, "replacement creation failed; retaining slot and retrying");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+            }
+        }
     }
 }
 
@@ -110,56 +194,18 @@ impl EngineIO<ConsumerWorker, PostgresManager> for WorkerEngineIO {
         worker_index: usize,
         database_name: ReadString,
         lease: LeaseId,
+        generation: u64,
         postgres_client: Arc<PostgresManager>,
     ) -> Result<(), IOError> {
-        let producer_spawn = self.send_message.clone();
-        self.spawn_cancellable(async move {
-            match postgres_client.drop_database(&database_name).await {
-                Ok(_) => match producer_spawn.send(EngineMessage::DeleteLease { lease }) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        tracing::error!(
-                            "Unable to communicate with the worker to delete a unused lease"
-                        );
-                        return;
-                    }
-                },
-                Err(error) => {
-                    tracing::error!("Unable to drop {database_name} in Postgres: Source {error}");
-                    tracing::error!("Trying to create a new database");
-                }
-            };
-
-            match postgres_client.create_database().await {
-                Ok(template_name) => {
-                    match producer_spawn.send(EngineMessage::TemplateCreated {
-                        index: worker_index as usize,
-                        result: Ok(template_name.clone()),
-                    }) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            tracing::error!(
-                                "Unable to create a new database after delete an used database"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    match producer_spawn.send(EngineMessage::TemplateCreated {
-                        index: worker_index as usize,
-                        result: Err(error),
-                    }) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            tracing::error!(
-                                "Unable to communicate with the worker to indicate a new database \
-                                 is ready"
-                            );
-                        }
-                    }
-                }
-            }
-        });
+        self.spawn_cancellable(recreate_database(
+            self.send_message.clone(),
+            worker_index,
+            database_name,
+            lease,
+            generation,
+            postgres_client,
+            self.cleanup.clone(),
+        ));
 
         Ok(())
     }
@@ -198,13 +244,11 @@ impl EngineIO<ConsumerWorker, PostgresManager> for WorkerEngineIO {
 }
 
 struct WorkerEngineInbox {
-    receive_message: tokio::sync::mpsc::UnboundedReceiver<EngineMessage<ConsumerWorker>>,
+    receive_message: UnboundedReceiver<EngineMessage<ConsumerWorker>>,
 }
 
 impl WorkerEngineInbox {
-    fn new(
-        receive_message: tokio::sync::mpsc::UnboundedReceiver<EngineMessage<ConsumerWorker>>,
-    ) -> Self {
+    fn new(receive_message: UnboundedReceiver<EngineMessage<ConsumerWorker>>) -> Self {
         Self { receive_message }
     }
 }
@@ -229,7 +273,7 @@ impl MetricIO for Metrics {
 }
 
 pub struct WorkerEngineManager {
-    worker_inbox_tx: tokio::sync::mpsc::UnboundedSender<EngineMessage<ConsumerWorker>>,
+    worker_inbox_tx: UnboundedSender<EngineMessage<ConsumerWorker>>,
     pub pg_client: Arc<PostgresManager>,
     lease_claim_timeout: u64,
     engine_handle: tokio::task::JoinHandle<WorkerEngineType>,
@@ -243,31 +287,56 @@ type WorkerEngineType =
 pub struct LeaseSession {
     pub database_name: ReadString,
     pub lease_id: LeaseId,
-    engine_tx: tokio::sync::mpsc::UnboundedSender<EngineMessage<ConsumerWorker>>,
+    generation: u64,
+    cancellation: CancellationToken,
+    detach_on_drop: bool,
+    engine_tx: UnboundedSender<EngineMessage<ConsumerWorker>>,
 }
 
 impl LeaseSession {
     fn new(
         database_name: ReadString,
         lease_id: LeaseId,
-        engine_tx: tokio::sync::mpsc::UnboundedSender<EngineMessage<ConsumerWorker>>,
+        generation: u64,
+        cancellation: CancellationToken,
+        engine_tx: UnboundedSender<EngineMessage<ConsumerWorker>>,
     ) -> Self {
-        Self { database_name, lease_id, engine_tx }
+        Self { database_name, lease_id, generation, cancellation, detach_on_drop: true, engine_tx }
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 }
 
 impl Drop for LeaseSession {
     fn drop(&mut self) {
-        tracing::debug!("Sending the message to detach the lease");
-        let _ = self.engine_tx.send(EngineMessage::Detach { lease: self.lease_id.clone() });
+        if self.detach_on_drop {
+            let _ = self.engine_tx.send(EngineMessage::Detach {
+                lease: self.lease_id.clone(),
+                generation: self.generation,
+            });
+        }
     }
 }
 
 impl WorkerEngineManager {
+    #[hotpath::measure]
     pub async fn start(
         postgres_config: PostgresConfig,
         worker_engine_config: WorkerEngineConfig,
     ) -> Result<Self, ()> {
+        if worker_engine_config.cleanup_max_pending == 0
+            || worker_engine_config.cleanup_concurrency == 0
+            || worker_engine_config.max_lease_records == 0
+        {
+            tracing::error!(
+                "cleanup capacity, concurrency, and lease record capacity must be greater than \
+                 zero"
+            );
+            return Err(());
+        }
+
         let postgres_client = match PostgresManager::start(postgres_config).await {
             Ok(pg_client) => Arc::new(pg_client),
             Err(PostgresClientError::DatabaseDoesNotExist(database_name)) => {
@@ -312,17 +381,22 @@ impl WorkerEngineManager {
             }
         };
 
-        let _ = postgres_client.drop_ddl_templates_like().await;
+        // Keep the large, instrumented startup futures out of this future's
+        // inline state; nested profiling wrappers otherwise overflow the stack.
+        let _ = Box::pin(postgres_client.drop_ddl_templates_like()).await;
 
-        let (inbox_tx, inbox_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (inbox_tx, inbox_rx) =
+            hotpath::channel!(tokio::sync::mpsc::unbounded_channel(), label = "worker-inbox");
 
         let timeout_claim = worker_engine_config.lease_claim_timeout_ms.clone();
 
         let tracker = TaskTracker::new();
         let shutdown_token = CancellationToken::new();
         let worker_engine_inbox = WorkerEngineInbox::new(inbox_rx);
+        let cleanup =
+            DatabaseCleanup::new(&worker_engine_config, tracker.clone(), shutdown_token.clone());
         let worker_engine_io =
-            WorkerEngineIO::new(inbox_tx.clone(), tracker.clone(), shutdown_token.clone());
+            WorkerEngineIO::new(inbox_tx.clone(), tracker.clone(), shutdown_token.clone(), cleanup);
 
         let mut worker_engine: WorkerEngineType = WorkerEngine::new(
             worker_engine_config,
@@ -331,7 +405,7 @@ impl WorkerEngineManager {
             worker_engine_inbox,
         );
 
-        worker_engine.try_init().await;
+        Box::pin(worker_engine.try_init()).await;
 
         let engine_handle = tokio::spawn(async move {
             worker_engine.run().await;
@@ -348,7 +422,15 @@ impl WorkerEngineManager {
         })
     }
 
-    pub async fn attach(&self, database_name: &str, lease: LeaseId) -> Result<LeaseSession, ()> {
+    #[hotpath::measure]
+    pub async fn attach(
+        &self,
+        database_name: &str,
+        lease: LeaseId,
+    ) -> Result<LeaseSession, AttachError> {
+        if !is_valid_lease_id(&lease) {
+            return Err(AttachError::InvalidLeaseId);
+        }
         let template_name = self.pg_client.template_database_name.template_name();
         if template_name.ne(database_name) {
             tracing::warn!(
@@ -357,13 +439,17 @@ impl WorkerEngineManager {
                 expected_database = template_name,
                 "Lease request rejected: database does not match the configured template"
             );
-            return Err(());
+            return Err(AttachError::TemplateMismatch);
         }
 
         let now = tokio::time::Instant::now();
         let waiting_response_until = now + Duration::from_millis(self.lease_claim_timeout);
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let consumer_worker = ConsumerWorker::new(reply_tx);
+        let (reply_tx, reply_rx) =
+            hotpath::channel!(tokio::sync::oneshot::channel(), proxy = true, label = "lease-reply");
+        let consumer_worker = ConsumerWorker {
+            oneshot_channel: reply_tx,
+            attachment: Some((lease.clone(), self.worker_inbox_tx.clone())),
+        };
 
         let request_database_msg = EngineMessage::AttachOrJoin {
             lease: lease.clone(),
@@ -378,22 +464,50 @@ impl WorkerEngineManager {
             }
             Err(_error) => {
                 tracing::error!("Unable to ask for a lease");
-                return Err(());
+                return Err(AttachError::EngineUnavailable);
             }
         }
 
-        match timeout_at(waiting_response_until, reply_rx).await {
-            Err(_) => {
-                tracing::error!("Worker was unable to answer on time");
-                Err(())
+        let reply = if self.lease_claim_timeout == 0 {
+            reply_rx.await
+        } else {
+            timeout_at(waiting_response_until, reply_rx).await.map_err(|_| AttachError::TimedOut)?
+        }
+        .map_err(|_| AttachError::EngineUnavailable)?;
+        match reply {
+            ManagerReply::Attached(session) => {
+                if session.cancellation.is_cancelled() {
+                    return Err(AttachError::LeaseClosed);
+                }
+                Ok(session)
             }
-            Ok(reply) => {
-                let Ok(Attached { database_name }) = reply else { return Err(()) };
-                Ok(LeaseSession::new(database_name, lease, self.worker_inbox_tx.clone()))
-            }
+            ManagerReply::Engine(ConsumerReply::AttachRejected(error)) => Err(error),
+            _ => Err(AttachError::Failed),
         }
     }
 
+    /// Success acknowledges logical closure; physical deletion runs in the
+    /// background.
+    #[hotpath::measure]
+    pub async fn release(&self, lease: LeaseId) -> Result<(), ReleaseError> {
+        if !is_valid_lease_id(&lease) {
+            return Err(ReleaseError::InvalidLeaseId);
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.worker_inbox_tx
+            .send(EngineMessage::ReleaseLease { lease, reply: ConsumerWorker::new(reply_tx) })
+            .map_err(|_| ReleaseError::EngineUnavailable)?;
+        let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .map_err(|_| ReleaseError::ReplyTimedOut)?
+            .map_err(|_| ReleaseError::EngineUnavailable)?;
+        match reply {
+            ManagerReply::Engine(ConsumerReply::ReleaseResult(result)) => result,
+            _ => Err(ReleaseError::UnexpectedReply),
+        }
+    }
+
+    #[hotpath::measure]
     pub async fn shutdown(self) {
         self.shutdown_token.cancel();
         self.tracker.close();
@@ -414,7 +528,7 @@ impl WorkerEngineManager {
     }
 
     #[cfg(all(test, not(feature = "stable_ids")))]
-    pub(crate) async fn drain_and_snapshot(self, cancel_spawned_threads: bool) -> WorkerEngineType {
+    async fn drain_and_snapshot(self, cancel_spawned_threads: bool) -> WorkerEngineType {
         if cancel_spawned_threads {
             self.shutdown_token.cancel()
         }
@@ -457,9 +571,20 @@ mod worker_engine_manager_test {
             initial_slots: slots,
             maximum_slots: slots,
             lease_claim_timeout_ms: 30_000,
-            lease_grace_ms: 0,
             ..WorkerEngineConfig::default()
         }
+    }
+
+    #[test]
+    fn startup_future_fits_stack_budget() {
+        // Nested profiling wrappers used to inflate this to over 600 KiB,
+        // overflowing the main thread's stack when startup was first polled.
+        let startup = WorkerEngineManager::start(
+            crate::postgres_manager::PostgresConfig::default(),
+            WorkerEngineConfig::default(),
+        );
+        let size = std::mem::size_of_val(&startup);
+        assert!(size < 64 * 1024, "startup future uses {size} bytes");
     }
 
     async fn start_manager(config: WorkerEngineConfig) -> WorkerEngineManager {
@@ -483,8 +608,7 @@ mod worker_engine_manager_test {
     }
 
     #[tokio::test]
-    async fn when_a_lease_session_is_dropped_then_a_detach_message_is_send_to_signal_end_of_the_connection()
-     {
+    async fn when_the_last_lease_session_is_dropped_then_the_database_remains_assigned() {
         let worker_engine_config =
             WorkerEngineConfig { lease_claim_timeout_ms: 5_000, ..WorkerEngineConfig::default() };
         let manager = start_manager(worker_engine_config).await;
@@ -494,17 +618,28 @@ mod worker_engine_manager_test {
             .attach("pgtest", lease.clone())
             .await
             .expect("attach against the template database succeeds");
+        let assigned_database = session.database_name.to_string();
 
         drop(session);
 
-        let engine = manager.drain_and_snapshot(false).await;
+        let engine = manager.drain_and_snapshot(true).await;
         let snapshot = engine.snapshot();
 
-        assert!(!snapshot.leases.contains_key(&lease));
+        assert_eq!(snapshot.leases.get(&lease).expect("lease must remain assigned").conns, 0);
         let leased =
             snapshot.slots.iter().filter(|slot| matches!(slot, Slot::Leased { .. })).count();
-        assert_eq!(leased, 0);
-        assert_eq!(snapshot.capacity.free_slots, WorkerEngineConfig::default().initial_slots);
+        assert_eq!(leased, 1);
+        assert_eq!(
+            snapshot.ready_slots.len(),
+            usize::from(WorkerEngineConfig::default().initial_slots - 1)
+        );
+
+        let mut assigned_config = pg_container_config().await;
+        assigned_config.pgtest_pg_database = assigned_database;
+        assert!(
+            crate::postgres_manager::PostgresManager::start(assigned_config).await.is_ok(),
+            "the database must still exist after its last session closes"
+        );
     }
 
     #[tokio::test]
@@ -534,7 +669,10 @@ mod worker_engine_manager_test {
         let leased =
             snapshot.slots.iter().filter(|slot| matches!(slot, Slot::Leased { .. })).count();
         assert_eq!(leased, 1);
-        assert_eq!(snapshot.capacity.free_slots, WorkerEngineConfig::default().initial_slots - 1);
+        assert_eq!(
+            snapshot.ready_slots.len(),
+            usize::from(WorkerEngineConfig::default().initial_slots - 1)
+        );
     }
 
     #[tokio::test]
@@ -576,7 +714,7 @@ mod worker_engine_manager_test {
         let snapshot = engine.snapshot();
         assert!(snapshot.leases.is_empty());
         assert_eq!(snapshot.waiters.len(), 1, "the timed-out claim stays parked in the engine");
-        assert_eq!(snapshot.waiters.front().unwrap().0, lease);
+        assert_eq!(snapshot.waiters.front().unwrap(), &lease);
     }
 
     #[tokio::test]
@@ -590,7 +728,7 @@ mod worker_engine_manager_test {
         let original_database = session.database_name.clone();
 
         // The engine uses its claim setting for lease lifetime too. Shorten
-        // only the caller's deadline so recycling is triggered by session drop.
+        // only the caller's deadline, then explicitly deliver lifetime expiry.
         manager.lease_claim_timeout = 100;
         let started_at = Instant::now();
         let result = manager.attach("pgtest", ReadString::from("timed_out")).await;
@@ -598,6 +736,13 @@ mod worker_engine_manager_test {
         assert!(started_at.elapsed() >= Duration::from_millis(100));
 
         drop(session);
+        manager
+            .worker_inbox_tx
+            .send(EngineMessage::LeaseMaxTimeReached {
+                lease: ReadString::from("holder"),
+                generation: 1,
+            })
+            .unwrap();
         let engine = manager.drain_and_snapshot(false).await;
         let snapshot = engine.snapshot();
         assert!(snapshot.leases.is_empty());
@@ -606,7 +751,7 @@ mod worker_engine_manager_test {
             &snapshot.slots[..],
             [Slot::Ready { db_name }] if *db_name != original_database
         ));
-        assert_eq!(snapshot.capacity.free_slots, 1);
+        assert_eq!(snapshot.ready_slots.len(), 1);
     }
 
     #[tokio::test]
@@ -622,6 +767,10 @@ mod worker_engine_manager_test {
         let mut attach = Box::pin(manager.attach("pgtest", waiting.clone()));
         enqueue_attach(&manager, attach.as_mut()).await;
         drop(session);
+        manager
+            .worker_inbox_tx
+            .send(EngineMessage::LeaseMaxTimeReached { lease: holder.clone(), generation: 1 })
+            .unwrap();
         let received_session =
             attach.await.expect("queued attach must receive the recycled database");
 
@@ -636,7 +785,7 @@ mod worker_engine_manager_test {
             [Slot::Leased { db_name, lease }]
                 if *db_name == received_session.database_name && *lease == waiting
         ));
-        assert_eq!(snapshot.capacity.free_slots, 0);
+        assert_eq!(snapshot.ready_slots.len(), 0);
         drop(received_session);
     }
 
@@ -654,6 +803,13 @@ mod worker_engine_manager_test {
         enqueue_attach(&manager, attach.as_mut()).await;
         drop(attach);
         drop(session);
+        manager
+            .worker_inbox_tx
+            .send(EngineMessage::LeaseMaxTimeReached {
+                lease: ReadString::from("holder"),
+                generation: 1,
+            })
+            .unwrap();
 
         let engine = manager.drain_and_snapshot(false).await;
         assert!(
@@ -667,7 +823,7 @@ mod worker_engine_manager_test {
             &snapshot.slots[..],
             [Slot::Ready { db_name }] if *db_name != original_database
         ));
-        assert_eq!(snapshot.capacity.free_slots, 1);
+        assert_eq!(snapshot.ready_slots.len(), 1);
     }
 
     #[tokio::test]
@@ -692,8 +848,17 @@ mod worker_engine_manager_test {
         let manager = start_manager(fixed_pool_config(0)).await;
         let tracker = manager.tracker.clone();
         let inbox = manager.worker_inbox_tx.clone();
-        let io =
-            WorkerEngineIO::new(inbox.clone(), tracker.clone(), manager.shutdown_token.clone());
+        let cleanup = super::DatabaseCleanup::new(
+            &WorkerEngineConfig::default(),
+            tracker.clone(),
+            manager.shutdown_token.clone(),
+        );
+        let io = WorkerEngineIO::new(
+            inbox.clone(),
+            tracker.clone(),
+            manager.shutdown_token.clone(),
+            cleanup,
+        );
         let (reply, mut received) = tokio::sync::oneshot::channel();
         io.send_delayed_message(EngineMessage::Barrier { reply }, 60_000, CancellationToken::new())
             .expect("delayed message task must be scheduled");
