@@ -34,17 +34,16 @@ Measured results: [Explicit lease release removes burst stalls](docs/explicit-re
 
 Implementation walkthrough: [Worker engine retirement retries](docs/worker-engine-retirement-retries.md).
 
-Retired lease databases are deleted in the background. Replacement creation
-waits for cleanup capacity only when the backlog is full. Configure the bounds
-with `PGTEST_CLEANUP_MAX_PENDING` (default `16`, including running deletions) and
-`PGTEST_CLEANUP_CONCURRENCY` (default `2` concurrent DROP operations). Both must
-be greater than zero. Cleanup uses the existing PostgreSQL connection pool.
+Database creation and cleanup run in separate workers with independent PostgreSQL
+connection pools. `PGTEST_POOL_CONNECTION` controls creation connections
+(default `5`), and `PGTEST_CLEANUP_POOL_CONNECTION` controls cleanup connections
+(default `2`). Both must be greater than zero. These settings limit connection
+use; they do not cap queued jobs or database counts.
 
-Failed deletions keep their backlog capacity and retry after an exponentially
-increasing delay, capped at 30 seconds, so persistent failures apply backpressure
-instead of leaking unlimited databases. DROP is idempotent. Shutdown cancels
-pending cleanup; the existing startup sweep removes remaining prefixed databases
-on the next start. These limits bound database counts, not their sizes in bytes.
+The engine replenishes ready database supply independently of cleanup.
+Retired databases remain recorded until cleanup reports success. If the existing
+PostgreSQL retry attempts fail, the retirement record remains; scheduling further
+cleanup attempts is still pending in this refactor.
 
 Hotpath profiling is opt-in for the server and its core/wire libraries:
 
@@ -171,42 +170,42 @@ on the `pgtest::performance` tracing target. Match their `window_start_ms` field
 to compare demand, clone supply, and latency over time. To show just those events,
 use `RUST_LOG=pgtest::performance=info`.
 
-| Fields | Measurement |
-| --- | --- |
-| `tcp_accepted`, `unix_accepted` | Frontend connections accepted in this window, including control connections. |
-| `attach_started` | Calls entering the manager's attachment path; includes connections joining an existing lease. |
-| `attach_ok`, `attach_failed`, `attach_cancelled` | Attachment outcomes; failed includes returned timeouts, cancelled means the future was dropped. |
-| `attach_avg_ms`, `attach_max_ms` | Manager attachment duration for calls returning success or error. Excludes upstream connection setup and cancelled calls. |
-| `inbox_count`, `inbox_avg_ms`, `inbox_max_ms` | Time from the manager's request timestamp until the engine begins handling it. |
-| `queued` | Attachment requests that found no ready clone and entered the waiting queue. |
-| `ready_wait_count`, `ready_wait_avg_ms`, `ready_wait_max_ms` | Time from entering that queue until attempting an attachment reply after a clone becomes available. Excludes expired or released waiters that never reach that reply. |
-| `ready_min`, `ready_last` | Minimum and latest observed ready-clone counts; `None` before the engine's first snapshot. |
-| `pending_peak`, `waiting_peak` | Maximum observed pending creation/replacement reservations and distinct lease IDs waiting for a clone. Pending includes cleanup-admission and retry waits. |
-| `capacity_last`, `maximum_last` | Latest allocated slot capacity and configured maximum; `None` before the engine's first snapshot. Capacity includes ready, leased, and pending slots. |
-| `create_started`, `create_ok`, `create_failed`, `create_cancelled` | Individual CREATE attempts, including initial clones and retries. |
-| `create_avg_ms`, `create_max_ms` | CREATE attempt duration including acquisition of a SQLx management connection. Successes and returned errors are included; cancelled attempts are excluded. |
-| `create_in_flight_last`, `create_in_flight_peak` | Latest and maximum number of unfinished CREATE attempts, including management connection acquisition. Excludes cleanup admission and time between attempts. |
-| `acquire_count`, `acquire_avg_ms`, `acquire_max_ms` | Management connection acquisition for completed CREATE attempts, including failed acquisitions. |
-| `sql_count`, `sql_avg_ms`, `sql_max_ms` | CREATE execution after acquiring a management connection, including SQL errors. |
-| `replacement_cleanup_last`, `replacement_cleanup_peak` | Replacement jobs awaiting cleanup admission for their old database, before calling CREATE. |
-| `replacement_creating_last`, `replacement_creating_peak` | Replacement jobs inside the creation call, including management acquisition and the PostgreSQL client's internal retries. Excludes initial clones and pool growth. |
-| `replacement_retrying_last`, `replacement_retrying_peak` | Replacement jobs sleeping between failed creation calls. |
+| Fields                                                             | Measurement                                                                                                                                                           |
+| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tcp_accepted`, `unix_accepted`                                    | Frontend connections accepted in this window, including control connections.                                                                                          |
+| `attach_started`                                                   | Calls entering the manager's attachment path; includes connections joining an existing lease.                                                                         |
+| `attach_ok`, `attach_failed`, `attach_cancelled`                   | Attachment outcomes; failed includes returned timeouts, cancelled means the future was dropped.                                                                       |
+| `attach_avg_ms`, `attach_max_ms`                                   | Manager attachment duration for calls returning success or error. Excludes upstream connection setup and cancelled calls.                                             |
+| `inbox_count`, `inbox_avg_ms`, `inbox_max_ms`                      | Time from the manager's request timestamp until the engine begins handling it.                                                                                        |
+| `queued`                                                           | Attachment requests that found no ready clone and entered the waiting queue.                                                                                          |
+| `ready_wait_count`, `ready_wait_avg_ms`, `ready_wait_max_ms`       | Time from entering that queue until attempting an attachment reply after a clone becomes available. Excludes expired or released waiters that never reach that reply. |
+| `ready_min`, `ready_last`                                          | Minimum and latest observed ready-clone counts; `None` before the engine's first snapshot.                                                                            |
+| `pending_peak`, `waiting_peak`                                     | Maximum observed pending creation/replacement reservations and distinct lease IDs waiting for a clone. Pending includes cleanup-admission and retry waits.            |
+| `capacity_last`, `maximum_last`                                    | Latest allocated slot capacity and configured maximum; `None` before the engine's first snapshot. Capacity includes ready, leased, and pending slots.                 |
+| `create_started`, `create_ok`, `create_failed`, `create_cancelled` | Individual CREATE attempts, including initial clones and retries.                                                                                                     |
+| `create_avg_ms`, `create_max_ms`                                   | CREATE attempt duration including acquisition of a SQLx management connection. Successes and returned errors are included; cancelled attempts are excluded.           |
+| `create_in_flight_last`, `create_in_flight_peak`                   | Latest and maximum number of unfinished CREATE attempts, including management connection acquisition. Excludes cleanup admission and time between attempts.           |
+| `acquire_count`, `acquire_avg_ms`, `acquire_max_ms`                | Management connection acquisition for completed CREATE attempts, including failed acquisitions.                                                                       |
+| `sql_count`, `sql_avg_ms`, `sql_max_ms`                            | CREATE execution after acquiring a management connection, including SQL errors.                                                                                       |
+| `replacement_cleanup_last`, `replacement_cleanup_peak`             | Replacement jobs awaiting cleanup admission for their old database, before calling CREATE.                                                                            |
+| `replacement_creating_last`, `replacement_creating_peak`           | Replacement jobs inside the creation call, including management acquisition and the PostgreSQL client's internal retries. Excludes initial clones and pool growth.    |
+| `replacement_retrying_last`, `replacement_retrying_peak`           | Replacement jobs sleeping between failed creation calls.                                                                                                              |
 
 The `cleanup_window` fields expose the work that can delay replacement creation:
 
-| Fields | Measurement |
-| --- | --- |
-| `admission_started`, `admission_ok`, `admission_cancelled` | Requests for cleanup backlog capacity, successful admissions, and requests cancelled before admission (including shutdown). |
-| `admission_avg_ms`, `admission_max_ms` | Time until backlog capacity is acquired, for successful admissions. This precedes the replacement's CREATE timer and does not wait for that database's DROP to finish. |
-| `admission_waiting_last`, `admission_waiting_peak` | Requests still awaiting cleanup backlog capacity. |
-| `cleanup_queued_last`, `cleanup_queued_peak` | Admitted deletion jobs awaiting their task's first poll or a cleanup execution permit. |
-| `cleanup_running_last`, `cleanup_running_peak` | Jobs holding an execution permit while calling `drop_database`, including management acquisition and the client's internal retries. |
-| `cleanup_retrying_last`, `cleanup_retrying_peak` | Jobs sleeping after a failed `drop_database` call. They retain backlog capacity but release the execution permit. |
-| `queue_wait_count`, `queue_wait_avg_ms`, `queue_wait_max_ms` | Time from entering the admitted queue until acquiring an execution permit. Includes task scheduling on the first attempt and a new sample for each retry; excludes outer retry sleep and cancelled waits. |
-| `drop_started`, `drop_ok`, `drop_failed`, `drop_cancelled` | Individual DROP attempts, including startup sweep deletions and internal retries. |
-| `drop_avg_ms`, `drop_max_ms` | Completed DROP attempt duration including management connection acquisition. Excludes admission, execution-permit waits, and time between attempts. |
-| `drop_acquire_count`, `drop_acquire_avg_ms`, `drop_acquire_max_ms` | Management connection acquisition for completed DROP attempts, including failed acquisitions. |
-| `drop_sql_count`, `drop_sql_avg_ms`, `drop_sql_max_ms` | DROP execution after acquiring a management connection, including SQL errors. |
+| Fields                                                             | Measurement                                                                                                                                                                                               |
+| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `admission_started`, `admission_ok`, `admission_cancelled`         | Requests for cleanup backlog capacity, successful admissions, and requests cancelled before admission (including shutdown).                                                                               |
+| `admission_avg_ms`, `admission_max_ms`                             | Time until backlog capacity is acquired, for successful admissions. This precedes the replacement's CREATE timer and does not wait for that database's DROP to finish.                                    |
+| `admission_waiting_last`, `admission_waiting_peak`                 | Requests still awaiting cleanup backlog capacity.                                                                                                                                                         |
+| `cleanup_queued_last`, `cleanup_queued_peak`                       | Admitted deletion jobs awaiting their task's first poll or a cleanup execution permit.                                                                                                                    |
+| `cleanup_running_last`, `cleanup_running_peak`                     | Jobs holding an execution permit while calling `drop_database`, including management acquisition and the client's internal retries.                                                                       |
+| `cleanup_retrying_last`, `cleanup_retrying_peak`                   | Jobs sleeping after a failed `drop_database` call. They retain backlog capacity but release the execution permit.                                                                                         |
+| `queue_wait_count`, `queue_wait_avg_ms`, `queue_wait_max_ms`       | Time from entering the admitted queue until acquiring an execution permit. Includes task scheduling on the first attempt and a new sample for each retry; excludes outer retry sleep and cancelled waits. |
+| `drop_started`, `drop_ok`, `drop_failed`, `drop_cancelled`         | Individual DROP attempts, including startup sweep deletions and internal retries.                                                                                                                         |
+| `drop_avg_ms`, `drop_max_ms`                                       | Completed DROP attempt duration including management connection acquisition. Excludes admission, execution-permit waits, and time between attempts.                                                       |
+| `drop_acquire_count`, `drop_acquire_avg_ms`, `drop_acquire_max_ms` | Management connection acquisition for completed DROP attempts, including failed acquisitions.                                                                                                             |
+| `drop_sql_count`, `drop_sql_avg_ms`, `drop_sql_max_ms`             | DROP execution after acquiring a management connection, including SQL errors.                                                                                                                             |
 
 Stage gauges carry their current values into the next occupied window and are
 released on completion or cancellation. Within each job, only one stage is
@@ -267,13 +266,13 @@ distroless image will run a Linux build of the same program. PostgreSQL and the
 template database remain external prerequisites. The current executable is
 `pgtest-server`; the CLI interface and distribution work below are planned.
 
-| Order | Milestone | Completion criteria |
-| --- | --- | --- |
-| 1 | Separate fresh database supply from retirement | Ready databases replenish while cleanup is delayed, subject to explicit resource limits. Cleanup-blocked replacements no longer count as immediately progressing creation. |
-| 2 | Stabilize the v0.1 architecture; refactor and review | Document ownership, lifecycle transitions, failure handling, and shutdown. Resolve correctness findings before treating the design as the v0.1 baseline. |
-| 3 | Prepare the native CLI | One validated configuration path supports command-line options and the existing environment variables, with useful help, version output, startup errors, and clean shutdown. |
-| 4 | Package the server in distroless | A reproducible Linux build runs without a shell, accepts connections through the configured interface, and handles container termination cleanly. |
-| 5 | Validate and publish the v0.1 beta | Run the agreed runtime checks, record benchmark results, review release artifacts, and publish matching binary and image versions through the selected release destinations. |
+| Order | Milestone                                            | Completion criteria                                                                                                                                                          |
+| ----- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Separate fresh database supply from retirement       | Ready databases replenish while cleanup is delayed, subject to explicit resource limits. Cleanup-blocked replacements no longer count as immediately progressing creation.   |
+| 2     | Stabilize the v0.1 architecture; refactor and review | Document ownership, lifecycle transitions, failure handling, and shutdown. Resolve correctness findings before treating the design as the v0.1 baseline.                     |
+| 3     | Prepare the native CLI                               | One validated configuration path supports command-line options and the existing environment variables, with useful help, version output, startup errors, and clean shutdown. |
+| 4     | Package the server in distroless                     | A reproducible Linux build runs without a shell, accepts connections through the configured interface, and handles container termination cleanly.                            |
+| 5     | Validate and publish the v0.1 beta                   | Run the agreed runtime checks, record benchmark results, review release artifacts, and publish matching binary and image versions through the selected release destinations. |
 
 ### Database supply and architecture baseline
 

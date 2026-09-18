@@ -5,8 +5,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     utils::ReadString,
     worker_engine::{
-        core::{LeaseId, SlotIdx},
-        errors::{AttachError, PostgresDDLClientError, ReleaseError},
+        core::LeaseId,
+        database_jobs::DatabaseWorkerMessages,
+        errors::{AttachError, ReleaseError},
         traits::ConsumerIO,
     },
 };
@@ -22,10 +23,6 @@ pub enum EngineMessage<C: ConsumerIO> {
         lease: LeaseId,
         reply: C,
     },
-    TemplateCreated {
-        index: SlotIdx,
-        result: Result<ReadString, PostgresDDLClientError>,
-    },
     Detach {
         lease: LeaseId,
         generation: u64,
@@ -34,14 +31,7 @@ pub enum EngineMessage<C: ConsumerIO> {
         lease: LeaseId,
         generation: u64,
     },
-    DeleteLease {
-        lease: LeaseId,
-        generation: u64,
-    },
-    RetryDatabaseCreation {
-        index: SlotIdx,
-        try_number: usize,
-    },
+    DatabaseWorker(DatabaseWorkerMessages),
     #[cfg(test)]
     Barrier {
         reply: tokio::sync::oneshot::Sender<()>,

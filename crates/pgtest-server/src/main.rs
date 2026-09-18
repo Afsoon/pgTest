@@ -44,10 +44,6 @@ async fn main() -> Result<()> {
         PostgresConfig::init_from_env().context("invalid PostgreSQL configuration")?;
     let worker_engine_config =
         WorkerEngineConfig::init_from_env().context("invalid worker engine configuration")?;
-    ensure!(
-        worker_engine_config.initial_slots <= worker_engine_config.maximum_slots,
-        "initial pool size must not exceed maximum pool size"
-    );
 
     let engine =
         Arc::new(WorkerEngineManager::start(postgres_config, worker_engine_config).await.map_err(

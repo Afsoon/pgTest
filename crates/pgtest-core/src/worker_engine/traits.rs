@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     utils::ReadString,
     worker_engine::{
-        core::LeaseId,
+        database_jobs::{CleanupDatabase, CreateDatabase},
         errors::{IOError, MetricIOError, PostgresDDLClientError},
         messages::{ConsumerReply, EngineMessage, EngineMetricMessage},
     },
@@ -23,19 +21,9 @@ pub trait MetricIO {
 }
 
 pub trait EngineIO<C: ConsumerIO, P: PostgresClient> {
-    fn spawn_create_database(
-        &self,
-        worker_index: usize,
-        postgres_client: Arc<P>,
-    ) -> Result<(), IOError>;
-    fn spawn_recreate_database(
-        &self,
-        worker_index: usize,
-        database_name: ReadString,
-        lease: LeaseId,
-        generation: u64,
-        postgres_client: Arc<P>,
-    ) -> Result<(), IOError>;
+    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError>;
+    fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError>;
+
     fn send_delayed_message(
         &self,
         msg: EngineMessage<C>,

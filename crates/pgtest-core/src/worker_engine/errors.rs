@@ -1,7 +1,5 @@
 use thiserror::Error;
 
-use crate::worker_engine::core::{LeaseId, SlotIdx};
-
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseError {
     #[error("lease ID must contain 1 to 256 UTF-8 bytes and cannot contain '/' or NUL")]
@@ -14,8 +12,6 @@ pub enum ReleaseError {
     ReplyTimedOut,
     #[error("the worker engine returned an unexpected release reply")]
     UnexpectedReply,
-    #[error("the lease references an invalid database slot")]
-    InvalidSlot,
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -37,35 +33,9 @@ pub enum AttachError {
 }
 
 #[derive(Error, Debug)]
-pub enum LeaseSlotError {
-    #[error("worker slot {0} is not initialized")]
-    WorkerSlotNotInitialized(SlotIdx),
-    #[error("worker slot {slot} is in state {state}, expected Ready")]
-    WorkerSlotNotReady { slot: SlotIdx, state: &'static str },
-}
-
-#[derive(Error, Debug)]
-pub enum OfferTemplateError {
-    #[error("worker slot {0} is not initialized")]
-    WorkerSlotNotInitialized(SlotIdx),
-}
-
-#[derive(Error, Debug)]
-pub enum ForceRecycleError {
-    #[error("no lease registered for id {0}")]
-    UnknownLease(LeaseId),
-    #[error("worker slot {0} is not initialized")]
-    WorkerSlotNotInitialized(SlotIdx),
-    #[error("lost connectivity with the postgres server")]
-    DatabaseIsDown,
-}
-
-#[derive(Error, Debug)]
 pub enum IOError {
     #[error("failed to deliver a message to the worker engine (channel closed)")]
     FailedToSendTheMessage,
-    #[error("failed to spawn the background database-creation task for slot {0}")]
-    FailedToStartABackgroundProcess(SlotIdx),
 }
 
 #[derive(Error, Debug)]

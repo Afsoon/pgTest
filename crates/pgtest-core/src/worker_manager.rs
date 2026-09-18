@@ -12,14 +12,19 @@ use crate::{
     utils::ReadString,
     worker_engine::{
         core::{LeaseId, WorkerEngine, WorkerEngineConfig, is_valid_lease_id},
+        database_jobs::{CleanupDatabase, CreateDatabase},
         errors::{AttachError, IOError, ReleaseError},
         messages::{ConsumerReply, EngineMessage},
-        traits::{ConsumerIO, EngineIO, EngineInbox, MetricIO, PostgresClient},
+        traits::{ConsumerIO, EngineIO, EngineInbox, MetricIO},
+    },
+    worker_manager::{
+        database_cleanup_worker::DatabaseCleanupWorker,
+        database_creation_worker::DatabaseCreationWorker,
     },
 };
 
-mod database_cleanup;
-use database_cleanup::DatabaseCleanup;
+mod database_cleanup_worker;
+mod database_creation_worker;
 
 #[cfg(test)]
 mod cleanup_tests;
@@ -76,11 +81,33 @@ impl ConsumerIO for ConsumerWorker {
     }
 }
 
+struct DatabaseWorkerSenders {
+    creation_tx: UnboundedSender<CreateDatabase>,
+    cleanup_tx: UnboundedSender<CleanupDatabase>,
+}
+
+impl DatabaseWorkerSenders {
+    fn init_database_worker_channels()
+    -> (Self, UnboundedReceiver<CreateDatabase>, UnboundedReceiver<CleanupDatabase>) {
+        let (creation_tx, creation_rx) = hotpath::channel!(
+            tokio::sync::mpsc::unbounded_channel::<CreateDatabase>(),
+            label = "database-creation"
+        );
+
+        let (cleanup_tx, cleanup_rx) = hotpath::channel!(
+            tokio::sync::mpsc::unbounded_channel::<CleanupDatabase>(),
+            label = "database-cleanup"
+        );
+
+        (Self { creation_tx, cleanup_tx }, creation_rx, cleanup_rx)
+    }
+}
+
 struct WorkerEngineIO {
     send_message: UnboundedSender<EngineMessage<ConsumerWorker>>,
     tracker: TaskTracker,
     shutdown_token: CancellationToken,
-    cleanup: DatabaseCleanup,
+    database_worker_senders: DatabaseWorkerSenders,
 }
 
 impl WorkerEngineIO {
@@ -88,9 +115,9 @@ impl WorkerEngineIO {
         send_message: UnboundedSender<EngineMessage<ConsumerWorker>>,
         tracker: TaskTracker,
         shutdown_token: CancellationToken,
-        cleanup: DatabaseCleanup,
+        database_worker_senders: DatabaseWorkerSenders,
     ) -> Self {
-        Self { send_message, tracker, shutdown_token, cleanup }
+        Self { send_message, tracker, shutdown_token, database_worker_senders }
     }
 
     /// Every background task races against the shutdown token: cancelling it
@@ -113,101 +140,23 @@ impl WorkerEngineIO {
     }
 }
 
-async fn recreate_database<P: PostgresClient + Send + Sync + 'static>(
-    producer: UnboundedSender<EngineMessage<ConsumerWorker>>,
-    worker_index: usize,
-    database_name: ReadString,
-    lease: LeaseId,
-    generation: u64,
-    postgres_client: Arc<P>,
-    cleanup: DatabaseCleanup,
-) {
-    // Reserve cleanup capacity before creating another database. When drops
-    // fall behind, this slot stays pending instead of accumulating more clones.
-    if cleanup.enqueue(database_name, postgres_client.clone()).await.is_err() {
-        return;
-    }
-
-    // Replacement retires the old lease even if its database could not be
-    // dropped. Otherwise that lease can attach to or recycle the replacement.
-
-    if producer.send(EngineMessage::DeleteLease { lease, generation }).is_err() {
-        tracing::error!("Unable to communicate with the worker to delete an unused lease");
-        return;
-    }
-
-    let mut retry_delay = Duration::from_secs(1);
-    loop {
-        match postgres_client.create_database().await {
-            Ok(database) => {
-                let _ = producer.send(EngineMessage::TemplateCreated {
-                    index: worker_index,
-                    result: Ok(database),
-                });
-                return;
-            }
-            Err(error) => {
-                tracing::error!(worker_index, %error, "replacement creation failed; retaining slot and retrying");
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-            }
-        }
-    }
-}
-
 impl EngineIO<ConsumerWorker, PostgresManager> for WorkerEngineIO {
-    fn spawn_create_database(
-        &self,
-        worker_index: usize,
-        postgres_client: Arc<PostgresManager>,
-    ) -> Result<(), IOError> {
-        let producer_spawn = self.send_message.clone();
+    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
+        let Err(error) = self.database_worker_senders.creation_tx.send(request) else {
+            return Ok(());
+        };
 
-        self.spawn_cancellable(async move {
-            match postgres_client.create_database().await {
-                Ok(template_name) => {
-                    match producer_spawn.send(EngineMessage::TemplateCreated {
-                        index: worker_index as usize,
-                        result: Ok(template_name.clone()),
-                    }) {
-                        Ok(_) => Ok(()),
-                        Err(_) => Err(IOError::FailedToSendTheMessage),
-                    }
-                }
-                Err(error) => {
-                    match producer_spawn.send(EngineMessage::TemplateCreated {
-                        index: worker_index as usize,
-                        result: Err(error),
-                    }) {
-                        Ok(_) => Ok(()),
-                        Err(_) => Err(IOError::FailedToSendTheMessage),
-                    }
-                }
-            }
-        });
-
-        Ok(())
+        tracing::error!(%error, "unable to send a creation database request");
+        Err(IOError::FailedToSendTheMessage)
     }
 
-    fn spawn_recreate_database(
-        &self,
-        worker_index: usize,
-        database_name: ReadString,
-        lease: LeaseId,
-        generation: u64,
-        postgres_client: Arc<PostgresManager>,
-    ) -> Result<(), IOError> {
-        self.spawn_cancellable(recreate_database(
-            self.send_message.clone(),
-            worker_index,
-            database_name,
-            lease,
-            generation,
-            postgres_client,
-            self.cleanup.clone(),
-        ));
+    fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError> {
+        let Err(error) = self.database_worker_senders.cleanup_tx.send(request) else {
+            return Ok(());
+        };
 
-        Ok(())
+        tracing::error!(%error, "unable to send a creation database request");
+        Err(IOError::FailedToSendTheMessage)
     }
 
     fn send_delayed_message(
@@ -326,19 +275,17 @@ impl WorkerEngineManager {
         postgres_config: PostgresConfig,
         worker_engine_config: WorkerEngineConfig,
     ) -> Result<Self, ()> {
-        if worker_engine_config.cleanup_max_pending == 0
-            || worker_engine_config.cleanup_concurrency == 0
-            || worker_engine_config.max_lease_records == 0
-        {
-            tracing::error!(
-                "cleanup capacity, concurrency, and lease record capacity must be greater than \
-                 zero"
-            );
+        if worker_engine_config.max_lease_records == 0 {
+            tracing::error!("lease record capacity must be greater than zero");
             return Err(());
         }
 
         let postgres_client = match PostgresManager::start(postgres_config).await {
             Ok(pg_client) => Arc::new(pg_client),
+            Err(error @ PostgresClientError::InvalidPoolSize(_)) => {
+                tracing::error!(%error, "invalid PostgreSQL pool configuration");
+                return Err(());
+            }
             Err(PostgresClientError::DatabaseDoesNotExist(database_name)) => {
                 tracing::error!(
                     "pgTest couldn't find {database_name} database to be used as template"
@@ -392,11 +339,34 @@ impl WorkerEngineManager {
 
         let tracker = TaskTracker::new();
         let shutdown_token = CancellationToken::new();
+
+        let (database_worker_senders, creation_rx, cleanup_rx) =
+            DatabaseWorkerSenders::init_database_worker_channels();
+
+        let creation_worker = DatabaseCreationWorker::new(
+            inbox_tx.clone(),
+            tracker.clone(),
+            shutdown_token.clone(),
+            postgres_client.clone(),
+            creation_rx,
+        );
+
+        let cleanup_worker = DatabaseCleanupWorker::new(
+            inbox_tx.clone(),
+            tracker.clone(),
+            shutdown_token.clone(),
+            postgres_client.clone(),
+            cleanup_rx,
+        );
+
         let worker_engine_inbox = WorkerEngineInbox::new(inbox_rx);
-        let cleanup =
-            DatabaseCleanup::new(&worker_engine_config, tracker.clone(), shutdown_token.clone());
-        let worker_engine_io =
-            WorkerEngineIO::new(inbox_tx.clone(), tracker.clone(), shutdown_token.clone(), cleanup);
+
+        let worker_engine_io = WorkerEngineIO::new(
+            inbox_tx.clone(),
+            tracker.clone(),
+            shutdown_token.clone(),
+            database_worker_senders,
+        );
 
         let mut worker_engine: WorkerEngineType = WorkerEngine::new(
             worker_engine_config,
@@ -406,6 +376,9 @@ impl WorkerEngineManager {
         );
 
         Box::pin(worker_engine.try_init()).await;
+
+        tracker.spawn(creation_worker.run());
+        tracker.spawn(cleanup_worker.run());
 
         let engine_handle = tokio::spawn(async move {
             worker_engine.run().await;
@@ -528,19 +501,23 @@ impl WorkerEngineManager {
     }
 
     #[cfg(all(test, not(feature = "stable_ids")))]
-    async fn drain_and_snapshot(self, cancel_spawned_threads: bool) -> WorkerEngineType {
-        if cancel_spawned_threads {
-            self.shutdown_token.cancel()
-        }
+    async fn drain_and_snapshot(self) -> WorkerEngineType {
         self.sync_inbox().await;
+        // Receiver loops now live in the tracker too. Cancel them before
+        // waiting.
+        self.shutdown_token.cancel();
         self.tracker.close();
-        loop {
-            self.tracker.wait().await;
-            self.sync_inbox().await;
-            if self.tracker.is_empty() {
-                break;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                self.tracker.wait().await;
+                self.sync_inbox().await;
+                if self.tracker.is_empty() {
+                    break;
+                }
             }
-        }
+        })
+        .await
+        .expect("background workers must stop");
 
         let _ = self.worker_inbox_tx.send(EngineMessage::Shutdown);
         self.engine_handle.await.expect("engine task panicked")
@@ -553,23 +530,22 @@ mod worker_engine_manager_test {
 
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
-    use tracing_test::traced_test;
 
     use crate::{
         postgres_manager::pg_container_config,
         utils::ReadString,
         worker_engine::{
-            core::{Slot, WorkerEngineConfig},
+            core::WorkerEngineConfig,
             messages::EngineMessage,
-            traits::EngineIO,
+            traits::{EngineIO, PostgresClient},
         },
         worker_manager::{WorkerEngineIO, WorkerEngineManager},
     };
 
-    fn fixed_pool_config(slots: u16) -> WorkerEngineConfig {
+    fn no_growth_config(slots: u16) -> WorkerEngineConfig {
         WorkerEngineConfig {
             initial_slots: slots,
-            maximum_slots: slots,
+            grow_batch_size: 0,
             lease_claim_timeout_ms: 30_000,
             ..WorkerEngineConfig::default()
         }
@@ -593,6 +569,81 @@ mod worker_engine_manager_test {
             .expect("engine must start")
     }
 
+    // Keep the real manager/engine and PostgreSQL, but explicitly deliver DDL
+    // results so timeout and cancellation tests do not depend on database
+    // creation speed.
+    struct DeferredWorkers {
+        creation_rx: super::UnboundedReceiver<super::CreateDatabase>,
+        _cleanup_rx: super::UnboundedReceiver<super::CleanupDatabase>,
+    }
+
+    impl DeferredWorkers {
+        async fn complete_creation(&mut self, manager: &WorkerEngineManager) -> ReadString {
+            let request = tokio::time::timeout(Duration::from_secs(5), self.creation_rx.recv())
+                .await
+                .expect("creation must be queued")
+                .expect("creation channel must be open");
+            let database_name =
+                manager.pg_client.create_database().await.expect("test database must be created");
+            manager
+                .worker_inbox_tx
+                .send(EngineMessage::DatabaseWorker(
+                    crate::worker_engine::database_jobs::DatabaseWorkerMessages::CreationFinished {
+                        database_id: request.database_id,
+                        result: Ok(database_name.clone()),
+                    },
+                ))
+                .unwrap();
+            manager.sync_inbox().await;
+            database_name
+        }
+    }
+
+    async fn start_with_deferred_workers() -> (WorkerEngineManager, DeferredWorkers) {
+        let config = WorkerEngineConfig {
+            initial_slots: 1,
+            starvation_threshold: 0,
+            grow_batch_size: 1,
+            ..WorkerEngineConfig::default()
+        };
+        let pg_client = std::sync::Arc::new(
+            crate::postgres_manager::PostgresManager::start(pg_container_config().await)
+                .await
+                .expect("PostgreSQL must start"),
+        );
+        let (engine_tx, engine_rx) = hotpath::channel!(tokio::sync::mpsc::unbounded_channel());
+        let tracker = tokio_util::task::TaskTracker::new();
+        let shutdown_token = CancellationToken::new();
+        let (senders, creation_rx, cleanup_rx) =
+            super::DatabaseWorkerSenders::init_database_worker_channels();
+        let io = WorkerEngineIO::new(
+            engine_tx.clone(),
+            tracker.clone(),
+            shutdown_token.clone(),
+            senders,
+        );
+        let mut engine = super::WorkerEngineType::new(
+            config,
+            pg_client.clone(),
+            io,
+            super::WorkerEngineInbox::new(engine_rx),
+        );
+        engine.try_init().await;
+        let engine_handle = tokio::spawn(async move {
+            engine.run().await;
+            engine
+        });
+        let manager = WorkerEngineManager {
+            worker_inbox_tx: engine_tx,
+            pg_client,
+            lease_claim_timeout: config.lease_claim_timeout_ms,
+            engine_handle,
+            tracker,
+            shutdown_token,
+        };
+        (manager, DeferredWorkers { creation_rx, _cleanup_rx: cleanup_rx })
+    }
+
     async fn enqueue_attach<F: Future>(manager: &WorkerEngineManager, mut attach: Pin<&mut F>) {
         poll_fn(|cx| {
             assert!(attach.as_mut().poll(cx).is_pending(), "attach must wait for a slot");
@@ -604,7 +655,7 @@ mod worker_engine_manager_test {
 
     #[tokio::test]
     async fn immediate_available_templates() {
-        start_manager(WorkerEngineConfig::default()).await;
+        start_manager(WorkerEngineConfig::default()).await.shutdown().await;
     }
 
     #[tokio::test]
@@ -622,15 +673,13 @@ mod worker_engine_manager_test {
 
         drop(session);
 
-        let engine = manager.drain_and_snapshot(true).await;
+        let engine = manager.drain_and_snapshot().await;
         let snapshot = engine.snapshot();
 
         assert_eq!(snapshot.leases.get(&lease).expect("lease must remain assigned").conns, 0);
-        let leased =
-            snapshot.slots.iter().filter(|slot| matches!(slot, Slot::Leased { .. })).count();
-        assert_eq!(leased, 1);
+        assert_eq!(snapshot.leases.len(), 1);
         assert_eq!(
-            snapshot.ready_slots.len(),
+            snapshot.inventory.ready.len(),
             usize::from(WorkerEngineConfig::default().initial_slots - 1)
         );
 
@@ -662,15 +711,14 @@ mod worker_engine_manager_test {
 
         drop(session);
 
-        let engine = manager.drain_and_snapshot(true).await;
+        let engine = manager.drain_and_snapshot().await;
         let snapshot = engine.snapshot();
 
         assert!(snapshot.leases.contains_key(&lease));
-        let leased =
-            snapshot.slots.iter().filter(|slot| matches!(slot, Slot::Leased { .. })).count();
-        assert_eq!(leased, 1);
+        assert_eq!(snapshot.leases.len(), 1);
+        assert_eq!(snapshot.leases[&lease].conns, 1);
         assert_eq!(
-            snapshot.ready_slots.len(),
+            snapshot.inventory.ready.len(),
             usize::from(WorkerEngineConfig::default().initial_slots - 1)
         );
     }
@@ -682,7 +730,7 @@ mod worker_engine_manager_test {
         let result = manager.attach("not_the_template", ReadString::from("connection1")).await;
         assert!(result.is_err());
 
-        let engine = manager.drain_and_snapshot(false).await;
+        let engine = manager.drain_and_snapshot().await;
         assert!(engine.snapshot().leases.is_empty());
     }
 
@@ -691,7 +739,7 @@ mod worker_engine_manager_test {
      {
         let worker_engine_config = WorkerEngineConfig {
             initial_slots: 0,
-            maximum_slots: 0,
+            grow_batch_size: 0,
             lease_claim_timeout_ms: 100,
             ..WorkerEngineConfig::default()
         };
@@ -710,17 +758,20 @@ mod worker_engine_manager_test {
         );
 
         tokio::time::resume();
-        let engine = manager.drain_and_snapshot(false).await;
+        let engine = manager.drain_and_snapshot().await;
         let snapshot = engine.snapshot();
         assert!(snapshot.leases.is_empty());
-        assert_eq!(snapshot.waiters.len(), 1, "the timed-out claim stays parked in the engine");
+        assert_eq!(
+            snapshot.waiters.len(),
+            1,
+            "the timed-out claim remains queued until supply arrives"
+        );
         assert_eq!(snapshot.waiters.front().unwrap(), &lease);
     }
 
     #[tokio::test]
-    async fn given_a_full_pool_when_a_slot_is_recycled_after_attach_times_out_then_it_stays_ready()
-    {
-        let mut manager = start_manager(fixed_pool_config(1)).await;
+    async fn creation_after_attach_timeout_leaves_the_new_database_ready() {
+        let (mut manager, mut workers) = start_with_deferred_workers().await;
         let session = manager
             .attach("pgtest", ReadString::from("holder"))
             .await
@@ -743,20 +794,20 @@ mod worker_engine_manager_test {
                 generation: 1,
             })
             .unwrap();
-        let engine = manager.drain_and_snapshot(false).await;
+        let created = workers.complete_creation(&manager).await;
+        let engine = manager.drain_and_snapshot().await;
         let snapshot = engine.snapshot();
         assert!(snapshot.leases.is_empty());
-        assert!(snapshot.waiters.is_empty(), "recycling must remove the expired caller");
-        assert!(matches!(
-            &snapshot.slots[..],
-            [Slot::Ready { db_name }] if *db_name != original_database
-        ));
-        assert_eq!(snapshot.ready_slots.len(), 1);
+        assert!(snapshot.waiters.is_empty(), "creation must skip the closed reply channel");
+        assert_eq!(snapshot.inventory.ready.len(), 1);
+        assert_eq!(snapshot.inventory.ready[0].database_name, created);
+        assert_ne!(created, original_database);
+        assert_eq!(snapshot.inventory.retiring.len(), 1, "cleanup has not completed");
     }
 
     #[tokio::test]
-    async fn given_a_queued_attach_when_a_slot_is_recycled_then_the_caller_receives_the_database() {
-        let manager = start_manager(fixed_pool_config(1)).await;
+    async fn queued_attach_receives_creation_while_cleanup_is_pending() {
+        let (manager, mut workers) = start_with_deferred_workers().await;
         let holder = ReadString::from("holder");
         let waiting = ReadString::from("waiting");
         let session = manager
@@ -771,27 +822,28 @@ mod worker_engine_manager_test {
             .worker_inbox_tx
             .send(EngineMessage::LeaseMaxTimeReached { lease: holder.clone(), generation: 1 })
             .unwrap();
-        let received_session =
-            attach.await.expect("queued attach must receive the recycled database");
+        let created = workers.complete_creation(&manager).await;
+        let received_session = attach.await.expect("queued attach must receive the fresh database");
+        assert_eq!(received_session.database_name, created);
 
-        let engine = manager.drain_and_snapshot(true).await;
+        let engine = manager.drain_and_snapshot().await;
         let snapshot = engine.snapshot();
         assert!(snapshot.waiters.is_empty());
         assert!(!snapshot.leases.contains_key(&holder));
         assert_eq!(snapshot.leases.len(), 1);
         assert_eq!(snapshot.leases.get(&waiting).expect("new lease must exist").conns, 1);
-        assert!(matches!(
-            &snapshot.slots[..],
-            [Slot::Leased { db_name, lease }]
-                if *db_name == received_session.database_name && *lease == waiting
-        ));
-        assert_eq!(snapshot.ready_slots.len(), 0);
+        assert_eq!(
+            snapshot.leases[&waiting].database.database_name,
+            received_session.database_name
+        );
+        assert_eq!(snapshot.inventory.retiring.len(), 1, "attachment did not wait for cleanup");
+        assert_eq!(snapshot.inventory.ready.len(), 0);
         drop(received_session);
     }
 
     #[tokio::test]
-    async fn given_a_cancelled_attach_when_a_slot_is_recycled_then_the_closed_reply_is_skipped() {
-        let manager = start_manager(fixed_pool_config(1)).await;
+    async fn creation_skips_a_cancelled_attach_and_keeps_the_database_ready() {
+        let (manager, mut workers) = start_with_deferred_workers().await;
         let session = manager
             .attach("pgtest", ReadString::from("holder"))
             .await
@@ -811,7 +863,8 @@ mod worker_engine_manager_test {
             })
             .unwrap();
 
-        let engine = manager.drain_and_snapshot(false).await;
+        let created = workers.complete_creation(&manager).await;
+        let engine = manager.drain_and_snapshot().await;
         assert!(
             started_at.elapsed() < Duration::from_secs(30),
             "the reply must be skipped because its receiver closed, before waiter expiry"
@@ -819,16 +872,14 @@ mod worker_engine_manager_test {
         let snapshot = engine.snapshot();
         assert!(snapshot.leases.is_empty());
         assert!(snapshot.waiters.is_empty());
-        assert!(matches!(
-            &snapshot.slots[..],
-            [Slot::Ready { db_name }] if *db_name != original_database
-        ));
-        assert_eq!(snapshot.ready_slots.len(), 1);
+        assert_eq!(snapshot.inventory.ready[0].database_name, created);
+        assert_ne!(created, original_database);
+        assert_eq!(snapshot.inventory.ready.len(), 1);
     }
 
     #[tokio::test]
     async fn given_a_closed_engine_inbox_when_attaching_then_the_caller_fails_without_waiting() {
-        let mut manager = start_manager(fixed_pool_config(0)).await;
+        let mut manager = start_manager(no_growth_config(0)).await;
         assert!(manager.worker_inbox_tx.send(EngineMessage::Shutdown).is_ok());
         let engine = (&mut manager.engine_handle).await.expect("engine must not panic");
         drop(engine);
@@ -845,25 +896,23 @@ mod worker_engine_manager_test {
 
     #[tokio::test]
     async fn given_a_pending_delayed_message_when_shutting_down_then_the_task_is_cancelled() {
-        let manager = start_manager(fixed_pool_config(0)).await;
+        let manager = start_manager(no_growth_config(0)).await;
         let tracker = manager.tracker.clone();
         let inbox = manager.worker_inbox_tx.clone();
-        let cleanup = super::DatabaseCleanup::new(
-            &WorkerEngineConfig::default(),
-            tracker.clone(),
-            manager.shutdown_token.clone(),
-        );
+        let initial_tasks = tracker.len();
+        let (senders, _creation_rx, _cleanup_rx) =
+            super::DatabaseWorkerSenders::init_database_worker_channels();
         let io = WorkerEngineIO::new(
             inbox.clone(),
             tracker.clone(),
             manager.shutdown_token.clone(),
-            cleanup,
+            senders,
         );
         let (reply, mut received) = tokio::sync::oneshot::channel();
         io.send_delayed_message(EngineMessage::Barrier { reply }, 60_000, CancellationToken::new())
             .expect("delayed message task must be scheduled");
 
-        assert_eq!(tracker.len(), 1);
+        assert_eq!(tracker.len(), initial_tasks + 1);
         assert!(matches!(
             received.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)

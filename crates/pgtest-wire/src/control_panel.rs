@@ -53,7 +53,7 @@ impl PgTestControlPanel {
             ReleaseError::LeaseRecordLimitReached => "53400",
             ReleaseError::EngineUnavailable => "08006",
             ReleaseError::ReplyTimedOut => "57014",
-            ReleaseError::UnexpectedReply | ReleaseError::InvalidSlot => "XX000",
+            ReleaseError::UnexpectedReply => "XX000",
         };
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".into(),

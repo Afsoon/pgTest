@@ -4,10 +4,12 @@ use std::{
     time::Instant,
 };
 
+use rustc_hash::FxHashSet;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    core::{LeaseId, Slot, WorkerEngine, WorkerEngineConfig},
+    core::{LeaseId, WorkerEngine, WorkerEngineConfig},
+    database_jobs::{CleanupDatabase, CreateDatabase, DatabaseId, DatabaseWorkerMessages},
     errors::{AttachError, IOError, PostgresDDLClientError, ReleaseError},
     messages::{ConsumerReply, EngineMessage},
     test_support::{
@@ -23,11 +25,12 @@ type Engine =
 
 #[derive(Default)]
 struct Operations {
-    creates: Vec<usize>,
-    replacements: Vec<usize>,
+    // Histories include attempts whose submission was rejected.
+    creates: Vec<DatabaseId>,
+    cleanups: Vec<CleanupDatabase>,
     timers: Vec<(EngineMessage<ConsumerWorker>, CancellationToken)>,
-    spawn_results: VecDeque<Result<(), IOError>>,
-    reject_retry: bool,
+    create_results: VecDeque<Result<(), IOError>>,
+    cleanup_results: VecDeque<Result<(), IOError>>,
 }
 
 /// Records work without completing it, so tests can submit an entire burst
@@ -39,26 +42,16 @@ struct DeferredIO {
 }
 
 impl EngineIO<ConsumerWorker, PostgresConnection> for DeferredIO {
-    fn spawn_create_database(
-        &self,
-        index: usize,
-        _: Arc<PostgresConnection>,
-    ) -> Result<(), IOError> {
+    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
         let mut operations = self.operations.lock().unwrap();
-        operations.creates.push(index);
-        operations.spawn_results.pop_front().unwrap_or(Ok(()))
+        operations.creates.push(request.database_id);
+        operations.create_results.pop_front().unwrap_or(Ok(()))
     }
 
-    fn spawn_recreate_database(
-        &self,
-        index: usize,
-        _: ReadString,
-        lease: LeaseId,
-        generation: u64,
-        _: Arc<PostgresConnection>,
-    ) -> Result<(), IOError> {
-        self.operations.lock().unwrap().replacements.push(index);
-        self.send_message(EngineMessage::DeleteLease { lease, generation })
+    fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError> {
+        let mut operations = self.operations.lock().unwrap();
+        operations.cleanups.push(request);
+        operations.cleanup_results.pop_front().unwrap_or(Ok(()))
     }
 
     fn send_delayed_message(
@@ -72,11 +65,6 @@ impl EngineIO<ConsumerWorker, PostgresConnection> for DeferredIO {
     }
 
     fn send_message(&self, message: EngineMessage<ConsumerWorker>) -> Result<(), IOError> {
-        if self.operations.lock().unwrap().reject_retry
-            && matches!(message, EngineMessage::RetryDatabaseCreation { .. })
-        {
-            return Err(IOError::FailedToSendTheMessage);
-        }
         self.inbox.lock().unwrap().push_back(message);
         Ok(())
     }
@@ -89,6 +77,10 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn creation_ids(&self) -> Vec<DatabaseId> {
+        self.io.operations.lock().unwrap().creates.clone()
+    }
+
     fn release(&self, lease: &str) -> EngineMessage<ConsumerWorker> {
         EngineMessage::ReleaseLease { lease: LeaseId::from(lease), reply: self.consumer.clone() }
     }
@@ -112,47 +104,72 @@ impl Fixture {
 
     async fn process(&mut self, messages: Vec<EngineMessage<ConsumerWorker>>) {
         self.io.inbox.lock().unwrap().extend(messages);
-        self.engine.run().await;
-        assert_eq!(
-            self.engine.ready_slots.len(),
-            self.engine.slots.iter().filter(|slot| matches!(slot, Slot::Ready { .. })).count()
-        );
-        for &index in &self.engine.pending_creations {
-            assert!(matches!(self.engine.slots[index], Slot::Creating { .. } | Slot::Done { .. }));
+        self.engine.process_messages().await;
+
+        let inventory = &self.engine.inventory;
+        let mut seen = FxHashSet::default();
+
+        let ids = inventory
+            .creating
+            .iter()
+            .copied()
+            .chain(inventory.ready.iter().map(|database| database.database_id))
+            .chain(self.engine.leases.values().map(|entry| entry.database.database_id))
+            .chain(inventory.retiring.keys().copied());
+
+        for database_id in ids {
+            assert!(
+                seen.insert(database_id),
+                "database {database_id:?} appears more than once across lifecycle states"
+            );
         }
     }
 
-    async fn complete(&mut self, index: usize) {
-        self.process(vec![EngineMessage::TemplateCreated {
-            index,
-            result: Ok(ReadString::from(format!("completed_{index}"))),
-        }])
+    async fn finish_creation(
+        &mut self,
+        database_id: DatabaseId,
+        result: Result<ReadString, PostgresDDLClientError>,
+    ) {
+        self.process(vec![EngineMessage::DatabaseWorker(
+            DatabaseWorkerMessages::CreationFinished { database_id, result },
+        )])
         .await;
     }
 
-    async fn fail(&mut self, index: usize) {
-        self.process(vec![EngineMessage::TemplateCreated {
-            index,
-            result: Err(PostgresDDLClientError::NonRecoverableError("injected".into())),
-        }])
+    async fn finish_cleanup(
+        &mut self,
+        database_id: DatabaseId,
+        result: Result<(), PostgresDDLClientError>,
+    ) {
+        self.process(vec![EngineMessage::DatabaseWorker(
+            DatabaseWorkerMessages::CleanupFinished { database_id, result },
+        )])
         .await;
     }
 }
 
 #[tokio::test]
-async fn release_cancels_sessions_and_stays_closed_after_replacement() {
+async fn release_allows_new_attachments_while_cleanup_is_pending() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 1,
+        starvation_threshold: 0,
+        grow_batch_size: 1,
         ..WorkerEngineConfig::default()
     })
     .await;
     fixture.process(vec![fixture.attach("test")]).await;
-    let cancellation = fixture.engine.leases["test"].cancellation.clone();
-    let generation = fixture.engine.leases["test"].generation;
+    let old = fixture.engine.leases["test"].clone();
+    assert!(!old.cancellation.is_cancelled());
+
     fixture.process(vec![fixture.release("test"), fixture.release("test")]).await;
-    assert!(cancellation.is_cancelled());
-    assert_eq!(fixture.io.operations.lock().unwrap().replacements, vec![0]);
+    assert!(old.cancellation.is_cancelled());
+    assert!(!fixture.engine.leases.contains_key("test"));
+    {
+        let operations = fixture.io.operations.lock().unwrap();
+        assert_eq!(operations.cleanups.len(), 1);
+        assert_eq!(operations.cleanups[0].database_id, old.database.database_id);
+        assert_eq!(operations.cleanups[0].database_name, old.database.database_name);
+    }
     assert_eq!(
         fixture
             .consumer
@@ -162,63 +179,32 @@ async fn release_cancels_sessions_and_stays_closed_after_replacement() {
             .count(),
         2
     );
-    fixture.complete(0).await;
+
     fixture.process(vec![fixture.attach("test"), fixture.attach("next")]).await;
-    let next_generation = fixture.engine.leases["next"].generation;
-    fixture
-        .process(vec![
-            EngineMessage::Detach { lease: LeaseId::from("test"), generation },
-            EngineMessage::LeaseMaxTimeReached { lease: LeaseId::from("test"), generation },
-            EngineMessage::DeleteLease { lease: LeaseId::from("test"), generation },
-        ])
-        .await;
-    assert_eq!(fixture.engine.leases["next"].conns, 1);
-    assert_eq!(fixture.engine.leases["next"].generation, next_generation);
-    assert!(!fixture.engine.leases["next"].cancellation.is_cancelled());
-    assert!(
-        fixture
-            .consumer
-            .messages()
-            .iter()
-            .any(|reply| matches!(reply, ConsumerReply::AttachRejected(AttachError::LeaseClosed)))
+    assert!(!fixture.engine.leases.contains_key("next"));
+    let next_id = fixture.creation_ids()[0];
+    assert_ne!(next_id, old.database.database_id);
+    fixture.finish_creation(next_id, Ok(ReadString::from("fresh_database"))).await;
+
+    let next = fixture.engine.leases["next"].clone();
+    assert_eq!(next.database.database_id, next_id);
+    assert_eq!(next.conns, 1);
+    assert!(!next.cancellation.is_cancelled());
+    assert!(fixture.engine.waiters.is_empty());
+    assert_eq!(
+        fixture.engine.inventory.retiring.get(&old.database.database_id),
+        Some(&old.database.database_name)
     );
-}
 
-#[tokio::test]
-async fn releasing_an_unseen_id_does_not_allocate_a_database() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        initial_slots: 1,
-        maximum_slots: 1,
-        ..WorkerEngineConfig::default()
-    })
-    .await;
-    fixture.process(vec![fixture.release("late"), fixture.attach("late")]).await;
-    assert!(fixture.engine.leases.is_empty());
-    assert_eq!(fixture.engine.ready_slots.len(), 1);
-    assert!(fixture.io.operations.lock().unwrap().replacements.is_empty());
-    assert!(matches!(
-        fixture.consumer.messages().back(),
-        Some(ConsumerReply::AttachRejected(AttachError::LeaseClosed))
-    ));
-}
-
-#[tokio::test]
-async fn release_fails_all_waiters_without_consuming_the_shared_creation() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        initial_slots: 0,
-        maximum_slots: 1,
-        grow_batch_size: 1,
-        ..WorkerEngineConfig::default()
-    })
-    .await;
-    fixture
-        .process(vec![
-            fixture.attach("waiting"),
-            fixture.attach("waiting"),
-            fixture.release("waiting"),
-            fixture.attach("survivor"),
-        ])
-        .await;
+    fixture.finish_cleanup(old.database.database_id, Ok(())).await;
+    fixture.process(vec![fixture.attach("test")]).await;
+    assert!(fixture.engine.inventory.retiring.is_empty());
+    assert!(!fixture.engine.leases.contains_key("test"));
+    assert_eq!(fixture.engine.leases["next"].database.database_id, next_id);
+    assert_eq!(fixture.engine.leases["next"].generation, next.generation);
+    assert_eq!(fixture.engine.leases["next"].conns, 1);
+    assert!(!fixture.engine.leases["next"].cancellation.is_cancelled());
+    assert_eq!(fixture.io.operations.lock().unwrap().cleanups.len(), 1);
     assert_eq!(
         fixture
             .consumer
@@ -231,9 +217,59 @@ async fn release_fails_all_waiters_without_consuming_the_shared_creation() {
             .count(),
         2
     );
-    assert!(fixture.io.operations.lock().unwrap().replacements.is_empty());
-    fixture.complete(0).await;
-    assert!(fixture.engine.leases.contains_key("survivor"));
+}
+
+#[tokio::test]
+async fn releasing_an_unseen_id_does_not_allocate_a_database() {
+    let mut fixture =
+        Fixture::new(WorkerEngineConfig { initial_slots: 1, ..WorkerEngineConfig::default() })
+            .await;
+    let original = fixture.engine.inventory.ready[0].clone();
+    fixture.process(vec![fixture.release("late"), fixture.attach("late")]).await;
+
+    assert!(fixture.engine.leases.is_empty());
+    assert_eq!(fixture.engine.inventory.ready.len(), 1);
+    assert_eq!(fixture.engine.inventory.ready[0].database_id, original.database_id);
+    assert!(fixture.engine.inventory.creating.is_empty());
+    assert!(fixture.engine.inventory.retiring.is_empty());
+    assert!(fixture.creation_ids().is_empty());
+    assert!(fixture.io.operations.lock().unwrap().cleanups.is_empty());
+    assert!(matches!(
+        fixture.consumer.messages().back(),
+        Some(ConsumerReply::AttachRejected(AttachError::LeaseClosed))
+    ));
+}
+
+#[tokio::test]
+async fn release_fails_all_waiters_without_consuming_the_shared_creation() {
+    let mut fixture = Fixture::new(WorkerEngineConfig {
+        initial_slots: 0,
+        starvation_threshold: 0,
+        grow_batch_size: 1,
+        ..WorkerEngineConfig::default()
+    })
+    .await;
+    fixture.process(vec![fixture.attach("waiting"), fixture.attach("waiting")]).await;
+    let requested = fixture.creation_ids();
+    fixture.process(vec![fixture.release("waiting"), fixture.attach("survivor")]).await;
+
+    assert_eq!(
+        fixture
+            .consumer
+            .messages()
+            .iter()
+            .filter(|reply| matches!(
+                reply,
+                ConsumerReply::AttachRejected(AttachError::LeaseClosed)
+            ))
+            .count(),
+        2
+    );
+    assert_eq!(fixture.creation_ids(), requested);
+    assert!(fixture.io.operations.lock().unwrap().cleanups.is_empty());
+    fixture.finish_creation(requested[0], Ok(ReadString::from("survivor_database"))).await;
+    assert_eq!(fixture.engine.leases["survivor"].database.database_id, requested[0]);
+    assert_eq!(fixture.engine.leases["survivor"].conns, 1);
     assert!(!fixture.engine.leases.contains_key("waiting"));
     assert!(fixture.engine.waiters.is_empty());
 }
@@ -242,7 +278,6 @@ async fn release_fails_all_waiters_without_consuming_the_shared_creation() {
 async fn record_limit_reserves_room_for_closing_existing_leases() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 1,
         max_lease_records: 2,
         ..WorkerEngineConfig::default()
     })
@@ -273,18 +308,19 @@ async fn record_limit_reserves_room_for_closing_existing_leases() {
             .count(),
         3
     );
+    assert!(fixture.engine.leases.is_empty());
+    assert!(fixture.engine.waiters.is_empty());
+    assert_eq!(fixture.io.operations.lock().unwrap().cleanups.len(), 1);
 }
 
 #[tokio::test]
 async fn lost_release_reply_does_not_undo_closure_or_cleanup() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        initial_slots: 1,
-        maximum_slots: 1,
-        ..WorkerEngineConfig::default()
-    })
-    .await;
+    let mut fixture =
+        Fixture::new(WorkerEngineConfig { initial_slots: 1, ..WorkerEngineConfig::default() })
+            .await;
     fixture.process(vec![fixture.attach("test")]).await;
-    let cancellation = fixture.engine.leases["test"].cancellation.clone();
+    let old = fixture.engine.leases["test"].clone();
+    assert!(!old.cancellation.is_cancelled());
     fixture
         .process(vec![EngineMessage::ReleaseLease {
             lease: LeaseId::from("test"),
@@ -292,8 +328,16 @@ async fn lost_release_reply_does_not_undo_closure_or_cleanup() {
         }])
         .await;
     fixture.process(vec![fixture.release("test"), fixture.attach("test")]).await;
-    assert!(cancellation.is_cancelled());
-    assert_eq!(fixture.io.operations.lock().unwrap().replacements, vec![0]);
+
+    assert!(old.cancellation.is_cancelled());
+    assert!(!fixture.engine.leases.contains_key("test"));
+    assert_eq!(
+        fixture.engine.inventory.retiring.get(&old.database.database_id),
+        Some(&old.database.database_name)
+    );
+    let operations = fixture.io.operations.lock().unwrap();
+    assert_eq!(operations.cleanups.len(), 1);
+    assert_eq!(operations.cleanups[0].database_id, old.database.database_id);
     assert!(matches!(
         fixture.consumer.messages().back(),
         Some(ConsumerReply::AttachRejected(AttachError::LeaseClosed))
@@ -301,116 +345,154 @@ async fn lost_release_reply_does_not_undo_closure_or_cleanup() {
 }
 
 #[tokio::test]
-async fn old_generation_events_cannot_retire_a_reused_id() {
+async fn old_generation_events_and_cleanup_cannot_retire_a_reused_lease_id() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 1,
+        starvation_threshold: 0,
+        grow_batch_size: 1,
         ..WorkerEngineConfig::default()
     })
     .await;
     fixture.process(vec![fixture.attach("test")]).await;
-    let generation = fixture.engine.leases["test"].generation;
+    let old = fixture.engine.leases["test"].clone();
     fixture
         .process(vec![EngineMessage::LeaseMaxTimeReached {
             lease: LeaseId::from("test"),
-            generation,
+            generation: old.generation,
         }])
         .await;
-    fixture.complete(0).await;
+    assert!(old.cancellation.is_cancelled());
+
+    let new_id = fixture.creation_ids()[0];
+    fixture.finish_creation(new_id, Ok(ReadString::from("new_generation"))).await;
     fixture.process(vec![fixture.attach("test")]).await;
-    assert_ne!(fixture.engine.leases["test"].generation, generation);
+    let new = fixture.engine.leases["test"].clone();
+    assert_ne!(new.generation, old.generation);
+    assert_ne!(new.database.database_id, old.database.database_id);
+    assert!(!new.cancellation.is_cancelled());
+
     fixture
         .process(vec![
-            EngineMessage::Detach { lease: LeaseId::from("test"), generation },
-            EngineMessage::LeaseMaxTimeReached { lease: LeaseId::from("test"), generation },
-            EngineMessage::DeleteLease { lease: LeaseId::from("test"), generation },
+            EngineMessage::Detach { lease: LeaseId::from("test"), generation: old.generation },
+            EngineMessage::LeaseMaxTimeReached {
+                lease: LeaseId::from("test"),
+                generation: old.generation,
+            },
         ])
         .await;
+    fixture.finish_cleanup(old.database.database_id, Ok(())).await;
+    fixture.finish_cleanup(old.database.database_id, Ok(())).await;
+    assert_eq!(fixture.engine.leases["test"].database.database_id, new_id);
+    assert_eq!(fixture.engine.leases["test"].generation, new.generation);
     assert_eq!(fixture.engine.leases["test"].conns, 1);
-    assert!(!fixture.engine.leases["test"].cancellation.is_cancelled());
-    assert_eq!(fixture.io.operations.lock().unwrap().replacements, vec![0]);
+    assert!(!new.cancellation.is_cancelled());
+    assert!(fixture.engine.inventory.retiring.is_empty());
+    assert_eq!(fixture.io.operations.lock().unwrap().cleanups.len(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_expiry_schedules_cleanup_only_once() {
+    let mut fixture = Fixture::new(WorkerEngineConfig::default()).await;
+    fixture.process(vec![fixture.attach("test")]).await;
+    let old = fixture.engine.leases["test"].clone();
+    fixture
+        .process(vec![
+            EngineMessage::LeaseMaxTimeReached {
+                lease: LeaseId::from("test"),
+                generation: old.generation,
+            },
+            EngineMessage::LeaseMaxTimeReached {
+                lease: LeaseId::from("test"),
+                generation: old.generation,
+            },
+        ])
+        .await;
+    assert!(fixture.engine.leases.is_empty());
+    assert!(old.cancellation.is_cancelled());
+    assert_eq!(fixture.engine.inventory.retiring.len(), 1);
+    assert_eq!(fixture.io.operations.lock().unwrap().cleanups.len(), 1);
+    assert_eq!(fixture.engine.counters.rejected_attach_max_lifetime, 1);
 }
 
 #[tokio::test]
 async fn last_disconnect_keeps_the_database_for_reconnect() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 1,
         lease_claim_timeout_ms: 0,
         ..WorkerEngineConfig::default()
     })
     .await;
     let lease = LeaseId::from("reconnecting");
     fixture.process(vec![fixture.attach(&lease)]).await;
-    let Slot::Leased { db_name: original_database, .. } = fixture.engine.slots[0].clone() else {
-        panic!("the first connection must lease the database");
-    };
-
-    fixture.process(vec![EngineMessage::Detach { lease: lease.clone(), generation: 1 }]).await;
+    let original = fixture.engine.leases[&lease].clone();
+    let creates = fixture.creation_ids();
+    fixture
+        .process(vec![EngineMessage::Detach {
+            lease: lease.clone(),
+            generation: original.generation,
+        }])
+        .await;
     assert_eq!(fixture.engine.leases[&lease].conns, 0);
-    assert!(matches!(fixture.engine.slots[0], Slot::Leased { .. }));
-    assert!(fixture.io.operations.lock().unwrap().replacements.is_empty());
+    assert!(!original.cancellation.is_cancelled());
+    assert!(fixture.io.operations.lock().unwrap().cleanups.is_empty());
     assert!(fixture.io.operations.lock().unwrap().timers.is_empty());
 
     fixture.process(vec![fixture.attach(&lease)]).await;
-    assert_eq!(fixture.engine.leases[&lease].conns, 1);
-    assert!(matches!(
-        &fixture.engine.slots[0],
-        Slot::Leased { db_name, .. } if *db_name == original_database
-    ));
+    let reconnected = &fixture.engine.leases[&lease];
+    assert_eq!(reconnected.conns, 1);
+    assert_eq!(reconnected.database.database_id, original.database.database_id);
+    assert_eq!(reconnected.database.database_name, original.database.database_name);
+    assert_eq!(reconnected.generation, original.generation);
+    assert_eq!(fixture.creation_ids(), creates, "joining must not request more supply");
 }
 
 #[tokio::test]
 async fn startup_does_not_prefill_beyond_initial_size() {
     let fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 12,
         starvation_threshold: 8,
         grow_batch_size: 4,
         ..WorkerEngineConfig::default()
     })
     .await;
-    assert_eq!(fixture.engine.ready_slots.len(), 1);
-    assert_eq!(fixture.engine.capacity.current, 1);
-    assert!(fixture.engine.pending_creations.is_empty());
-    assert!(fixture.io.operations.lock().unwrap().creates.is_empty());
+    assert_eq!(fixture.engine.inventory.ready.len(), 1);
+    assert!(fixture.engine.inventory.creating.is_empty());
+    assert!(fixture.engine.inventory.retiring.is_empty());
+    assert!(fixture.creation_ids().is_empty());
 }
 
 #[tokio::test]
 async fn covered_burst_does_not_schedule_redundant_batches() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 12,
         starvation_threshold: 0,
         grow_batch_size: 4,
         ..WorkerEngineConfig::default()
     })
     .await;
     fixture.process(vec![fixture.attach("holder"), fixture.attach("a"), fixture.attach("b")]).await;
-    assert_eq!(fixture.engine.capacity.current, 5);
-    assert_eq!(fixture.engine.pending_creations.len(), 4);
-    assert_eq!(fixture.io.operations.lock().unwrap().creates, vec![1, 2, 3, 4]);
-    assert!(fixture.engine.ready_slots.is_empty());
+    assert_eq!(fixture.engine.inventory.creating.len(), 4);
+    assert_eq!(fixture.creation_ids(), (2..=5).map(DatabaseId).collect::<Vec<_>>());
+    assert!(fixture.engine.inventory.ready.is_empty());
     assert_eq!(fixture.consumer.messages().len(), 1);
 }
 
 #[tokio::test]
-async fn excess_demand_grows_before_any_completion_and_clamps_to_maximum() {
+async fn excess_demand_grows_in_full_batches_before_any_completion() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 8,
         starvation_threshold: 0,
         grow_batch_size: 4,
         ..WorkerEngineConfig::default()
     })
     .await;
     fixture.process(vec![fixture.attach("holder")]).await;
-    assert_eq!(fixture.engine.pending_creations.len(), 4);
+    assert_eq!(fixture.engine.inventory.creating.len(), 4);
     let burst = (0..10).map(|n| fixture.attach(&format!("waiting_{n}"))).collect();
     fixture.process(burst).await;
-    assert_eq!(fixture.engine.capacity.current, 8);
-    assert_eq!(fixture.engine.pending_creations.len(), 7);
-    assert_eq!(fixture.io.operations.lock().unwrap().creates, (1..8).collect::<Vec<_>>());
+    assert_eq!(fixture.engine.inventory.creating.len(), 12, "ten waiting leases plus reserve");
+    assert_eq!(fixture.creation_ids(), (2..=13).map(DatabaseId).collect::<Vec<_>>());
+    assert_eq!(fixture.engine.waiters.len(), 10);
     assert_eq!(fixture.consumer.messages().len(), 1, "no creation has completed yet");
 }
 
@@ -418,7 +500,6 @@ async fn excess_demand_grows_before_any_completion_and_clamps_to_maximum() {
 async fn connections_for_one_lease_share_demand_and_one_completion() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 0,
-        maximum_slots: 12,
         starvation_threshold: 0,
         grow_batch_size: 4,
         ..WorkerEngineConfig::default()
@@ -426,99 +507,136 @@ async fn connections_for_one_lease_share_demand_and_one_completion() {
     .await;
     let burst = (0..20).map(|_| fixture.attach("shared")).collect();
     fixture.process(burst).await;
-    assert_eq!(fixture.engine.capacity.current, 4);
+    assert_eq!(fixture.engine.inventory.creating.len(), 4);
     assert_eq!(fixture.engine.waiters.len(), 1);
-    fixture.complete(0).await;
+    let id = fixture.creation_ids()[0];
+    fixture.finish_creation(id, Ok(ReadString::from("shared_database"))).await;
     assert_eq!(fixture.consumer.messages().len(), 20);
-    assert_eq!(fixture.engine.leases[&LeaseId::from("shared")].conns, 20);
+    assert_eq!(fixture.engine.leases["shared"].conns, 20);
+    assert_eq!(fixture.engine.leases["shared"].database.database_id, id);
     assert!(fixture.engine.waiters.is_empty());
-    assert_eq!(fixture.engine.pending_creations.len(), 3);
+    assert_eq!(fixture.engine.inventory.creating.len(), 3);
+}
+
+#[tokio::test]
+async fn one_creation_serves_only_one_distinct_waiting_lease() {
+    let mut fixture = Fixture::new(WorkerEngineConfig {
+        initial_slots: 0,
+        starvation_threshold: 0,
+        grow_batch_size: 1,
+        ..WorkerEngineConfig::default()
+    })
+    .await;
+    fixture.process(vec![fixture.attach("first"), fixture.attach("second")]).await;
+    let ids = fixture.creation_ids();
+    fixture.finish_creation(ids[0], Ok(ReadString::from("first_database"))).await;
+    assert_eq!(fixture.engine.leases["first"].database.database_id, ids[0]);
+    assert!(!fixture.engine.leases.contains_key("second"));
+    assert_eq!(
+        fixture.engine.waiters.iter().cloned().collect::<Vec<_>>(),
+        vec![LeaseId::from("second")]
+    );
+    assert_eq!(fixture.consumer.messages().len(), 1);
+    fixture.finish_creation(ids[1], Ok(ReadString::from("second_database"))).await;
+    assert_eq!(fixture.engine.leases["second"].database.database_id, ids[1]);
+    assert!(fixture.engine.waiters.is_empty());
 }
 
 #[tokio::test]
 async fn settled_success_is_not_counted_as_both_ready_and_pending() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 0,
-        maximum_slots: 8,
         starvation_threshold: 0,
         grow_batch_size: 2,
         ..WorkerEngineConfig::default()
     })
     .await;
     fixture.process(vec![fixture.attach("a")]).await;
-    fixture.complete(0).await;
-    fixture.complete(1).await;
-    fixture.complete(1).await; // Duplicate completion cannot park the same slot twice.
-    assert!(fixture.engine.pending_creations.is_empty());
-    assert_eq!(fixture.engine.ready_slots.len(), 1);
+    let ids = fixture.creation_ids();
+    fixture.finish_creation(ids[0], Ok(ReadString::from("a_database"))).await;
+    fixture.finish_creation(ids[1], Ok(ReadString::from("spare"))).await;
+    fixture.finish_creation(ids[1], Ok(ReadString::from("duplicate"))).await;
+    assert!(fixture.engine.inventory.creating.is_empty());
+    assert_eq!(fixture.engine.inventory.ready.len(), 1);
+    assert_eq!(fixture.engine.inventory.ready[0].database_name, ReadString::from("spare"));
     fixture.process(vec![fixture.attach("b")]).await;
-    assert_eq!(fixture.engine.capacity.current, 4);
-    assert_eq!(fixture.engine.pending_creations.len(), 2);
+    assert_eq!(fixture.engine.leases["b"].database.database_id, ids[1]);
+    assert_eq!(fixture.engine.inventory.creating.len(), 2);
+    assert_eq!(fixture.creation_ids().len(), 4);
 }
 
 #[tokio::test]
-async fn failed_creation_replenishes_without_reusing_failed_slots() {
+async fn failed_creation_keeps_waiter_and_replenishes_without_reusing_failed_ids() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 0,
-        maximum_slots: 3,
         starvation_threshold: 0,
         grow_batch_size: 1,
         ..WorkerEngineConfig::default()
     })
     .await;
     fixture.process(vec![fixture.attach("a")]).await;
-    fixture.fail(0).await;
-    assert_eq!(fixture.engine.capacity.current, 3);
-    assert_eq!(fixture.engine.pending_creations.len(), 2);
-    assert!(matches!(fixture.engine.slots[0], Slot::Empty));
-    fixture.fail(0).await;
+    let ids = fixture.creation_ids();
+    fixture.finish_creation(ids[0], Err(creation_failure())).await;
+    assert_eq!(fixture.engine.inventory.creating.len(), 2);
+    assert!(!fixture.engine.inventory.creating.contains(&ids[0]));
+    assert!(fixture.engine.leases.is_empty());
+    assert_eq!(fixture.engine.waiters.len(), 1);
+    assert!(fixture.consumer.messages().is_empty());
+
+    fixture.finish_creation(ids[0], Err(creation_failure())).await;
     assert_eq!(fixture.engine.counters.template_create_failures, 1);
-    fixture.fail(1).await;
-    fixture.complete(2).await;
+    assert_eq!(fixture.creation_ids().len(), 3, "duplicate failure must not schedule more work");
+    fixture.finish_creation(ids[1], Err(creation_failure())).await;
+    let all_ids = fixture.creation_ids();
+    assert_eq!(all_ids, (1..=4).map(DatabaseId).collect::<Vec<_>>());
+    fixture.finish_creation(all_ids[2], Ok(ReadString::from("recovered"))).await;
+    assert_eq!(fixture.engine.leases["a"].database.database_id, all_ids[2]);
     assert_eq!(fixture.consumer.messages().len(), 1);
-    assert!(fixture.engine.pending_creations.is_empty());
-    assert_eq!(fixture.io.operations.lock().unwrap().creates, vec![0, 1, 2]);
+    assert!(fixture.engine.waiters.is_empty());
+    assert_eq!(fixture.engine.inventory.creating.len(), 1, "a spare is still being created");
+}
+
+fn creation_failure() -> PostgresDDLClientError {
+    PostgresDDLClientError::NonRecoverableError("injected creation failure".into())
 }
 
 #[tokio::test]
-async fn forced_recycling_covers_waiting_demand() {
+async fn retiring_databases_do_not_count_as_supply_for_waiters() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 2,
-        maximum_slots: 8,
         starvation_threshold: 0,
         grow_batch_size: 1,
         ..WorkerEngineConfig::default()
     })
     .await;
     fixture.process(vec![fixture.attach("holder"), fixture.attach("other")]).await;
-    let lease = LeaseId::from("holder");
+    let old = fixture.engine.leases["holder"].clone();
     fixture
         .process(vec![
-            EngineMessage::Detach { lease: lease.clone(), generation: 1 },
-            EngineMessage::LeaseMaxTimeReached { lease, generation: 1 },
+            EngineMessage::LeaseMaxTimeReached {
+                lease: LeaseId::from("holder"),
+                generation: old.generation,
+            },
             fixture.attach("waiting"),
         ])
         .await;
-    assert_eq!(fixture.engine.capacity.current, 3);
-    assert_eq!(fixture.engine.pending_creations.len(), 2);
-    assert_eq!(fixture.io.operations.lock().unwrap().creates, vec![2]);
-    assert_eq!(fixture.io.operations.lock().unwrap().replacements, vec![0]);
-    fixture.complete(0).await;
-    assert!(fixture.engine.leases.contains_key(&LeaseId::from("waiting")));
-    assert_eq!(fixture.engine.pending_creations.len(), 1);
+    assert_eq!(fixture.engine.inventory.retiring.len(), 1);
+    assert_eq!(fixture.engine.inventory.creating.len(), 2, "waiter plus spare, excluding cleanup");
+    assert_eq!(fixture.creation_ids(), vec![DatabaseId(3), DatabaseId(4)]);
+    fixture.finish_creation(DatabaseId(3), Ok(ReadString::from("waiting_database"))).await;
+    assert_eq!(fixture.engine.leases["waiting"].database.database_id, DatabaseId(3));
+    assert!(fixture.engine.inventory.retiring.contains_key(&old.database.database_id));
 }
 
 #[tokio::test]
 async fn expired_and_undeliverable_groups_do_not_block_live_groups() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 1,
         starvation_threshold: 0,
         grow_batch_size: 1,
         ..WorkerEngineConfig::default()
     })
     .await;
-    let failed = ConsumerWorker::failing(Arc::default());
     fixture
         .process(vec![
             fixture.attach("holder"),
@@ -529,17 +647,18 @@ async fn expired_and_undeliverable_groups_do_not_block_live_groups() {
             },
             EngineMessage::AttachOrJoin {
                 lease: LeaseId::from("gone"),
-                reply: failed,
+                reply: ConsumerWorker::failing(Arc::default()),
                 message_time: Instant::now(),
             },
             fixture.attach("live"),
-            EngineMessage::Detach { lease: LeaseId::from("holder"), generation: 1 },
-            EngineMessage::LeaseMaxTimeReached { lease: LeaseId::from("holder"), generation: 1 },
         ])
         .await;
-    fixture.complete(0).await;
+    let id = fixture.creation_ids()[0];
+    fixture.finish_creation(id, Ok(ReadString::from("live_database"))).await;
     assert_eq!(fixture.consumer.messages().len(), 2);
-    assert!(fixture.engine.leases.contains_key(&LeaseId::from("live")));
+    assert_eq!(fixture.engine.leases["live"].database.database_id, id);
+    assert!(!fixture.engine.leases.contains_key("expired"));
+    assert!(!fixture.engine.leases.contains_key("gone"));
     assert!(fixture.engine.waiters.is_empty());
     assert_eq!(fixture.engine.counters.waiter_timeouts, 1);
 }
@@ -548,7 +667,6 @@ async fn expired_and_undeliverable_groups_do_not_block_live_groups() {
 async fn expired_groups_do_not_inflate_growth_demand() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 0,
-        maximum_slots: 8,
         starvation_threshold: 0,
         grow_batch_size: 1,
         ..WorkerEngineConfig::default()
@@ -564,16 +682,16 @@ async fn expired_groups_do_not_inflate_growth_demand() {
             fixture.attach("live"),
         ])
         .await;
-    assert_eq!(fixture.engine.capacity.current, 2, "one live lease plus one spare");
-    fixture.complete(0).await;
-    assert!(fixture.engine.leases.contains_key(&LeaseId::from("live")));
+    assert_eq!(fixture.engine.inventory.creating.len(), 2, "one live lease plus one spare");
+    let id = fixture.creation_ids()[0];
+    fixture.finish_creation(id, Ok(ReadString::from("live_database"))).await;
+    assert!(fixture.engine.leases.contains_key("live"));
 }
 
 #[tokio::test]
-async fn scheduling_retries_keep_one_reservation() {
+async fn failed_creation_submission_releases_reservation_without_retrying_inline() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 0,
-        maximum_slots: 8,
         starvation_threshold: 0,
         grow_batch_size: 1,
         ..WorkerEngineConfig::default()
@@ -584,75 +702,129 @@ async fn scheduling_retries_keep_one_reservation() {
         .operations
         .lock()
         .unwrap()
-        .spawn_results
-        .push_back(Err(IOError::FailedToStartABackgroundProcess(0)));
-    fixture.process(vec![fixture.attach("a"), fixture.attach("a")]).await;
-    assert_eq!(fixture.engine.capacity.current, 2);
-    assert_eq!(fixture.engine.pending_creations.len(), 2);
-    assert_eq!(fixture.io.operations.lock().unwrap().creates, vec![0, 1, 0]);
-    fixture.complete(0).await;
-    assert_eq!(fixture.consumer.messages().len(), 2);
-    assert_eq!(fixture.engine.pending_creations.len(), 1);
-}
-
-#[tokio::test]
-async fn exhausted_scheduling_retries_clear_pending_without_looping() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        initial_slots: 0,
-        maximum_slots: 1,
-        starvation_threshold: 0,
-        grow_batch_size: 1,
-        ..WorkerEngineConfig::default()
-    })
-    .await;
-    fixture
-        .io
-        .operations
-        .lock()
-        .unwrap()
-        .spawn_results
-        .extend((0..3).map(|_| Err(IOError::FailedToStartABackgroundProcess(0))));
+        .create_results
+        .push_back(Err(IOError::FailedToSendTheMessage));
     fixture.process(vec![fixture.attach("a")]).await;
-    assert!(fixture.engine.pending_creations.is_empty());
-    assert!(matches!(fixture.engine.slots[0], Slot::Empty));
-    assert_eq!(fixture.engine.capacity.current, 1);
+    let rejected_id = fixture.creation_ids()[0];
+    assert!(fixture.engine.inventory.creating.is_empty());
+    assert_eq!(fixture.creation_ids().len(), 1);
     assert_eq!(fixture.engine.counters.unable_to_start_database_slots, 1);
-    assert_eq!(fixture.io.operations.lock().unwrap().creates.len(), 3);
+    assert_eq!(fixture.engine.waiters.len(), 1);
+
+    // A later demand event can try again, with fresh IDs.
+    fixture.process(vec![fixture.attach("a")]).await;
+    let ids = fixture.creation_ids();
+    assert_eq!(ids.len(), 3);
+    assert!(ids[1].0 > rejected_id.0);
+    fixture.finish_creation(ids[1], Ok(ReadString::from("recovered"))).await;
+    assert_eq!(fixture.engine.leases["a"].conns, 2);
+    assert_eq!(fixture.engine.leases["a"].database.database_id, ids[1]);
 }
 
 #[tokio::test]
-async fn undeliverable_retry_clears_pending_reservation() {
+async fn repeated_submission_failure_does_not_loop_or_accumulate_reservations() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 0,
-        maximum_slots: 1,
         starvation_threshold: 0,
         grow_batch_size: 1,
         ..WorkerEngineConfig::default()
     })
     .await;
-    {
-        let mut operations = fixture.io.operations.lock().unwrap();
-        operations.reject_retry = true;
-        operations.spawn_results.push_back(Err(IOError::FailedToStartABackgroundProcess(0)));
+    fixture
+        .io
+        .operations
+        .lock()
+        .unwrap()
+        .create_results
+        .extend((0..3).map(|_| Err(IOError::FailedToSendTheMessage)));
+    for expected in 1..=3 {
+        fixture.process(vec![fixture.attach("a")]).await;
+        assert!(fixture.engine.inventory.creating.is_empty());
+        assert_eq!(fixture.creation_ids().len(), expected);
+        assert_eq!(fixture.engine.waiters.len(), 1);
     }
+    assert_eq!(fixture.engine.counters.unable_to_start_database_slots, 3);
+    assert_eq!(fixture.creation_ids(), vec![DatabaseId(1), DatabaseId(2), DatabaseId(3)]);
+    assert!(fixture.consumer.messages().is_empty());
+}
+
+#[tokio::test]
+async fn unknown_creation_completion_cannot_supply_a_database() {
+    let mut fixture = Fixture::new(WorkerEngineConfig {
+        initial_slots: 0,
+        starvation_threshold: 0,
+        grow_batch_size: 1,
+        ..WorkerEngineConfig::default()
+    })
+    .await;
     fixture.process(vec![fixture.attach("a")]).await;
-    assert!(fixture.engine.pending_creations.is_empty());
-    assert_eq!(fixture.engine.counters.non_ready_slots, 1);
-    assert_eq!(fixture.io.operations.lock().unwrap().creates.len(), 1);
+    let requested = fixture.creation_ids();
+    fixture.finish_creation(DatabaseId(999), Ok(ReadString::from("unrequested"))).await;
+    assert!(fixture.engine.leases.is_empty());
+    assert!(fixture.engine.inventory.ready.is_empty());
+    assert_eq!(fixture.creation_ids(), requested);
+    assert_eq!(fixture.engine.inventory.creating.len(), requested.len());
+    assert_eq!(fixture.engine.waiters.len(), 1);
+}
+
+#[tokio::test]
+async fn cleanup_failure_retains_database_identity_without_blocking_creation() {
+    for submission_fails in [false, true] {
+        let mut fixture = Fixture::new(WorkerEngineConfig {
+            initial_slots: 1,
+            starvation_threshold: 0,
+            grow_batch_size: 1,
+            ..WorkerEngineConfig::default()
+        })
+        .await;
+        fixture.process(vec![fixture.attach("old")]).await;
+        let old = fixture.engine.leases["old"].database.clone();
+        if submission_fails {
+            fixture
+                .io
+                .operations
+                .lock()
+                .unwrap()
+                .cleanup_results
+                .push_back(Err(IOError::FailedToSendTheMessage));
+        }
+        fixture.process(vec![fixture.release("old"), fixture.attach("next")]).await;
+        if !submission_fails {
+            fixture
+                .finish_cleanup(
+                    old.database_id,
+                    Err(PostgresDDLClientError::NonRecoverableError(
+                        "injected drop failure".into(),
+                    )),
+                )
+                .await;
+        }
+        assert_eq!(
+            fixture.engine.inventory.retiring.get(&old.database_id),
+            Some(&old.database_name)
+        );
+        let new_id = fixture.creation_ids()[0];
+        fixture.finish_creation(new_id, Ok(ReadString::from("next_database"))).await;
+        assert_eq!(fixture.engine.leases["next"].database.database_id, new_id);
+        assert_ne!(new_id, old.database_id);
+        // The current implementation retains failed cleanup, but does not
+        // reschedule it.
+        assert_eq!(fixture.io.operations.lock().unwrap().cleanups.len(), 1);
+    }
 }
 
 #[tokio::test]
 async fn zero_batch_size_disables_growth() {
     let mut fixture = Fixture::new(WorkerEngineConfig {
         initial_slots: 0,
-        maximum_slots: 8,
         starvation_threshold: 0,
         grow_batch_size: 0,
         ..WorkerEngineConfig::default()
     })
     .await;
     fixture.process(vec![fixture.attach("a"), fixture.attach("b")]).await;
-    assert_eq!(fixture.engine.capacity.current, 0);
-    assert!(fixture.engine.pending_creations.is_empty());
-    assert!(fixture.io.operations.lock().unwrap().creates.is_empty());
+    assert!(fixture.engine.inventory.ready.is_empty());
+    assert!(fixture.engine.inventory.creating.is_empty());
+    assert!(fixture.creation_ids().is_empty());
+    assert_eq!(fixture.engine.waiters.len(), 2);
 }

@@ -1,10 +1,11 @@
 #![cfg(test)]
-// Consumed only by the stable_ids-gated suites; silence the other mode.
-#![cfg_attr(not(feature = "stable_ids"), allow(dead_code, unused_imports))]
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use rustc_hash::FxHashMap;
@@ -14,10 +15,9 @@ use crate::{
     postgres_manager::{PostgresConfig, PostgresDatabaseName},
     utils::ReadString,
     worker_engine::{
-        core::{
-            EngineCounters, LeaseEntry, LeaseId, PoolCapacity, Slot, WorkerEngine,
-            WorkerEngineConfig,
-        },
+        core::{EngineCounters, LeaseEntry, LeaseId, WorkerEngine, WorkerEngineConfig},
+        database_inventory::DatabaseInventory,
+        database_jobs::{CleanupDatabase, CreateDatabase, DatabaseWorkerMessages},
         errors::{IOError, MetricIOError, PostgresDDLClientError},
         messages::{ConsumerReply, EngineMessage, EngineMetricMessage},
         traits::{ConsumerIO, EngineIO, EngineInbox, MetricIO, PostgresClient},
@@ -76,7 +76,7 @@ impl<'a> WorkerEngineIO<'a> {
         }
     }
 
-    fn fail(
+    fn fail_once(
         inbox: Arc<std::sync::Mutex<VecDeque<EngineMessage<ConsumerWorker>>>>,
         database_progression_name: &'a PostgresDatabaseName,
         operations_before_fail: usize,
@@ -92,50 +92,26 @@ impl<'a> WorkerEngineIO<'a> {
 }
 
 impl<'a> EngineIO<ConsumerWorker, PostgresConnection> for WorkerEngineIO<'a> {
-    fn spawn_create_database(
-        &self,
-        worker_index: usize,
-        _postgres_client: Arc<PostgresConnection>,
-    ) -> Result<(), IOError> {
-        if self.fail
-            && self.messages_pushed.load(std::sync::atomic::Ordering::SeqCst)
-                == self.operations_before_fail - 1
-        {
-            self.inbox.lock().unwrap().push_back(EngineMessage::TemplateCreated {
-                index: worker_index as usize,
-                result: Err(PostgresDDLClientError::NonRecoverableError(String::from(
-                    "Error creating a database",
-                ))),
-            });
-        } else {
-            self.inbox.lock().unwrap().push_back(EngineMessage::TemplateCreated {
-                index: worker_index as usize,
-                result: Ok(ReadString::from(
-                    self.database_progression_name.generate_database_name(),
-                )),
-            });
-            self.messages_pushed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
+        let request_number = self.messages_pushed.fetch_add(1, Ordering::SeqCst) + 1;
 
-        Ok(())
+        let result = if self.fail && request_number == self.operations_before_fail {
+            Err(PostgresDDLClientError::NonRecoverableError("injected creation failure".into()))
+        } else {
+            Ok(ReadString::from(self.database_progression_name.generate_database_name()))
+        };
+
+        self.send_message(EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CreationFinished {
+            database_id: request.database_id,
+            result,
+        }))
     }
 
-    fn spawn_recreate_database(
-        &self,
-        worker_index: usize,
-        _database_name: ReadString,
-        lease: LeaseId,
-        generation: u64,
-        _postgres_client: Arc<PostgresConnection>,
-    ) -> Result<(), IOError> {
-        let mut inbox = self.inbox.lock().unwrap();
-        inbox.push_back(EngineMessage::DeleteLease { lease: lease.clone(), generation });
-        inbox.push_back(EngineMessage::TemplateCreated {
-            index: worker_index,
-            result: Ok(ReadString::from(self.database_progression_name.generate_database_name())),
-        });
-
-        Ok(())
+    fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError> {
+        self.send_message(EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CleanupFinished {
+            database_id: request.database_id,
+            result: Ok(()),
+        }))
     }
 
     fn send_delayed_message(
@@ -224,57 +200,15 @@ impl PostgresClient for PostgresConnection {
 pub struct EngineOutcome {
     pub counters: EngineCounters,
     pub leases: FxHashMap<LeaseId, LeaseEntry>,
-    pub slots: Box<[Slot]>,
-    pub capacity: PoolCapacity,
-    pub ready_slots: VecDeque<usize>,
+    pub inventory: DatabaseInventory,
     pub waiters: Vec<LeaseId>,
 }
 
 pub struct EngineSimulator;
 
 impl EngineSimulator {
-    pub async fn run<'a>(
-        msgs: Vec<EngineMessage<ConsumerWorker>>,
-    ) -> Result<EngineOutcome, IOError> {
-        let config = PostgresConfig::default();
-        let manager = Arc::from(PostgresConnection::start(config));
-
-        let _ = manager.drop_templates_like().await;
-
-        let engine_config = WorkerEngineConfig::default();
-
-        let inbox_buffer: Arc<std::sync::Mutex<VecDeque<EngineMessage<ConsumerWorker>>>> =
-            Arc::from(Mutex::new(VecDeque::new()));
-
-        let inbox = WorkerInboxImpl::new(inbox_buffer.clone());
-        let manager_to_bg = manager.clone();
-        let engine_io =
-            WorkerEngineIO::new(inbox_buffer.clone(), &manager_to_bg.template_database_name);
-
-        for msg in msgs {
-            inbox.push_message(msg);
-        }
-
-        let mut engine = WorkerEngine::<
-            ConsumerWorker,
-            WorkerEngineIO,
-            WorkerInboxImpl,
-            TestMetrics,
-            PostgresConnection,
-        >::new(engine_config, manager, engine_io, inbox.clone());
-
-        engine.try_init().await;
-
-        engine.run().await;
-
-        Ok(EngineOutcome {
-            counters: engine.counters.clone(),
-            leases: engine.leases.clone(),
-            slots: engine.slots.clone(),
-            capacity: engine.capacity.clone(),
-            ready_slots: engine.ready_slots.clone(),
-            waiters: engine.waiters.iter().map(|lease| lease.clone()).collect(),
-        })
+    pub async fn run(msgs: Vec<EngineMessage<ConsumerWorker>>) -> Result<EngineOutcome, IOError> {
+        Self::run_with_custom_config(msgs, WorkerEngineConfig::default()).await
     }
 
     pub async fn run_with_failing_pg<'a>(
@@ -282,6 +216,10 @@ impl EngineSimulator {
         operations_before_fail: usize,
         worker_engine_config: WorkerEngineConfig,
     ) -> Result<EngineOutcome, IOError> {
+        assert!(
+            operations_before_fail > 0,
+            "the failing creation request number must be greater than zero"
+        );
         let config = PostgresConfig::default();
         let manager = Arc::from(PostgresConnection::start(config));
 
@@ -292,7 +230,7 @@ impl EngineSimulator {
 
         let inbox = WorkerInboxImpl::new(inbox_buffer.clone());
         let manager_to_bg = manager.clone();
-        let engine_io = WorkerEngineIO::fail(
+        let engine_io = WorkerEngineIO::fail_once(
             inbox_buffer.clone(),
             &manager_to_bg.template_database_name,
             operations_before_fail,
@@ -312,14 +250,12 @@ impl EngineSimulator {
 
         engine.try_init().await;
 
-        engine.run().await;
+        engine.process_messages().await;
 
         Ok(EngineOutcome {
             counters: engine.counters.clone(),
             leases: engine.leases.clone(),
-            slots: engine.slots.clone(),
-            capacity: engine.capacity.clone(),
-            ready_slots: engine.ready_slots.clone(),
+            inventory: engine.inventory.clone(),
             waiters: engine.waiters.iter().map(|lease| lease.clone()).collect(),
         })
     }
@@ -355,21 +291,15 @@ impl EngineSimulator {
 
         engine.try_init().await;
 
-        engine.run().await;
+        engine.process_messages().await;
 
         Ok(EngineOutcome {
             counters: engine.counters.clone(),
             leases: engine.leases.clone(),
-            slots: engine.slots.clone(),
-            capacity: engine.capacity.clone(),
-            ready_slots: engine.ready_slots.clone(),
+            inventory: engine.inventory.clone(),
             waiters: engine.waiters.iter().map(|lease| lease.clone()).collect(),
         })
     }
-}
-
-pub fn db(n: usize) -> ReadString {
-    ReadString::from(format!("pgtest_{n}"))
 }
 
 pub fn past_instant() -> std::time::Instant {
@@ -396,44 +326,26 @@ impl ScriptedWorkerIO {
 }
 
 impl EngineIO<ConsumerWorker, PostgresConnection> for ScriptedWorkerIO {
-    fn spawn_create_database(
-        &self,
-        worker_index: usize,
-        _postgres_client: Arc<PostgresConnection>,
-    ) -> Result<(), IOError> {
-        let result = self
-            .script
+    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
+        self.script
             .lock()
             .unwrap()
             .pop_front()
-            .expect("ScriptedWorkerIO: spawn_create_database called more times than scripted");
+            .expect("request_creation called more times than scripted")?;
 
-        if result.is_ok() {
-            self.inbox.lock().unwrap().push_back(EngineMessage::TemplateCreated {
-                index: worker_index,
-                result: Ok(ReadString::from(format!("grow_{worker_index}"))),
-            });
-        }
+        let database_name = ReadString::from(format!("grow_{}", request.database_id.0));
 
-        result
+        self.send_message(EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CreationFinished {
+            database_id: request.database_id,
+            result: Ok(database_name),
+        }))
     }
 
-    fn spawn_recreate_database(
-        &self,
-        worker_index: usize,
-        _database_name: ReadString,
-        lease: LeaseId,
-        generation: u64,
-        _postgres_client: Arc<PostgresConnection>,
-    ) -> Result<(), IOError> {
-        let mut inbox = self.inbox.lock().unwrap();
-        inbox.push_back(EngineMessage::DeleteLease { lease: lease.clone(), generation });
-        inbox.push_back(EngineMessage::TemplateCreated {
-            index: worker_index,
-            result: Ok(ReadString::from(format!("grow_{worker_index}"))),
-        });
-
-        Ok(())
+    fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError> {
+        self.send_message(EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CleanupFinished {
+            database_id: request.database_id,
+            result: Ok(()),
+        }))
     }
 
     fn send_delayed_message(
@@ -463,7 +375,6 @@ pub type GrowWorker = WorkerEngine<
 pub fn grow_config() -> WorkerEngineConfig {
     WorkerEngineConfig {
         initial_slots: 1,
-        maximum_slots: 2,
         starvation_threshold: 1,
         grow_batch_size: 1,
         ..WorkerEngineConfig::default()
@@ -489,7 +400,7 @@ pub async fn run_grow_with(
 
     worker.try_init().await;
     worker.grow();
-    worker.run().await;
+    worker.process_messages().await;
 
     (worker, engine_io)
 }

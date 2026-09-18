@@ -1,15 +1,15 @@
-use std::{
-    future::poll_fn,
-    pin::Pin,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    task::Poll,
-};
-
+//! Exercise the real worker loops with explicitly completed PostgreSQL
+//! operations.
 use tokio::sync::{mpsc, oneshot};
 
 use super::*;
-use crate::worker_engine::errors::PostgresDDLClientError;
+use crate::worker_engine::{
+    database_jobs::{DatabaseId, DatabaseWorkerMessages},
+    errors::PostgresDDLClientError,
+    traits::PostgresClient,
+};
 
+type CreateResult = Result<ReadString, PostgresDDLClientError>;
 type DropResult = Result<(), PostgresDDLClientError>;
 
 struct DropRequest {
@@ -18,299 +18,359 @@ struct DropRequest {
 }
 
 struct ControlledPostgres {
+    creates: mpsc::UnboundedSender<oneshot::Sender<CreateResult>>,
     drops: mpsc::UnboundedSender<DropRequest>,
-    creations: AtomicUsize,
-    fail_create: AtomicBool,
 }
 
 impl PostgresClient for ControlledPostgres {
+    async fn create_database(&self) -> CreateResult {
+        let (finish, result) = oneshot::channel();
+        self.creates.send(finish).unwrap();
+        result.await.expect("test must finish or cancel every creation")
+    }
+
     async fn drop_database(&self, database_name: &str) -> DropResult {
         let (finish, result) = oneshot::channel();
         self.drops.send(DropRequest { database_name: database_name.into(), finish }).unwrap();
         result.await.expect("test must finish or cancel every drop")
     }
 
-    async fn create_database(&self) -> Result<ReadString, PostgresDDLClientError> {
-        self.creations.fetch_add(1, Ordering::SeqCst);
-        if self.fail_create.load(Ordering::SeqCst) {
-            Err(PostgresDDLClientError::NonRecoverableError("injected create failure".into()))
-        } else {
-            Ok(ReadString::from("replacement"))
-        }
-    }
-
     async fn drop_templates_like(&self) -> DropResult {
-        unreachable!()
+        unreachable!("workers do not run the startup sweep")
     }
 }
 
 struct Fixture {
-    cleanup: DatabaseCleanup,
-    client: Arc<ControlledPostgres>,
+    senders: Option<DatabaseWorkerSenders>,
+    results: UnboundedReceiver<EngineMessage<ConsumerWorker>>,
+    creates: mpsc::UnboundedReceiver<oneshot::Sender<CreateResult>>,
     drops: mpsc::UnboundedReceiver<DropRequest>,
     tracker: TaskTracker,
     shutdown: CancellationToken,
 }
 
 impl Fixture {
-    fn new(config: WorkerEngineConfig) -> Self {
+    fn new() -> Self {
         let tracker = TaskTracker::new();
         let shutdown = CancellationToken::new();
-        let cleanup = DatabaseCleanup::new(&config, tracker.clone(), shutdown.clone());
-        let (drops, receiver) = mpsc::unbounded_channel();
-        Self {
-            cleanup,
-            client: Arc::new(ControlledPostgres {
-                drops,
-                creations: AtomicUsize::new(0),
-                fail_create: AtomicBool::new(false),
-            }),
-            drops: receiver,
-            tracker,
-            shutdown,
-        }
+        let (creates_tx, creates) = mpsc::unbounded_channel();
+        let (drops_tx, drops) = mpsc::unbounded_channel();
+        let client = Arc::new(ControlledPostgres { creates: creates_tx, drops: drops_tx });
+        let (engine_tx, results) = hotpath::channel!(mpsc::unbounded_channel());
+        let (senders, creation_rx, cleanup_rx) =
+            DatabaseWorkerSenders::init_database_worker_channels();
+        let creation = DatabaseCreationWorker::new(
+            engine_tx.clone(),
+            tracker.clone(),
+            shutdown.clone(),
+            client.clone(),
+            creation_rx,
+        );
+        let cleanup = DatabaseCleanupWorker::new(
+            engine_tx,
+            tracker.clone(),
+            shutdown.clone(),
+            client,
+            cleanup_rx,
+        );
+        tracker.spawn(creation.run());
+        tracker.spawn(cleanup.run());
+        Self { senders: Some(senders), results, creates, drops, tracker, shutdown }
     }
 
-    async fn enqueue(&self, name: &str) {
-        self.cleanup.enqueue(ReadString::from(name), self.client.clone()).await.unwrap();
+    fn create(&self, id: u64) {
+        self.senders
+            .as_ref()
+            .unwrap()
+            .creation_tx
+            .send(CreateDatabase { database_id: DatabaseId(id) })
+            .unwrap();
+    }
+
+    fn cleanup(&self, id: u64, name: &str) {
+        self.senders
+            .as_ref()
+            .unwrap()
+            .cleanup_tx
+            .send(CleanupDatabase {
+                database_id: DatabaseId(id),
+                database_name: ReadString::from(name),
+            })
+            .unwrap();
+    }
+
+    async fn next_creation(&mut self) -> oneshot::Sender<CreateResult> {
+        tokio::time::timeout(Duration::from_secs(1), self.creates.recv())
+            .await
+            .expect("creation should start")
+            .expect("creation request channel must stay open")
     }
 
     async fn next_drop(&mut self) -> DropRequest {
         tokio::time::timeout(Duration::from_secs(1), self.drops.recv())
             .await
-            .expect("a drop should have started")
-            .expect("drop channel must be open")
+            .expect("drop should start")
+            .expect("drop request channel must stay open")
     }
 
-    async fn finish(&self) {
+    async fn next_result(&mut self) -> DatabaseWorkerMessages {
+        match tokio::time::timeout(Duration::from_secs(1), self.results.recv())
+            .await
+            .expect("worker should report its result")
+            .expect("engine inbox must stay open")
+        {
+            EngineMessage::DatabaseWorker(message) => message,
+            _ => panic!("workers must report through DatabaseWorker messages"),
+        }
+    }
+
+    async fn finish(&mut self) {
+        // Closing inputs lets the long-lived receiver loops exit after
+        // accepting queued jobs.
+        self.senders.take();
         self.tracker.close();
         tokio::time::timeout(Duration::from_secs(1), self.tracker.wait())
             .await
-            .expect("all cleanup tasks should have completed");
-    }
-}
-
-async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
-    poll_fn(|cx| {
-        assert!(future.as_mut().poll(cx).is_pending());
-        Poll::Ready(())
-    })
-    .await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn replacement_retries_creation_without_waiting_for_drop() {
-    for fail_create in [false, true] {
-        let mut fixture = Fixture::new(WorkerEngineConfig::default());
-        fixture.client.fail_create.store(fail_create, Ordering::SeqCst);
-        let (sender, mut receiver) = hotpath::channel!(mpsc::unbounded_channel());
-        let lease = LeaseId::from("old-lease");
-        let worker_index = 18;
-        let mut replacement = Box::pin(recreate_database(
-            sender,
-            worker_index,
-            ReadString::from("old-database"),
-            lease.clone(),
-            7,
-            fixture.client.clone(),
-            fixture.cleanup.clone(),
-        ));
-        if fail_create {
-            assert_pending(replacement.as_mut()).await;
-        } else {
-            replacement.as_mut().await;
-        }
-        let old_database = fixture.next_drop().await;
-        assert_eq!(old_database.database_name, "old-database");
-        assert!(matches!(receiver.recv().await,
-            Some(EngineMessage::DeleteLease { lease: retired, generation: 7 }) if retired == lease));
-        if fail_create {
-            assert!(receiver.try_recv().is_err(), "failed creation must retain the pending job");
-            assert_eq!(fixture.client.creations.load(Ordering::SeqCst), 1);
-            fixture.client.fail_create.store(false, Ordering::SeqCst);
-            tokio::time::advance(Duration::from_secs(1)).await;
-            replacement.as_mut().await;
-            assert_eq!(fixture.client.creations.load(Ordering::SeqCst), 2);
-        }
-        drop(replacement);
-        let Some(EngineMessage::TemplateCreated { index, result }) = receiver.recv().await else {
-            panic!("replacement must complete while the drop is still blocked");
-        };
-        assert_eq!(index, worker_index);
-        assert!(result.is_ok());
-        assert!(receiver.recv().await.is_none());
-        old_database.finish.send(Ok(())).unwrap();
-        fixture.finish().await;
+            .expect("worker loops and DDL tasks should finish");
+        assert!(self.tracker.is_empty());
     }
 }
 
 #[tokio::test]
-async fn full_backlog_blocks_replacement_until_a_deletion_completes() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        cleanup_max_pending: 2,
-        cleanup_concurrency: 1,
-        ..WorkerEngineConfig::default()
-    });
-    fixture.enqueue("first").await;
-    let first = fixture.next_drop().await;
-    fixture.enqueue("second").await;
+async fn creation_and_cleanup_send_results_to_the_same_engine_inbox() {
+    let mut fixture = Fixture::new();
+    fixture.create(41);
+    fixture.cleanup(17, "retired");
+    let create = fixture.next_creation().await;
+    let drop = fixture.next_drop().await;
+    assert_eq!(drop.database_name, "retired");
+    assert!(fixture.results.try_recv().is_err(), "unfinished DDL cannot report success");
 
-    let (sender, mut receiver) = hotpath::channel!(mpsc::unbounded_channel());
-    let mut replacement = Box::pin(recreate_database(
-        sender,
-        0,
-        ReadString::from("third"),
-        LeaseId::from("old-lease"),
-        1,
-        fixture.client.clone(),
-        fixture.cleanup.clone(),
+    drop.finish.send(Ok(())).unwrap();
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CleanupFinished { database_id: DatabaseId(17), result: Ok(()) }
     ));
-    assert_pending(replacement.as_mut()).await;
-    assert_eq!(fixture.client.creations.load(Ordering::SeqCst), 0);
-    assert!(receiver.try_recv().is_err());
-    assert!(fixture.drops.try_recv().is_err());
+    create.send(Ok(ReadString::from("fresh"))).unwrap();
+    assert!(matches!(fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished { database_id: DatabaseId(41), result: Ok(name) }
+            if name.as_ref() == "fresh"));
+    fixture.finish().await;
+    assert!(fixture.results.recv().await.is_none(), "all result senders should close");
+}
 
-    first.finish.send(Ok(())).unwrap();
-    replacement.await;
-    assert_eq!(fixture.client.creations.load(Ordering::SeqCst), 1);
-    let second = fixture.next_drop().await;
-    assert_eq!(second.database_name, "second");
-    second.finish.send(Ok(())).unwrap();
-    let third = fixture.next_drop().await;
-    assert_eq!(third.database_name, "third");
-    third.finish.send(Ok(())).unwrap();
+#[tokio::test]
+async fn blocked_cleanup_does_not_delay_creation() {
+    let mut fixture = Fixture::new();
+    let mut blocked = Vec::new();
+    for id in 1..=32 {
+        fixture.cleanup(id, &format!("retired_{id}"));
+        blocked.push(fixture.next_drop().await);
+    }
+    fixture.create(100);
+    fixture.next_creation().await.send(Ok(ReadString::from("fresh"))).unwrap();
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished { database_id: DatabaseId(100), result: Ok(_) }
+    ));
+
+    // Every old database is still blocked when creation completes.
+    assert!(blocked.iter().all(|request| !request.finish.is_closed()));
+    for request in blocked {
+        request.finish.send(Ok(())).unwrap();
+    }
+    let mut cleaned = rustc_hash::FxHashSet::default();
+    for _ in 0..32 {
+        let DatabaseWorkerMessages::CleanupFinished { database_id, result: Ok(()) } =
+            fixture.next_result().await
+        else {
+            panic!("expected successful cleanup");
+        };
+        assert!(cleaned.insert(database_id));
+    }
+    assert_eq!(cleaned, (1..=32).map(DatabaseId).collect());
     fixture.finish().await;
 }
 
 #[tokio::test]
-async fn concurrent_drops_never_exceed_the_configured_limit() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        cleanup_max_pending: 3,
-        cleanup_concurrency: 2,
-        ..WorkerEngineConfig::default()
-    });
-    fixture.enqueue("first").await;
-    fixture.enqueue("second").await;
-    fixture.enqueue("third").await;
-    let first = fixture.next_drop().await;
-    let second = fixture.next_drop().await;
-    tokio::task::yield_now().await;
-    assert!(fixture.drops.try_recv().is_err());
+async fn later_jobs_can_complete_while_earlier_jobs_are_blocked() {
+    let mut fixture = Fixture::new();
+    fixture.create(1);
+    let first_create = fixture.next_creation().await;
+    fixture.create(2);
+    let second_create = fixture.next_creation().await;
+    fixture.cleanup(10, "slow");
+    let first_drop = fixture.next_drop().await;
+    fixture.cleanup(11, "fast");
+    let second_drop = fixture.next_drop().await;
 
-    first.finish.send(Ok(())).unwrap();
-    let third = fixture.next_drop().await;
-    assert_ne!(first.database_name, second.database_name);
-    assert_ne!(second.database_name, third.database_name);
-    assert_ne!(first.database_name, third.database_name);
-    second.finish.send(Ok(())).unwrap();
-    third.finish.send(Ok(())).unwrap();
+    second_create.send(Ok(ReadString::from("second"))).unwrap();
+    assert!(matches!(fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished { database_id: DatabaseId(2), result: Ok(name) }
+            if name.as_ref() == "second"));
+    second_drop.finish.send(Ok(())).unwrap();
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CleanupFinished { database_id: DatabaseId(11), result: Ok(()) }
+    ));
+    assert!(!first_create.is_closed());
+    assert!(!first_drop.finish.is_closed());
+    first_create.send(Ok(ReadString::from("first"))).unwrap();
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished { database_id: DatabaseId(1), result: Ok(_) }
+    ));
+    first_drop.finish.send(Ok(())).unwrap();
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CleanupFinished { database_id: DatabaseId(10), result: Ok(()) }
+    ));
     fixture.finish().await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn failures_keep_backlog_capacity_and_retry_with_a_capped_delay() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        cleanup_max_pending: 1,
-        cleanup_concurrency: 1,
-        ..WorkerEngineConfig::default()
-    });
-    fixture.enqueue("retry-me").await;
-    let mut request = fixture.next_drop().await;
-    let cleanup = fixture.cleanup.clone();
-    let mut admission = Box::pin(cleanup.enqueue(ReadString::from("next"), fixture.client.clone()));
+#[tokio::test]
+async fn ddl_failures_are_reported_and_workers_accept_later_jobs() {
+    let mut fixture = Fixture::new();
+    fixture.create(1);
+    fixture
+        .next_creation()
+        .await
+        .send(Err(PostgresDDLClientError::NonRecoverableError("create failed".into())))
+        .unwrap();
+    assert!(matches!(fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished {
+            database_id: DatabaseId(1),
+            result: Err(PostgresDDLClientError::NonRecoverableError(reason)),
+        } if reason == "create failed"));
 
-    for retry_after_secs in [1, 2, 4, 8, 16, 30, 30] {
-        request
-            .finish
-            .send(Err(PostgresDDLClientError::NonRecoverableError("injected".into())))
-            .unwrap();
-        tokio::task::yield_now().await;
-        assert_pending(admission.as_mut()).await;
-
-        tokio::time::advance(Duration::from_secs(retry_after_secs) - Duration::from_millis(1))
-            .await;
-        assert!(fixture.drops.try_recv().is_err());
-        tokio::time::advance(Duration::from_millis(1)).await;
-        request = fixture.next_drop().await;
-        assert_eq!(request.database_name, "retry-me");
-    }
-
-    request.finish.send(Ok(())).unwrap();
-    admission.await.unwrap();
-    let next = fixture.next_drop().await;
-    assert_eq!(next.database_name, "next");
-    next.finish.send(Ok(())).unwrap();
-    fixture.finish().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn retry_backoff_releases_execution_capacity_for_other_drops() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        cleanup_max_pending: 2,
-        cleanup_concurrency: 1,
-        ..WorkerEngineConfig::default()
-    });
-    fixture.enqueue("retry-me").await;
+    fixture.cleanup(2, "retired");
     fixture
         .next_drop()
         .await
         .finish
         .send(Err(PostgresDDLClientError::OperationNotExecutedAfterCertainRetries {
-            operation: "drop retry-me".into(),
+            operation: "drop retired".into(),
             retries: 3,
         }))
         .unwrap();
-    tokio::task::yield_now().await;
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CleanupFinished {
+            database_id: DatabaseId(2),
+            result: Err(PostgresDDLClientError::OperationNotExecutedAfterCertainRetries {
+                retries: 3,
+                ..
+            }),
+        }
+    ));
 
-    fixture.enqueue("healthy").await;
-    let healthy = fixture.next_drop().await;
-    assert_eq!(healthy.database_name, "healthy");
-    healthy.finish.send(Ok(())).unwrap();
-    tokio::time::advance(Duration::from_secs(1)).await;
-    let retried = fixture.next_drop().await;
-    assert_eq!(retried.database_name, "retry-me");
-    retried.finish.send(Ok(())).unwrap();
+    fixture.create(3);
+    fixture.next_creation().await.send(Ok(ReadString::from("healthy"))).unwrap();
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished { database_id: DatabaseId(3), result: Ok(_) }
+    ));
+    fixture.cleanup(4, "healthy_retired");
+    fixture.next_drop().await.finish.send(Ok(())).unwrap();
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CleanupFinished { database_id: DatabaseId(4), result: Ok(()) }
+    ));
+    // Worker-level retry policy has not been introduced by the split.
     fixture.finish().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn shutdown_cancels_active_queued_and_retrying_drops_and_blocked_admission() {
-    let mut fixture = Fixture::new(WorkerEngineConfig {
-        cleanup_max_pending: 3,
-        cleanup_concurrency: 1,
-        ..WorkerEngineConfig::default()
-    });
-    fixture.enqueue("retrying").await;
-    fixture
-        .next_drop()
-        .await
-        .finish
-        .send(Err(PostgresDDLClientError::NonRecoverableError("injected".into())))
-        .unwrap();
-    tokio::task::yield_now().await;
-    fixture.enqueue("active").await;
-    let active = fixture.next_drop().await;
-    fixture.enqueue("queued").await;
-    let cleanup = fixture.cleanup.clone();
-    let mut admission =
-        Box::pin(cleanup.enqueue(ReadString::from("blocked"), fixture.client.clone()));
-    assert_pending(admission.as_mut()).await;
-
-    fixture.shutdown.cancel();
-    fixture.finish().await;
-    assert!(admission.await.is_err());
-    assert!(active.finish.send(Ok(())).is_err(), "in-flight drop must be cancelled");
-    tokio::time::advance(Duration::from_secs(60)).await;
-    assert!(fixture.drops.try_recv().is_err(), "queued and retrying drops must not start");
-    assert!(fixture.tracker.is_empty());
+    assert!(fixture.creates.try_recv().is_err());
+    assert!(fixture.drops.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn zero_cleanup_limits_are_rejected_before_connecting_to_postgres() {
-    for config in [
-        WorkerEngineConfig { cleanup_max_pending: 0, ..WorkerEngineConfig::default() },
-        WorkerEngineConfig { cleanup_concurrency: 0, ..WorkerEngineConfig::default() },
-    ] {
-        assert!(WorkerEngineManager::start(PostgresConfig::default(), config).await.is_err());
+async fn closing_request_channels_drains_queued_jobs_and_exits_worker_loops() {
+    let mut fixture = Fixture::new();
+    fixture.create(1);
+    fixture.cleanup(2, "old");
+    fixture.senders.take();
+    fixture.next_creation().await.send(Ok(ReadString::from("new"))).unwrap();
+    fixture.next_drop().await.finish.send(Ok(())).unwrap();
+    fixture.finish().await;
+
+    let mut created = false;
+    let mut cleaned = false;
+    while let Some(message) = fixture.results.recv().await {
+        match message {
+            EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CreationFinished {
+                database_id: DatabaseId(1),
+                result: Ok(_),
+            }) => {
+                assert!(!created);
+                created = true;
+            }
+            EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CleanupFinished {
+                database_id: DatabaseId(2),
+                result: Ok(()),
+            }) => {
+                assert!(!cleaned);
+                cleaned = true;
+            }
+            _ => panic!("unexpected result"),
+        }
     }
+    assert!(created && cleaned);
+}
+
+#[tokio::test]
+async fn shutdown_cancels_in_flight_ddl_and_discards_queued_work() {
+    let mut fixture = Fixture::new();
+    fixture.create(1);
+    fixture.cleanup(2, "active");
+    let active_create = fixture.next_creation().await;
+    let active_drop = fixture.next_drop().await;
+    fixture.create(3);
+    fixture.cleanup(4, "queued");
+    // No await between enqueueing and cancellation: queued work cannot start
+    // first.
+    fixture.shutdown.cancel();
+    fixture.finish().await;
+    assert!(active_create.is_closed());
+    assert!(active_drop.finish.is_closed());
+    assert!(fixture.creates.try_recv().is_err());
+    assert!(fixture.drops.try_recv().is_err());
+    assert!(fixture.results.recv().await.is_none(), "cancelled DDL must not report success");
+}
+
+#[tokio::test]
+async fn closing_one_worker_queue_does_not_close_the_other() {
+    let (engine_tx, _engine_rx) = hotpath::channel!(mpsc::unbounded_channel());
+    let (senders, creation_rx, mut cleanup_rx) =
+        DatabaseWorkerSenders::init_database_worker_channels();
+    let io = WorkerEngineIO::new(engine_tx, TaskTracker::new(), CancellationToken::new(), senders);
+    drop(creation_rx);
+    assert!(matches!(
+        io.request_creation(CreateDatabase { database_id: DatabaseId(1) }),
+        Err(IOError::FailedToSendTheMessage)
+    ));
+    io.request_cleanup(CleanupDatabase {
+        database_id: DatabaseId(2),
+        database_name: ReadString::from("old"),
+    })
+    .unwrap();
+    assert_eq!(cleanup_rx.recv().await.unwrap().database_id, DatabaseId(2));
+    drop(cleanup_rx);
+    assert!(matches!(
+        io.request_cleanup(CleanupDatabase {
+            database_id: DatabaseId(3),
+            database_name: ReadString::from("another"),
+        }),
+        Err(IOError::FailedToSendTheMessage)
+    ));
+}
+
+#[tokio::test]
+async fn zero_lease_record_limit_is_rejected_before_connecting() {
+    assert!(
+        WorkerEngineManager::start(
+            PostgresConfig::default(),
+            WorkerEngineConfig { max_lease_records: 0, ..WorkerEngineConfig::default() }
+        )
+        .await
+        .is_err()
+    );
 }

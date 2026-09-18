@@ -36,19 +36,24 @@ pub struct PostgresConfig {
     pub pgtest_pg_database: String,
     #[envconfig(from = "PGTEST_POOL_CONNECTION", default = "5")]
     pub pgtest_pg_pool_connection: u32,
+    #[envconfig(from = "PGTEST_CLEANUP_POOL_CONNECTION", default = "2")]
+    pub pgtest_pg_cleanup_pool_connection: u32,
 }
 
 const MIN_SERVER_VERSION_NUM: u8 = 13;
 
 pub struct PostgresManager {
     version: u8,
-    pg: Pool<Postgres>,
+    create_pool: Pool<Postgres>,
+    cleanup_pool: Pool<Postgres>,
     pub port: u16,
     pub template_database_name: PostgresDatabaseName,
 }
 
 #[derive(Error, Debug)]
 pub enum PostgresClientError {
+    #[error("{0} must be greater than zero")]
+    InvalidPoolSize(&'static str),
     #[error("unable to connect to postgres at {0}")]
     UnableToConnectToPostgres(String),
     #[error("unable to fetch the postgres server version")]
@@ -327,6 +332,13 @@ impl PostgresManager {
     pub async fn start(
         postgres_config: PostgresConfig,
     ) -> Result<PostgresManager, PostgresClientError> {
+        if postgres_config.pgtest_pg_pool_connection == 0 {
+            return Err(PostgresClientError::InvalidPoolSize("PGTEST_POOL_CONNECTION"));
+        }
+        if postgres_config.pgtest_pg_cleanup_pool_connection == 0 {
+            return Err(PostgresClientError::InvalidPoolSize("PGTEST_CLEANUP_POOL_CONNECTION"));
+        }
+
         let connection_options = PgConnectOptions::new()
             .host(&postgres_config.pgtest_pg_host)
             .port(postgres_config.pgtest_pg_port)
@@ -334,29 +346,58 @@ impl PostgresManager {
             .password("postgres")
             .database("postgres");
 
-        let Ok(pool) = PgPoolOptions::new()
+        let create_pool = PgPoolOptions::new()
             .max_connections(postgres_config.pgtest_pg_pool_connection)
-            .connect_with(connection_options)
+            .connect_with(connection_options.clone())
             .await
-        else {
-            return Err(PostgresClientError::UnableToConnectToPostgres(format!(
-                "postgres://{}@{}:{}/postgres",
-                postgres_config.pgtest_pg_user,
-                postgres_config.pgtest_pg_host,
-                postgres_config.pgtest_pg_port
-            )));
+            .map_err(|error| {
+                tracing::error!(%error, "unable to connect the database creation pool");
+                PostgresClientError::UnableToConnectToPostgres(format!(
+                    "postgres://{}@{}:{}/postgres",
+                    postgres_config.pgtest_pg_user,
+                    postgres_config.pgtest_pg_host,
+                    postgres_config.pgtest_pg_port
+                ))
+            })?;
+
+        if let Err(error) =
+            PostgresManager::database_exists(&create_pool, &postgres_config.pgtest_pg_database)
+                .await
+        {
+            create_pool.close().await;
+            return Err(error);
+        }
+
+        let pg_version = match PostgresManager::is_valid_version(&create_pool).await {
+            Err(error) => {
+                create_pool.close().await;
+                return Err(error);
+            }
+            Ok(pg_server_version) => pg_server_version,
         };
 
-        PostgresManager::database_exists(&pool, &postgres_config.pgtest_pg_database).await?;
-
-        let pg_version = match PostgresManager::is_valid_version(&pool).await {
-            Err(error) => return Err(error),
-            Ok(pg_server_version) => pg_server_version,
+        let cleanup_pool = match PgPoolOptions::new()
+            .max_connections(postgres_config.pgtest_pg_cleanup_pool_connection)
+            .connect_with(connection_options)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                tracing::error!(%error, "unable to connect the database cleanup pool");
+                create_pool.close().await;
+                return Err(PostgresClientError::UnableToConnectToPostgres(format!(
+                    "postgres://{}@{}:{}/postgres",
+                    postgres_config.pgtest_pg_user,
+                    postgres_config.pgtest_pg_host,
+                    postgres_config.pgtest_pg_port
+                )));
+            }
         };
 
         Ok(PostgresManager {
             version: pg_version,
-            pg: pool,
+            create_pool,
+            cleanup_pool,
             template_database_name: PostgresDatabaseName::new(postgres_config.pgtest_pg_database),
             port: postgres_config.pgtest_pg_port,
         })
@@ -434,7 +475,7 @@ impl PostgresManager {
         let templates_result: Result<Vec<(String,)>, sqlx::Error> =
             sqlx::query_as("SELECT datname from pg_database WHERE datname LIKE $1")
                 .bind(format!("{}_%", self.template_database_name.template_name()))
-                .fetch_all(&self.pg)
+                .fetch_all(&self.cleanup_pool)
                 .await;
 
         let templates = match templates_result {
@@ -487,13 +528,13 @@ impl PostgresManager {
     async fn acquire_create_connection(
         &self,
     ) -> Result<sqlx::pool::PoolConnection<Postgres>, sqlx::Error> {
-        self.pg.acquire().await
+        self.create_pool.acquire().await
     }
 
     async fn acquire_drop_connection(
         &self,
     ) -> Result<sqlx::pool::PoolConnection<Postgres>, sqlx::Error> {
-        self.pg.acquire().await
+        self.cleanup_pool.acquire().await
     }
 }
 
@@ -503,7 +544,65 @@ impl PostgresManager {
 mod postgres_manager_test {
     use tokio::time::Instant;
 
-    use crate::postgres_manager::{PostgresDatabaseName, PostgresManager, pg_container_config};
+    use crate::postgres_manager::{
+        PostgresClientError, PostgresConfig, PostgresDatabaseName, PostgresManager,
+        pg_container_config,
+    };
+
+    #[tokio::test]
+    async fn zero_pool_limits_are_rejected_before_connecting() {
+        for (config, variable) in [
+            (
+                PostgresConfig { pgtest_pg_pool_connection: 0, ..PostgresConfig::default() },
+                "PGTEST_POOL_CONNECTION",
+            ),
+            (
+                PostgresConfig {
+                    pgtest_pg_cleanup_pool_connection: 0,
+                    ..PostgresConfig::default()
+                },
+                "PGTEST_CLEANUP_POOL_CONNECTION",
+            ),
+        ] {
+            assert!(matches!(
+                PostgresManager::start(config).await,
+                Err(PostgresClientError::InvalidPoolSize(actual)) if actual == variable
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_and_creation_have_independent_connection_capacity() {
+        let config = PostgresConfig {
+            pgtest_pg_pool_connection: 1,
+            pgtest_pg_cleanup_pool_connection: 1,
+            ..pg_container_config().await
+        };
+        let manager = PostgresManager::start(config).await.unwrap();
+
+        let cleanup_connection = manager.acquire_drop_connection().await.unwrap();
+        let creation_connection = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.acquire_create_connection(),
+        )
+        .await
+        .expect("a full cleanup pool must not block creation")
+        .unwrap();
+
+        drop(cleanup_connection);
+        let cleanup_connection = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.acquire_drop_connection(),
+        )
+        .await
+        .expect("a full creation pool must not block cleanup")
+        .unwrap();
+
+        drop(creation_connection);
+        drop(cleanup_connection);
+        manager.create_pool.close().await;
+        manager.cleanup_pool.close().await;
+    }
 
     #[tokio::test]
     async fn start_ok() {
@@ -546,6 +645,7 @@ impl Default for PostgresConfig {
             pgtest_pg_user: String::from("postgres"),
             pgtest_pg_host: String::from("localhost"),
             pgtest_pg_pool_connection: 5,
+            pgtest_pg_cleanup_pool_connection: 2,
         }
     }
 }
