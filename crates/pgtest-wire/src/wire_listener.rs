@@ -9,7 +9,10 @@ use tokio::task::JoinSet;
 use crate::connection::{ClientStream, handle_connection};
 #[cfg(unix)]
 pub use crate::unix_listener::UnixWireListener;
-pub use crate::{connection::parse_connection_field, postgres_upstream::RawBytes};
+pub use crate::{
+    connection::{ConnectionFieldError, parse_connection_field},
+    postgres_upstream::RawBytes,
+};
 
 #[derive(Error, Debug)]
 pub enum WireError {

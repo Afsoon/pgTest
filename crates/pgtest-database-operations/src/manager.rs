@@ -237,7 +237,7 @@ impl PostgresManager {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 mod postgres_manager_test {
     use tokio::time::Instant;
 

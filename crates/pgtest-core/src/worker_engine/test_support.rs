@@ -246,7 +246,7 @@ impl EngineSimulator {
 
         let mut engine = WorkerEngine::new(worker_engine_config, manager, engine_io, inbox.clone());
 
-        engine.try_init().await;
+        engine.try_init().await.unwrap();
 
         engine.process_messages().await;
 
@@ -281,7 +281,7 @@ impl EngineSimulator {
 
         let mut engine = WorkerEngine::new(worker_engine_config, manager, engine_io, inbox.clone());
 
-        engine.try_init().await;
+        engine.try_init().await.unwrap();
 
         engine.process_messages().await;
 
@@ -385,7 +385,7 @@ pub async fn run_grow_with(
 
     let mut worker = GrowWorker::new(config, manager, engine_io.clone(), inbox);
 
-    worker.try_init().await;
+    worker.try_init().await.unwrap();
     worker.grow();
     worker.process_messages().await;
 

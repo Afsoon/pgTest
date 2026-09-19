@@ -51,4 +51,4 @@ run-metered host="127.0.0.1" user="metered" template="metered" port="5432" pool=
 # Run metered with a Unix socket; pool limits CREATE, PGTEST_CLEANUP_POOL_CONNECTION limits cleanup
 run-metered-unix host="127.0.0.1" user="metered" template="metered" port="5432" pool="5" initial="16" socket_dir="/tmp/pgtest":
     mkdir -p -m 700 -- {{quote(socket_dir)}}
-    RUST_LOG=info RUST_MIN_STACK=16777216 PGTEST_UNIX_SOCKET_DIR={{quote(socket_dir)}} PGTEST_POOL_INITIAL_SIZE={{quote(initial)}} PGTEST_CREATION_POOL_CONNECTION={{quote(pool)}} PGTEST_PG_HOST={{quote(host)}} PGTEST_PG_USER={{quote(user)}} PGTEST_PG_DATABASE={{quote(template)}} PGTEST_PG_PORT={{quote(port)}} cargo run -p {{crate}}
+    HOTPATH_LIMIT=0 HOTPATH_OUTPUT_FORMAT=json RUST_LOG=info RUST_MIN_STACK=16777216 PGTEST_UNIX_SOCKET_DIR={{quote(socket_dir)}} PGTEST_POOL_INITIAL_SIZE={{quote(initial)}} PGTEST_CREATION_POOL_CONNECTION={{quote(pool)}} PGTEST_PG_HOST={{quote(host)}} PGTEST_PG_USER={{quote(user)}} PGTEST_PG_DATABASE={{quote(template)}} PGTEST_PG_PORT={{quote(port)}} cargo run -p {{crate}} --features hotpath

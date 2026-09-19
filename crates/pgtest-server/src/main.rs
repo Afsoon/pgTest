@@ -5,7 +5,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use envconfig::Envconfig;
 use pgtest::{worker_engine::core::WorkerEngineConfig, worker_manager::WorkerEngineManager};
 use pgtest_database_operations::manager::config::PostgresConfig;
@@ -43,10 +43,11 @@ async fn main() -> Result<()> {
     let worker_engine_config =
         WorkerEngineConfig::init_from_env().context("invalid worker engine configuration")?;
 
-    let engine =
-        Arc::new(WorkerEngineManager::start(postgres_config, worker_engine_config).await.map_err(
-            |()| anyhow!("failed to start worker engine manager; see logs for details"),
-        )?);
+    let engine = Arc::new(
+        WorkerEngineManager::start(postgres_config, worker_engine_config)
+            .await
+            .context("failed to start worker engine manager")?,
+    );
     let address =
         wire_listener::run(engine.clone()).await.context("failed to start wire listener")?;
     tracing::info!(%address, "pgtest server listening");

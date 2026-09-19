@@ -91,7 +91,7 @@ impl Fixture {
         let io = DeferredIO { inbox: inbox.clone(), operations: Arc::default() };
         let pg = Arc::new(PostgresConnection::start(PostgresConfig::default()));
         let mut engine = Engine::new(config, pg, io.clone(), WorkerInboxImpl::new(inbox));
-        engine.try_init().await;
+        engine.try_init().await.unwrap();
         Self { engine, io, consumer: ConsumerWorker::new(Arc::default()) }
     }
 

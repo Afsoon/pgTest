@@ -22,14 +22,12 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-testcontainers = { workspace = true, optional = true }
 pgtest-utils = { path = "../pgtest-utils"}
 pgtest-database-operations = { path = "../pgtest-database-operations"}
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-test = { workspace = true }
-testcontainers = { workspace = true }
 pgtest-database-operations = { path = "../pgtest-database-operations", features = ["test-support"]}
 
 [features]
@@ -37,5 +35,5 @@ default = []
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
 hotpath-prometheus = ["hotpath/hotpath-prometheus"]
-# Expose the container-backed PostgreSQL configuration to other crates' tests.
-test-support = ["dep:testcontainers"]
+# Expose configuration defaults to other crates' tests.
+test-support = []

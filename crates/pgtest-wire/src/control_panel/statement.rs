@@ -11,12 +11,18 @@ pub enum PgTestQueryTypeControlStatement {
     Ping,
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported control-panel command")]
+pub(super) struct InvalidControlQuery;
+
 impl PgTestQueryTypeControlStatement {
-    pub(super) fn parse(query: &str) -> Result<PgTestQueryTypeControlStatement, ()> {
+    pub(super) fn parse(
+        query: &str,
+    ) -> Result<PgTestQueryTypeControlStatement, InvalidControlQuery> {
         let mut value = match PgTestQueryControlPanelParser::parse(Rule::query, query) {
             Ok(value) => value,
             Err(_) => {
-                return Err(());
+                return Err(InvalidControlQuery);
             }
         };
 
@@ -48,7 +54,7 @@ impl PgTestQueryTypeControlStatement {
             _ => None,
         });
 
-        first_pair.ok_or(())
+        first_pair.ok_or(InvalidControlQuery)
     }
 }
 

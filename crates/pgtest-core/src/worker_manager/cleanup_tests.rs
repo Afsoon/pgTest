@@ -43,7 +43,7 @@ impl PostgresClient for ControlledPostgres {
 
 struct Fixture {
     senders: Option<DatabaseWorkerSenders>,
-    results: mpsc::UnboundedReceiver<EngineMessage<ConsumerWorker>>,
+    results: hotpath::wrap::tokio::sync::mpsc::UnboundedReceiver<EngineMessage<ConsumerWorker>>,
     creates: mpsc::UnboundedReceiver<oneshot::Sender<CreateResult>>,
     drops: mpsc::UnboundedReceiver<DropRequest>,
     tracker: TaskTracker,
@@ -366,12 +366,29 @@ async fn closing_one_worker_queue_does_not_close_the_other() {
 
 #[tokio::test]
 async fn zero_lease_record_limit_is_rejected_before_connecting() {
-    assert!(
+    assert!(matches!(
         WorkerEngineManager::start(
             PostgresConfig::default(),
             WorkerEngineConfig { max_lease_records: 0, ..WorkerEngineConfig::default() }
         )
-        .await
-        .is_err()
-    );
+        .await,
+        Err(StartError::InvalidLeaseRecordLimit)
+    ));
+}
+
+#[tokio::test]
+async fn startup_preserves_postgres_configuration_errors() {
+    let result = WorkerEngineManager::start(
+        PostgresConfig { pgtest_pg_creation_pool_connection: 0, ..PostgresConfig::default() },
+        WorkerEngineConfig::default(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(StartError::Postgres(
+            pgtest_database_operations::manager::errors::PostgresClientError::InvalidPoolSize(
+                "PGTEST_CREATION_POOL_CONNECTION"
+            )
+        ))
+    ));
 }

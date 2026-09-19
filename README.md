@@ -113,6 +113,23 @@ remaining startup messages through ReadyForQuery (or ErrorResponse). Bytes alrea
 read during authentication remain buffered for the final stage. Use
 `HOTPATH_LIMIT=0` to include all three stages even when their totals are small.
 
+Upstream startup also measures `send_startup`, `forwardable`, `read_frame`, and
+`read_until`. The `postgres_upstream::encode_startup` and
+`postgres_upstream::decode_authentication` blocks isolate encoding and decoding.
+The futures report labels startup writes, frame-header reads, frame-body reads,
+and actual socket reads as `postgres_upstream::write_startup`,
+`postgres_upstream::read_frame_header`, `postgres_upstream::read_frame_body`, and
+`postgres_upstream::read_socket`. A header or body already in the buffer needs no
+socket read.
+
+Use function durations to inspect elapsed time, including async waits. Compare
+`send_startup` and `read_frame` with their future poll times to distinguish time
+spent executing from time suspended waiting for I/O or task scheduling. Future
+poll duration is not the total time spent waiting for bytes. These measurements
+are nested and overlap; do not add their totals together. A long relay duration
+can simply mean a long-lived session. Profiling adds overhead when enabled, so
+compare runs with the same build profile and workload.
+
 Within `pgtest-wire`, `wire_listener` owns the accept loops, `connection` handles
 startup and routing, and `control_panel::serve` processes control connections.
 `postgres_upstream` owns the upstream startup exchange, while `session_relay`

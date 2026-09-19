@@ -24,6 +24,8 @@ mod database_creation_worker;
 mod startup;
 pub mod worker_io;
 
+pub use startup::StartError;
+
 #[cfg(test)]
 use self::{
     database_cleanup_worker::DatabaseCleanupWorker,
@@ -53,14 +55,13 @@ impl WorkerEngineManager {
     pub async fn start(
         postgres_config: PostgresConfig,
         worker_engine_config: WorkerEngineConfig,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, StartError> {
         if worker_engine_config.max_lease_records == 0 {
-            tracing::error!("lease record capacity must be greater than zero");
-            return Err(());
+            return Err(StartError::InvalidLeaseRecordLimit);
         }
 
         let postgres_client = startup::prepare_postgres(postgres_config).await?;
-        Ok(startup::start_workers(postgres_client, worker_engine_config).await)
+        startup::start_workers(postgres_client, worker_engine_config).await
     }
 
     #[hotpath::measure]
@@ -294,7 +295,7 @@ mod worker_engine_manager_test {
             io,
             super::WorkerEngineInbox::new(engine_rx),
         );
-        engine.try_init().await;
+        engine.try_init().await.unwrap();
         let engine_handle = tokio::spawn(async move {
             engine.run().await;
             engine
@@ -322,6 +323,20 @@ mod worker_engine_manager_test {
     #[tokio::test]
     async fn immediate_available_templates() {
         start_manager(WorkerEngineConfig::default()).await.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_returns_initial_creation_failure_without_panicking() {
+        let client = std::sync::Arc::new(
+            pgtest_database_operations::manager::PostgresManager::start(
+                pg_container_config().await,
+            )
+            .await
+            .unwrap(),
+        );
+        client.drop_ddl_database(client.template_database_name.template_name()).await.unwrap();
+        let result = super::startup::start_workers(client, no_growth_config(1)).await;
+        assert!(matches!(result, Err(super::StartError::InitialDatabaseCreation(_))));
     }
 
     #[tokio::test]

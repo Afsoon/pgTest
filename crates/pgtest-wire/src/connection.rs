@@ -2,7 +2,10 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::{SinkExt, StreamExt};
 use pgtest::{
-    worker_engine::{core::LeaseId, errors::AttachError},
+    worker_engine::{
+        core::LeaseId,
+        errors::{AttachError, InvalidLeaseId},
+    },
     worker_manager::WorkerEngineManager,
 };
 use pgwire::{
@@ -80,12 +83,18 @@ pub(crate) async fn handle_connection(stream: ClientStream, manager: Arc<WorkerE
         return;
     }
 
-    protocol_negotiation(&mut framed, &startup).await.unwrap();
+    if let Err(error) = protocol_negotiation(&mut framed, &startup).await {
+        tracing::debug!(%error, "client protocol negotiation failed");
+        return;
+    }
 
-    framed
+    if let Err(error) = framed
         .send(PgWireBackendMessage::Authentication(pgwire::messages::startup::Authentication::Ok))
         .await
-        .unwrap();
+    {
+        tracing::debug!(%error, "unable to send client authentication response");
+        return;
+    }
 
     tracing::debug!("connection string is {database}");
 
@@ -131,14 +140,19 @@ pub(crate) async fn handle_connection(stream: ClientStream, manager: Arc<WorkerE
             manager.pg_client.port,
         ) => match result {
             Ok(session) => session,
-            Err(()) => {
+            Err(error) => {
+                tracing::warn!(%error, host = %manager.pg_client.host, port = manager.pg_client.port, "upstream connection failed");
                 reject_connection(&mut framed, "08006", "unable to connect to PostgreSQL").await;
                 return;
             }
         }
     };
     let parts = framed.into_parts();
-    let _ = session_relay::run(parts.io, upstream_session, parts.read_buf, lease_session).await;
+    if let Err(error) =
+        session_relay::run(parts.io, upstream_session, parts.read_buf, lease_session).await
+    {
+        tracing::debug!(%error, "session relay ended with an I/O error");
+    }
 }
 
 #[hotpath::measure]
@@ -147,22 +161,35 @@ async fn reject_connection(framed: &mut ClientConnection, code: &str, message: &
     let _ = framed.send(PgWireBackendMessage::ErrorResponse(error.into())).await;
 }
 
-#[hotpath::measure]
-pub fn parse_connection_field(decode_raw_string: &str) -> Result<(&str, LeaseId), ()> {
-    let mut parts = decode_raw_string.splitn(3, '/');
-    let database_name = parts.next().unwrap();
-    let Some(lease_id) = parts.next() else { return Err(()) };
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectionFieldError {
+    #[error("expected template/lease-id")]
+    InvalidFormat,
+    #[error(transparent)]
+    InvalidLeaseId(#[from] InvalidLeaseId),
+}
 
-    if database_name.is_empty() || parts.next().is_some() {
-        return Err(());
+#[hotpath::measure]
+pub fn parse_connection_field(input: &str) -> Result<(&str, LeaseId), ConnectionFieldError> {
+    let (database, lease) = input.split_once('/').ok_or(ConnectionFieldError::InvalidFormat)?;
+    if database.is_empty() || lease.contains('/') {
+        return Err(ConnectionFieldError::InvalidFormat);
     }
-    Ok((database_name, LeaseId::new(lease_id).map_err(|_| ())?))
+    Ok((database, LeaseId::new(lease)?))
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn connection_field_validates_lease_ids() {
+        assert!(matches!(
+            super::parse_connection_field("template"),
+            Err(super::ConnectionFieldError::InvalidFormat)
+        ));
+        assert!(matches!(
+            super::parse_connection_field("template/"),
+            Err(super::ConnectionFieldError::InvalidLeaseId(_))
+        ));
         for input in ["", "template", "/lease", "template/", "template/a/b", "template/a\0b"] {
             assert!(super::parse_connection_field(input).is_err(), "{input:?}");
         }

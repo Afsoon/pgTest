@@ -11,21 +11,35 @@ use super::{
     database_creation_worker::DatabaseCreationWorker,
     worker_io::{DatabaseWorkerSenders, WorkerEngineIO, WorkerEngineInbox},
 };
-use crate::worker_engine::core::WorkerEngineConfig;
+use crate::worker_engine::{core::WorkerEngineConfig, errors::PostgresDDLClientError};
 
-pub(super) async fn prepare_postgres(config: PostgresConfig) -> Result<Arc<PostgresManager>, ()> {
-    let client = Arc::new(PostgresManager::start(config).await.map_err(log_postgres_start_error)?);
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    #[error("lease record capacity must be greater than zero")]
+    InvalidLeaseRecordLimit,
+    #[error("failed to initialize PostgreSQL: {0}")]
+    Postgres(#[from] PostgresClientError),
+    #[error("failed to create the initial databases: {0}")]
+    InitialDatabaseCreation(#[from] PostgresDDLClientError),
+}
+
+pub(super) async fn prepare_postgres(
+    config: PostgresConfig,
+) -> Result<Arc<PostgresManager>, StartError> {
+    let client = Arc::new(PostgresManager::start(config).await?);
 
     // Keep the large, instrumented cleanup future off the startup future's
     // inline state to avoid overflowing the stack with profiling enabled.
-    let _ = Box::pin(client.drop_ddl_templates_like()).await;
+    if let Err(error) = Box::pin(client.drop_ddl_templates_like()).await {
+        tracing::warn!(?error, "startup cleanup failed; continuing startup");
+    }
     Ok(client)
 }
 
 pub(super) async fn start_workers(
     postgres_client: Arc<PostgresManager>,
     worker_engine_config: WorkerEngineConfig,
-) -> WorkerEngineManager {
+) -> Result<WorkerEngineManager, StartError> {
     let (inbox_tx, inbox_rx) =
         hotpath::channel!(tokio::sync::mpsc::unbounded_channel(), label = "worker-inbox");
 
@@ -70,7 +84,7 @@ pub(super) async fn start_workers(
     );
 
     // Preserve the stack bound when engine initialization is instrumented.
-    Box::pin(worker_engine.try_init()).await;
+    Box::pin(worker_engine.try_init()).await?;
 
     tracker.spawn(creation_worker.run());
     tracker.spawn(cleanup_worker.run());
@@ -80,52 +94,12 @@ pub(super) async fn start_workers(
         worker_engine
     });
 
-    WorkerEngineManager {
+    Ok(WorkerEngineManager {
         worker_inbox_tx: inbox_tx,
         pg_client: postgres_client,
         lease_claim_timeout: timeout_claim,
         engine_handle,
         tracker,
         shutdown_token,
-    }
-}
-
-fn log_postgres_start_error(error: PostgresClientError) {
-    match error {
-        error @ PostgresClientError::InvalidPoolSize(_) => {
-            tracing::error!(%error, "invalid PostgreSQL pool configuration");
-        }
-        PostgresClientError::DatabaseDoesNotExist(database_name) => {
-            tracing::error!("pgTest couldn't find {database_name} database to be used as template");
-        }
-        PostgresClientError::UnsupportedVersion(version) => {
-            tracing::error!(
-                "The minimal version supported by pgTest is PostgreSQL 13; Detected PostgresSQL \
-                 {version}"
-            );
-        }
-        PostgresClientError::UnableToFetchPostgresVersion => {
-            tracing::error!(
-                "pgTest failed to query the Postgres version; Query used \"SELECT \
-                 current_setting('server_version_num')::int8\" "
-            );
-        }
-        PostgresClientError::UnableToFetchDatabaseList => {
-            tracing::error!(
-                "pgTest failed to query all databases created in Postgres; Query used \"SELECT \
-                 datname from pg_database WHERE datname LIKE $1\" "
-            );
-        }
-        PostgresClientError::UnableToConnectToPostgres(connection_string) => {
-            tracing::error!(
-                "Unable to connect using this connection string \"{connection_string}\" "
-            );
-        }
-        PostgresClientError::UnexpectedServerVersionFormatFetched(server_version) => {
-            tracing::error!(
-                "The version query by pgTest have an unexpected format. The value obtained is \
-                 {server_version}. Please report this as a bug"
-            );
-        }
-    }
+    })
 }

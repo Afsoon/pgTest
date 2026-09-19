@@ -15,7 +15,7 @@ pub(crate) async fn run(
     upstream_session: UpstreamSession,
     remaining_stream: BytesMut,
     lease_session: LeaseSession,
-) -> Result<(), ()> {
+) -> std::io::Result<()> {
     let mut upstream_client = hotpath::io!(upstream_client, label = "client-relay");
     let mut upstream_stream = hotpath::io!(upstream_session.stream, label = "postgres-relay");
     let cancellation = lease_session.cancellation_token();
@@ -33,16 +33,10 @@ pub(crate) async fn run(
         .await?;
         Ok::<(), std::io::Error>(())
     };
+    // Both sockets and the session guard are dropped on every exit path.
     tokio::select! {
         biased;
-        _ = cancellation.cancelled() => {}
-        result = relay => {
-            if let Err(error) = result {
-                tracing::debug!(%error, "session relay ended with an I/O error");
-            }
-        }
+        _ = cancellation.cancelled() => Ok(()),
+        result = relay => result,
     }
-    // Both sockets and the session guard are dropped on every exit path.
-
-    Ok(())
 }

@@ -1931,7 +1931,6 @@ dependencies = [
  "rand 0.10.2",
  "rustc-hash",
  "sqlx",
- "testcontainers",
  "thiserror",
  "tokio",
  "tokio-retry2",

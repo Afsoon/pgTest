@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::worker_engine::{
     database_inventory::{Database, DatabaseInventory},
     database_jobs::DatabaseWorkerMessages,
-    errors::{AttachError, ReleaseError},
+    errors::{AttachError, PostgresDDLClientError, ReleaseError},
     messages::{ConsumerReply, EngineMessage},
     traits::{ConsumerIO, EngineIO, EngineInbox, PostgresClient},
 };
@@ -116,7 +116,7 @@ where
     }
 
     #[hotpath::measure]
-    pub async fn try_init(&mut self) {
+    pub async fn try_init(&mut self) -> Result<(), PostgresDDLClientError> {
         for _ in 0..self.config.initial_slots {
             let request = self.inventory.reserve_creation();
             let database_id = request.database_id;
@@ -132,9 +132,10 @@ where
                 .expect("initial creation must have a pending reservation")
             {
                 tracing::error!(?database_id, %error, "initial database creation failed");
-                panic!("failed to create the initial batch of databases");
+                return Err(error);
             }
         }
+        Ok(())
     }
 
     #[hotpath::measure]
