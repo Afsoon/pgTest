@@ -1,5 +1,4 @@
 #![cfg(test)]
-
 use std::{
     collections::VecDeque,
     sync::{
@@ -8,20 +7,20 @@ use std::{
     },
 };
 
+use pgtest_database_operations::manager::{
+    config::PostgresConfig, database_name::PostgresDatabaseName,
+};
+use pgtest_utils::read_string::ReadString;
 use rustc_hash::FxHashMap;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    postgres_manager::{PostgresConfig, PostgresDatabaseName},
-    utils::ReadString,
-    worker_engine::{
-        core::{EngineCounters, LeaseEntry, LeaseId, WorkerEngine, WorkerEngineConfig},
-        database_inventory::DatabaseInventory,
-        database_jobs::{CleanupDatabase, CreateDatabase, DatabaseWorkerMessages},
-        errors::{IOError, MetricIOError, PostgresDDLClientError},
-        messages::{ConsumerReply, EngineMessage, EngineMetricMessage},
-        traits::{ConsumerIO, EngineIO, EngineInbox, MetricIO, PostgresClient},
-    },
+use crate::worker_engine::{
+    core::{EngineCounters, LeaseEntry, LeaseId, WorkerEngine, WorkerEngineConfig},
+    database_inventory::DatabaseInventory,
+    database_jobs::{CleanupDatabase, CreateDatabase, DatabaseWorkerMessages},
+    errors::{IOError, PostgresDDLClientError},
+    messages::{ConsumerReply, EngineMessage},
+    traits::{ConsumerIO, EngineIO, EngineInbox, PostgresClient},
 };
 
 #[derive(Clone, Debug)]
@@ -156,19 +155,6 @@ impl EngineInbox<ConsumerWorker> for WorkerInboxImpl {
     }
 }
 
-pub struct TestMetrics {
-    _inbox: Arc<std::sync::Mutex<VecDeque<EngineMessage<ConsumerWorker>>>>,
-}
-
-impl MetricIO for TestMetrics {
-    fn send_metric(
-        &self,
-        _metric_message: EngineMetricMessage,
-    ) -> impl Future<Output = Result<(), MetricIOError>> + Send {
-        std::future::ready(Ok(()))
-    }
-}
-
 pub struct PostgresConnection {
     template_database_name: PostgresDatabaseName,
 }
@@ -240,13 +226,7 @@ impl EngineSimulator {
             inbox.push_message(msg);
         }
 
-        let mut engine = WorkerEngine::<
-            ConsumerWorker,
-            WorkerEngineIO,
-            WorkerInboxImpl,
-            TestMetrics,
-            PostgresConnection,
-        >::new(worker_engine_config, manager, engine_io, inbox.clone());
+        let mut engine = WorkerEngine::new(worker_engine_config, manager, engine_io, inbox.clone());
 
         engine.try_init().await;
 
@@ -281,13 +261,7 @@ impl EngineSimulator {
             inbox.push_message(msg);
         }
 
-        let mut engine = WorkerEngine::<
-            ConsumerWorker,
-            WorkerEngineIO,
-            WorkerInboxImpl,
-            TestMetrics,
-            PostgresConnection,
-        >::new(worker_engine_config, manager, engine_io, inbox.clone());
+        let mut engine = WorkerEngine::new(worker_engine_config, manager, engine_io, inbox.clone());
 
         engine.try_init().await;
 
@@ -364,13 +338,8 @@ impl EngineIO<ConsumerWorker, PostgresConnection> for ScriptedWorkerIO {
     }
 }
 
-pub type GrowWorker = WorkerEngine<
-    ConsumerWorker,
-    ScriptedWorkerIO,
-    WorkerInboxImpl,
-    TestMetrics,
-    PostgresConnection,
->;
+pub type GrowWorker =
+    WorkerEngine<ConsumerWorker, ScriptedWorkerIO, WorkerInboxImpl, PostgresConnection>;
 
 pub fn grow_config() -> WorkerEngineConfig {
     WorkerEngineConfig {

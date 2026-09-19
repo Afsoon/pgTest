@@ -1,11 +1,9 @@
 use std::collections::VecDeque;
 
+use pgtest_utils::read_string::ReadString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{
-    utils::ReadString,
-    worker_engine::database_jobs::{CreateDatabase, DatabaseId},
-};
+use crate::worker_engine::database_jobs::{CreateDatabase, DatabaseId};
 
 #[derive(Clone, Debug)]
 pub struct Database {

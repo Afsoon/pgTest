@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use hotpath::wrap::tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use pgtest_database_operations::manager::PostgresManager;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    postgres_manager::PostgresManager,
     worker_engine::{
         database_jobs::{CleanupDatabase, DatabaseWorkerMessages},
         messages::EngineMessage,

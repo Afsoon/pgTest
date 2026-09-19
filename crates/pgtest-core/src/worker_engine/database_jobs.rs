@@ -1,4 +1,6 @@
-use crate::{utils::ReadString, worker_engine::errors::PostgresDDLClientError};
+use pgtest_utils::read_string::ReadString;
+
+use crate::worker_engine::errors::PostgresDDLClientError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DatabaseId(pub u64);

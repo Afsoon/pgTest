@@ -1,12 +1,13 @@
 //! Exercise the real worker loops with explicitly completed PostgreSQL
 //! operations.
+use pgtest_utils::read_string::ReadString;
 use tokio::sync::{mpsc, oneshot};
 
 use super::*;
 use crate::worker_engine::{
-    database_jobs::{DatabaseId, DatabaseWorkerMessages},
-    errors::PostgresDDLClientError,
-    traits::PostgresClient,
+    database_jobs::{CleanupDatabase, CreateDatabase, DatabaseId, DatabaseWorkerMessages},
+    errors::{IOError, PostgresDDLClientError},
+    traits::{EngineIO, PostgresClient},
 };
 
 type CreateResult = Result<ReadString, PostgresDDLClientError>;
@@ -42,7 +43,7 @@ impl PostgresClient for ControlledPostgres {
 
 struct Fixture {
     senders: Option<DatabaseWorkerSenders>,
-    results: UnboundedReceiver<EngineMessage<ConsumerWorker>>,
+    results: mpsc::UnboundedReceiver<EngineMessage<ConsumerWorker>>,
     creates: mpsc::UnboundedReceiver<oneshot::Sender<CreateResult>>,
     drops: mpsc::UnboundedReceiver<DropRequest>,
     tracker: TaskTracker,

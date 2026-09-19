@@ -4,6 +4,8 @@ use std::{
     time::Instant,
 };
 
+use pgtest_database_operations::manager::config::PostgresConfig;
+use pgtest_utils::read_string::ReadString;
 use rustc_hash::FxHashSet;
 use tokio_util::sync::CancellationToken;
 
@@ -12,16 +14,12 @@ use super::{
     database_jobs::{CleanupDatabase, CreateDatabase, DatabaseId, DatabaseWorkerMessages},
     errors::{AttachError, IOError, PostgresDDLClientError, ReleaseError},
     messages::{ConsumerReply, EngineMessage},
-    test_support::{
-        ConsumerWorker, PostgresConnection, TestMetrics, WorkerInboxImpl, past_instant,
-    },
+    test_support::{ConsumerWorker, PostgresConnection, WorkerInboxImpl, past_instant},
     traits::EngineIO,
 };
-use crate::{postgres_manager::PostgresConfig, utils::ReadString};
 
 type Inbox = Arc<Mutex<VecDeque<EngineMessage<ConsumerWorker>>>>;
-type Engine =
-    WorkerEngine<ConsumerWorker, DeferredIO, WorkerInboxImpl, TestMetrics, PostgresConnection>;
+type Engine = WorkerEngine<ConsumerWorker, DeferredIO, WorkerInboxImpl, PostgresConnection>;
 
 #[derive(Default)]
 struct Operations {

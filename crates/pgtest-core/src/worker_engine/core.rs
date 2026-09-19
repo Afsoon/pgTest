@@ -1,18 +1,16 @@
 use std::{collections::VecDeque, marker::PhantomData, sync::Arc, time::Instant};
 
 use envconfig::Envconfig;
+use pgtest_utils::read_string::ReadString;
 use rustc_hash::FxHashMap;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    utils::ReadString,
-    worker_engine::{
-        database_inventory::{Database, DatabaseInventory},
-        database_jobs::{CleanupDatabase, DatabaseWorkerMessages},
-        errors::{AttachError, ReleaseError},
-        messages::{ConsumerReply, EngineMessage},
-        traits::{ConsumerIO, EngineIO, EngineInbox, MetricIO, PostgresClient},
-    },
+use crate::worker_engine::{
+    database_inventory::{Database, DatabaseInventory},
+    database_jobs::{CleanupDatabase, DatabaseWorkerMessages},
+    errors::{AttachError, ReleaseError},
+    messages::{ConsumerReply, EngineMessage},
+    traits::{ConsumerIO, EngineIO, EngineInbox, PostgresClient},
 };
 
 #[derive(Envconfig, Debug, Clone, Copy)]
@@ -53,12 +51,11 @@ pub(crate) struct LeaseEntry {
 
 // TBR: Once test are completed, it's time to revisit how the data it's
 // persisted.
-pub(crate) struct WorkerEngine<Consumer, IO, Inbox, Metrics, Postgres>
+pub(crate) struct WorkerEngine<Consumer, IO, Inbox, Postgres>
 where
     Consumer: ConsumerIO,
     IO: EngineIO<Consumer, Postgres>,
     Inbox: EngineInbox<Consumer>,
-    Metrics: MetricIO,
     Postgres: PostgresClient,
 {
     pub(crate) leases: FxHashMap<LeaseId, LeaseEntry>,
@@ -72,11 +69,6 @@ where
     group_waiters: FxHashMap<LeaseId, Vec<(Consumer, Instant)>>,
     pub(crate) counters: EngineCounters,
     engine_io: IO,
-    // TBD: Once the proxy is completed and I have discovered all useful metrics, implement the
-    // metrics worker to save all changes on append mode. Until then, this property is marked
-    // as a PhantomData. This metrics will be useful for debugging and understand how the engine
-    // behave in an exact point.
-    metrics_io: PhantomData<Metrics>,
     inbox: Inbox,
     consumer: PhantomData<Consumer>,
     root_cancellation_token: CancellationToken,
@@ -94,12 +86,11 @@ pub struct EngineCounters {
     pub unable_to_start_database_slots: u64,
 }
 
-impl<Consumer, IO, Inbox, Metrics, Postgres> WorkerEngine<Consumer, IO, Inbox, Metrics, Postgres>
+impl<Consumer, IO, Inbox, Postgres> WorkerEngine<Consumer, IO, Inbox, Postgres>
 where
     Consumer: ConsumerIO,
     IO: EngineIO<Consumer, Postgres>,
     Inbox: EngineInbox<Consumer>,
-    Metrics: MetricIO,
     Postgres: PostgresClient,
 {
     pub fn new(
@@ -107,11 +98,11 @@ where
         postgres_manager: Arc<Postgres>,
         engine_io: IO,
         inbox: Inbox,
-    ) -> WorkerEngine<Consumer, IO, Inbox, Metrics, Postgres> {
+    ) -> WorkerEngine<Consumer, IO, Inbox, Postgres> {
         let leases = FxHashMap::default();
         let root_cancellation_token = CancellationToken::new();
 
-        WorkerEngine::<Consumer, IO, Inbox, Metrics, Postgres> {
+        WorkerEngine::<Consumer, IO, Inbox, Postgres> {
             leases,
             lease_records: FxHashMap::default(),
             next_generation: 0,
@@ -121,7 +112,6 @@ where
             group_waiters: FxHashMap::default(),
             counters: EngineCounters::default(),
             engine_io,
-            metrics_io: PhantomData,
             inbox,
             consumer: PhantomData,
             root_cancellation_token,

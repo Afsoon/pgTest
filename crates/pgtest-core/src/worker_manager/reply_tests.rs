@@ -1,4 +1,7 @@
+use pgtest_utils::read_string::ReadString;
+
 use super::*;
+use crate::worker_engine::traits::ConsumerIO;
 
 #[tokio::test]
 async fn dropping_an_unread_attach_reply_detaches_the_registered_generation() {
@@ -8,6 +11,7 @@ async fn dropping_an_unread_attach_reply_detaches_the_registered_generation() {
         oneshot_channel: reply_tx,
         attachment: Some((LeaseId::from("test"), engine_tx)),
     };
+
     assert!(
         consumer
             .reply(ConsumerReply::Attached {

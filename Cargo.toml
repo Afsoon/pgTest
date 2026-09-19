@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/pgtest-core", "crates/pgtest-container", "crates/pgtest-server", "crates/pgtest-wire"]
+members = ["crates/pgtest-core", "crates/pgtest-server", "crates/pgtest-wire", "crates/pgtest-utils", "crates/pgtest-database-operations"]
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -14,4 +14,5 @@ anyhow = "1.0.104"
 thiserror = "2.0.20"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1.44"
+tracing-test = "0.2.6"
 testcontainers = { version = "0.28.0", features = ["blocking"] }

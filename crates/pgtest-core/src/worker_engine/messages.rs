@@ -1,15 +1,13 @@
 use std::time::Instant;
 
+use pgtest_utils::read_string::ReadString;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    utils::ReadString,
-    worker_engine::{
-        core::LeaseId,
-        database_jobs::DatabaseWorkerMessages,
-        errors::{AttachError, ReleaseError},
-        traits::ConsumerIO,
-    },
+use crate::worker_engine::{
+    core::LeaseId,
+    database_jobs::DatabaseWorkerMessages,
+    errors::{AttachError, ReleaseError},
+    traits::ConsumerIO,
 };
 
 #[cfg_attr(test, derive(Debug))]
@@ -46,5 +44,3 @@ pub enum ConsumerReply {
     AttachRejected(AttachError),
     ReleaseResult(Result<(), ReleaseError>),
 }
-
-pub enum EngineMetricMessage {}

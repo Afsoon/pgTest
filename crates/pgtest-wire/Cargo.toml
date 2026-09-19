@@ -31,7 +31,7 @@ tokio-postgres = "0.7.18"
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
-pgtest-container = { path = "../pgtest-container"}
+pgtest-database-operations = { path = "../pgtest-database-operations", features = ["test-support"]}
 
 [features]
 default = []

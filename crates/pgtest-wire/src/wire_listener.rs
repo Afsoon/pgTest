@@ -7,7 +7,7 @@ use pgtest::{
         core::{LeaseId, is_valid_lease_id},
         errors::AttachError,
     },
-    worker_manager::{LeaseSession, WorkerEngineManager},
+    worker_manager::{WorkerEngineManager, worker_io::LeaseSession},
 };
 use pgwire::{
     api::{
@@ -568,10 +568,8 @@ pub fn parse_connection_field(decode_raw_string: &str) -> Result<(&str, LeaseId)
 mod listener_test {
     use std::sync::Arc;
 
-    use pgtest::{
-        pg_container_config, worker_engine::core::WorkerEngineConfig,
-        worker_manager::WorkerEngineManager,
-    };
+    use pgtest::{worker_engine::core::WorkerEngineConfig, worker_manager::WorkerEngineManager};
+    use pgtest_database_operations::testcontainer::pg_container_config;
     use tracing_test::traced_test;
 
     use crate::wire_listener::WireListener;

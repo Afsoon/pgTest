@@ -3,223 +3,38 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hotpath::wrap::tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use hotpath::wrap::tokio::sync::mpsc::UnboundedSender;
+use pgtest_database_operations::manager::{
+    PostgresManager, config::PostgresConfig, errors::PostgresClientError,
+};
 use tokio::time::timeout_at;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    postgres_manager::{PostgresClientError, PostgresConfig, PostgresManager},
-    utils::ReadString,
     worker_engine::{
         core::{LeaseId, WorkerEngine, WorkerEngineConfig, is_valid_lease_id},
-        database_jobs::{CleanupDatabase, CreateDatabase},
-        errors::{AttachError, IOError, ReleaseError},
+        errors::{AttachError, ReleaseError},
         messages::{ConsumerReply, EngineMessage},
-        traits::{ConsumerIO, EngineIO, EngineInbox, MetricIO},
     },
     worker_manager::{
         database_cleanup_worker::DatabaseCleanupWorker,
         database_creation_worker::DatabaseCreationWorker,
+        worker_io::{
+            ConsumerWorker, DatabaseWorkerSenders, LeaseSession, ManagerReply, WorkerEngineIO,
+            WorkerEngineInbox,
+        },
     },
 };
 
 mod database_cleanup_worker;
 mod database_creation_worker;
+pub mod worker_io;
 
 #[cfg(test)]
 mod cleanup_tests;
 
 #[cfg(test)]
 mod reply_tests;
-
-enum ManagerReply {
-    Attached(LeaseSession),
-    Engine(ConsumerReply),
-}
-
-struct ConsumerWorker {
-    oneshot_channel: tokio::sync::oneshot::Sender<ManagerReply>,
-    attachment: Option<(LeaseId, UnboundedSender<EngineMessage<ConsumerWorker>>)>,
-}
-
-impl ConsumerWorker {
-    fn new(sender: tokio::sync::oneshot::Sender<ManagerReply>) -> Self {
-        Self { oneshot_channel: sender, attachment: None }
-    }
-}
-
-impl ConsumerIO for ConsumerWorker {
-    fn reply(self, msg: ConsumerReply) -> Result<(), ConsumerReply> {
-        if let (
-            Some((lease, engine_tx)),
-            ConsumerReply::Attached { database_name, generation, cancellation },
-        ) = (&self.attachment, &msg)
-        {
-            // Transfer the guard through the channel. Dropping an unread
-            // successful reply must unregister the connection just
-            // like dropping a live session.
-            let session = LeaseSession::new(
-                database_name.clone(),
-                lease.clone(),
-                *generation,
-                cancellation.clone(),
-                engine_tx.clone(),
-            );
-            self.oneshot_channel.send(ManagerReply::Attached(session)).map_err(|reply| {
-                if let ManagerReply::Attached(mut session) = reply {
-                    // The engine rolls back a failed delivery synchronously.
-                    session.detach_on_drop = false;
-                }
-                msg
-            })
-        } else {
-            self.oneshot_channel.send(ManagerReply::Engine(msg)).map_err(|reply| {
-                let ManagerReply::Engine(msg) = reply else { unreachable!() };
-                msg
-            })
-        }
-    }
-}
-
-struct DatabaseWorkerSenders {
-    creation_tx: UnboundedSender<CreateDatabase>,
-    cleanup_tx: UnboundedSender<CleanupDatabase>,
-}
-
-impl DatabaseWorkerSenders {
-    fn init_database_worker_channels()
-    -> (Self, UnboundedReceiver<CreateDatabase>, UnboundedReceiver<CleanupDatabase>) {
-        let (creation_tx, creation_rx) = hotpath::channel!(
-            tokio::sync::mpsc::unbounded_channel::<CreateDatabase>(),
-            label = "database-creation"
-        );
-
-        let (cleanup_tx, cleanup_rx) = hotpath::channel!(
-            tokio::sync::mpsc::unbounded_channel::<CleanupDatabase>(),
-            label = "database-cleanup"
-        );
-
-        (Self { creation_tx, cleanup_tx }, creation_rx, cleanup_rx)
-    }
-}
-
-struct WorkerEngineIO {
-    send_message: UnboundedSender<EngineMessage<ConsumerWorker>>,
-    tracker: TaskTracker,
-    shutdown_token: CancellationToken,
-    database_worker_senders: DatabaseWorkerSenders,
-}
-
-impl WorkerEngineIO {
-    fn new(
-        send_message: UnboundedSender<EngineMessage<ConsumerWorker>>,
-        tracker: TaskTracker,
-        shutdown_token: CancellationToken,
-        database_worker_senders: DatabaseWorkerSenders,
-    ) -> Self {
-        Self { send_message, tracker, shutdown_token, database_worker_senders }
-    }
-
-    /// Every background task races against the shutdown token: cancelling it
-    /// ends all in-flight work at its next await point, so shutdown never
-    /// waits out a long timer or a slow DDL.
-    fn spawn_cancellable<F, T>(&self, fut: F)
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let shutdown = self.shutdown_token.clone();
-        self.tracker.spawn(async move {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    tracing::debug!("background task cancelled by shutdown");
-                }
-                _ = fut => {}
-            }
-        });
-    }
-}
-
-impl EngineIO<ConsumerWorker, PostgresManager> for WorkerEngineIO {
-    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
-        let Err(error) = self.database_worker_senders.creation_tx.send(request) else {
-            return Ok(());
-        };
-
-        tracing::error!(%error, "unable to send a creation database request");
-        Err(IOError::FailedToSendTheMessage)
-    }
-
-    fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError> {
-        let Err(error) = self.database_worker_senders.cleanup_tx.send(request) else {
-            return Ok(());
-        };
-
-        tracing::error!(%error, "unable to send a creation database request");
-        Err(IOError::FailedToSendTheMessage)
-    }
-
-    fn send_delayed_message(
-        &self,
-        msg: EngineMessage<ConsumerWorker>,
-        wait_duration: u32,
-        cancel_token: CancellationToken,
-    ) -> Result<(), IOError> {
-        let timer_producer = self.send_message.clone();
-        self.spawn_cancellable(async move {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-
-                }
-                _ =  tokio::time::sleep_until(
-                    tokio::time::Instant::now() + Duration::from_millis(wait_duration as u64),
-                ) => match timer_producer.send(msg) {
-                    Ok(_) => {},
-                    Err(_) => {},
-                }
-
-            }
-        });
-
-        Ok(())
-    }
-
-    fn send_message(&self, msg: EngineMessage<ConsumerWorker>) -> Result<(), IOError> {
-        match self.send_message.send(msg) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(IOError::FailedToSendTheMessage),
-        }
-    }
-}
-
-struct WorkerEngineInbox {
-    receive_message: UnboundedReceiver<EngineMessage<ConsumerWorker>>,
-}
-
-impl WorkerEngineInbox {
-    fn new(receive_message: UnboundedReceiver<EngineMessage<ConsumerWorker>>) -> Self {
-        Self { receive_message }
-    }
-}
-
-impl EngineInbox<ConsumerWorker> for WorkerEngineInbox {
-    fn wait_for_message(
-        &mut self,
-    ) -> impl Future<Output = Option<EngineMessage<ConsumerWorker>>> + Send {
-        self.receive_message.recv()
-    }
-}
-
-pub struct Metrics {}
-
-impl MetricIO for Metrics {
-    fn send_metric(
-        &self,
-        _metric_message: crate::worker_engine::messages::EngineMetricMessage,
-    ) -> impl Future<Output = Result<(), crate::worker_engine::errors::MetricIOError>> + Send {
-        std::future::ready(Ok(()))
-    }
-}
 
 pub struct WorkerEngineManager {
     worker_inbox_tx: UnboundedSender<EngineMessage<ConsumerWorker>>,
@@ -231,43 +46,7 @@ pub struct WorkerEngineManager {
 }
 
 type WorkerEngineType =
-    WorkerEngine<ConsumerWorker, WorkerEngineIO, WorkerEngineInbox, Metrics, PostgresManager>;
-
-pub struct LeaseSession {
-    pub database_name: ReadString,
-    pub lease_id: LeaseId,
-    generation: u64,
-    cancellation: CancellationToken,
-    detach_on_drop: bool,
-    engine_tx: UnboundedSender<EngineMessage<ConsumerWorker>>,
-}
-
-impl LeaseSession {
-    fn new(
-        database_name: ReadString,
-        lease_id: LeaseId,
-        generation: u64,
-        cancellation: CancellationToken,
-        engine_tx: UnboundedSender<EngineMessage<ConsumerWorker>>,
-    ) -> Self {
-        Self { database_name, lease_id, generation, cancellation, detach_on_drop: true, engine_tx }
-    }
-
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation.clone()
-    }
-}
-
-impl Drop for LeaseSession {
-    fn drop(&mut self) {
-        if self.detach_on_drop {
-            let _ = self.engine_tx.send(EngineMessage::Detach {
-                lease: self.lease_id.clone(),
-                generation: self.generation,
-            });
-        }
-    }
-}
+    WorkerEngine<ConsumerWorker, WorkerEngineIO, WorkerEngineInbox, PostgresManager>;
 
 impl WorkerEngineManager {
     #[hotpath::measure]
@@ -528,14 +307,18 @@ impl WorkerEngineManager {
 mod worker_engine_manager_test {
     use std::{future::poll_fn, pin::Pin, task::Poll, time::Duration};
 
+    use hotpath::wrap::tokio::sync::mpsc::UnboundedReceiver;
+    use pgtest_database_operations::{
+        manager::config::PostgresConfig, testcontainer::pg_container_config,
+    };
+    use pgtest_utils::read_string::ReadString;
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        postgres_manager::pg_container_config,
-        utils::ReadString,
         worker_engine::{
             core::WorkerEngineConfig,
+            database_jobs::{CleanupDatabase, CreateDatabase},
             messages::EngineMessage,
             traits::{EngineIO, PostgresClient},
         },
@@ -555,10 +338,8 @@ mod worker_engine_manager_test {
     fn startup_future_fits_stack_budget() {
         // Nested profiling wrappers used to inflate this to over 600 KiB,
         // overflowing the main thread's stack when startup was first polled.
-        let startup = WorkerEngineManager::start(
-            crate::postgres_manager::PostgresConfig::default(),
-            WorkerEngineConfig::default(),
-        );
+        let startup =
+            WorkerEngineManager::start(PostgresConfig::default(), WorkerEngineConfig::default());
         let size = std::mem::size_of_val(&startup);
         assert!(size < 64 * 1024, "startup future uses {size} bytes");
     }
@@ -573,8 +354,8 @@ mod worker_engine_manager_test {
     // results so timeout and cancellation tests do not depend on database
     // creation speed.
     struct DeferredWorkers {
-        creation_rx: super::UnboundedReceiver<super::CreateDatabase>,
-        _cleanup_rx: super::UnboundedReceiver<super::CleanupDatabase>,
+        creation_rx: UnboundedReceiver<CreateDatabase>,
+        _cleanup_rx: UnboundedReceiver<CleanupDatabase>,
     }
 
     impl DeferredWorkers {
@@ -607,9 +388,11 @@ mod worker_engine_manager_test {
             ..WorkerEngineConfig::default()
         };
         let pg_client = std::sync::Arc::new(
-            crate::postgres_manager::PostgresManager::start(pg_container_config().await)
-                .await
-                .expect("PostgreSQL must start"),
+            pgtest_database_operations::manager::PostgresManager::start(
+                pg_container_config().await,
+            )
+            .await
+            .expect("PostgreSQL must start"),
         );
         let (engine_tx, engine_rx) = hotpath::channel!(tokio::sync::mpsc::unbounded_channel());
         let tracker = tokio_util::task::TaskTracker::new();
@@ -686,7 +469,9 @@ mod worker_engine_manager_test {
         let mut assigned_config = pg_container_config().await;
         assigned_config.pgtest_pg_database = assigned_database;
         assert!(
-            crate::postgres_manager::PostgresManager::start(assigned_config).await.is_ok(),
+            pgtest_database_operations::manager::PostgresManager::start(assigned_config)
+                .await
+                .is_ok(),
             "the database must still exist after its last session closes"
         );
     }

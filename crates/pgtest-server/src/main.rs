@@ -7,10 +7,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use envconfig::Envconfig;
-use pgtest::{
-    postgres_manager::PostgresConfig, worker_engine::core::WorkerEngineConfig,
-    worker_manager::WorkerEngineManager,
-};
+use pgtest::{worker_engine::core::WorkerEngineConfig, worker_manager::WorkerEngineManager};
+use pgtest_database_operations::manager::config::PostgresConfig;
 use pgtest_pg_wire::wire_listener::WireListener;
 use tracing_subscriber::{EnvFilter, prelude::*};
 

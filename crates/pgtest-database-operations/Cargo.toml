@@ -1,11 +1,7 @@
 [package]
-name = "pgtest-core"
+name = "pgtest-database-operations"
 version = "0.1.0"
 edition = "2024"
-
-[lib]
-name = "pgtest"
-
 
 [lints]
 workspace = true
@@ -24,13 +20,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 testcontainers = { workspace = true, optional = true }
 pgtest-utils = { path = "../pgtest-utils"}
-pgtest-database-operations = { path = "../pgtest-database-operations"}
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tracing-test = { workspace = true }
+tracing-test = "0.2.6"
 testcontainers = { workspace = true }
-pgtest-database-operations = { path = "../pgtest-database-operations", features = ["test-support"]}
 
 [features]
 default = []

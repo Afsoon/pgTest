@@ -4,8 +4,13 @@
 use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
 
 use testcontainers::{
-    Container, CopyDataSource, CopyToContainer, Image, ImageExt, core::WaitFor, runners::SyncRunner,
+    Container, CopyDataSource, CopyToContainer, Image, ImageExt,
+    core::{ContainerPort, WaitFor},
+    runners::SyncRunner,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::manager::config::PostgresConfig;
 
 const NAME: &str = "postgres";
 const TAG: &str = "18-alpine";
@@ -173,4 +178,32 @@ impl Image for Postgres {
     fn expose_ports(&self) -> &[testcontainers::core::ContainerPort] {
         &[testcontainers::core::ContainerPort::Tcp(5432)]
     }
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            pgtest_pg_database: String::from("pgtest"),
+            pgtest_pg_port: 5432,
+            pgtest_pg_user: String::from("postgres"),
+            pgtest_pg_host: String::from("localhost"),
+            pgtest_pg_cretion_pool_connection: 5,
+            pgtest_pg_cleanup_pool_connection: 2,
+        }
+    }
+}
+
+impl<'a> From<&'a Container<Postgres>> for PostgresConfig {
+    fn from(value: &'a Container<Postgres>) -> Self {
+        Self {
+            pgtest_pg_host: value.get_host().unwrap().to_string(),
+            pgtest_pg_port: value.get_host_port_ipv4(ContainerPort::Tcp(5432)).unwrap(),
+            ..PostgresConfig::default()
+        }
+    }
+}
+
+// https://github.com/tokio-rs/tokio/discussions/3857
+pub async fn pg_container_config() -> PostgresConfig {
+    tokio::task::spawn_blocking(|| PostgresConfig::from(&*POSTGRES_CONTAINER)).await.unwrap()
 }

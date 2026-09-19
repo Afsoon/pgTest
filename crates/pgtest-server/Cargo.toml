@@ -16,6 +16,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 pgtest-core = { path = "../pgtest-core"}
 pgtest-wire = { path = "../pgtest-wire"}
+pgtest-database-operations = { path = "../pgtest-database-operations"}
 
 [features]
 default = []

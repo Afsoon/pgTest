@@ -1,23 +1,14 @@
+use pgtest_utils::read_string::ReadString;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    utils::ReadString,
-    worker_engine::{
-        database_jobs::{CleanupDatabase, CreateDatabase},
-        errors::{IOError, MetricIOError, PostgresDDLClientError},
-        messages::{ConsumerReply, EngineMessage, EngineMetricMessage},
-    },
+use crate::worker_engine::{
+    database_jobs::{CleanupDatabase, CreateDatabase},
+    errors::{IOError, PostgresDDLClientError},
+    messages::{ConsumerReply, EngineMessage},
 };
 
 pub trait ConsumerIO: Send + 'static {
     fn reply(self, msg: ConsumerReply) -> Result<(), ConsumerReply>;
-}
-
-pub trait MetricIO {
-    fn send_metric(
-        &self,
-        metric_message: EngineMetricMessage,
-    ) -> impl Future<Output = Result<(), MetricIOError>> + Send;
 }
 
 pub trait EngineIO<C: ConsumerIO, P: PostgresClient> {

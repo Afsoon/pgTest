@@ -39,12 +39,6 @@ pub enum IOError {
 }
 
 #[derive(Error, Debug)]
-pub enum MetricIOError {
-    #[error("failed to deliver the metric message to the worker")]
-    FailedToSendMetricMessage,
-}
-
-#[derive(Error, Debug)]
 pub enum ConsumerIOError {
     #[error("failed to reply to the consumer; its reply channel is gone")]
     FailedToReplyTheConsumer,

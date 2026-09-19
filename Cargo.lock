@@ -1930,20 +1930,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgtest-container"
-version = "0.1.0"
-dependencies = [
- "testcontainers",
-]
-
-[[package]]
 name = "pgtest-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "envconfig",
  "hotpath",
- "pgtest-container",
+ "pgtest-database-operations",
+ "pgtest-utils",
+ "rand 0.10.2",
+ "rustc-hash",
+ "sqlx",
+ "testcontainers",
+ "thiserror",
+ "tokio",
+ "tokio-retry2",
+ "tokio-util",
+ "tracing",
+ "tracing-test",
+]
+
+[[package]]
+name = "pgtest-database-operations"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "envconfig",
+ "hotpath",
+ "pgtest-utils",
  "rand 0.10.2",
  "rustc-hash",
  "sqlx",
@@ -1965,11 +1979,16 @@ dependencies = [
  "hotpath",
  "mimalloc",
  "pgtest-core",
+ "pgtest-database-operations",
  "pgtest-wire",
  "tokio",
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "pgtest-utils"
+version = "0.1.0"
 
 [[package]]
 name = "pgtest-wire"
@@ -1983,8 +2002,8 @@ dependencies = [
  "iri-string",
  "pest",
  "pest_derive",
- "pgtest-container",
  "pgtest-core",
+ "pgtest-database-operations",
  "pgwire",
  "testcontainers",
  "thiserror",
