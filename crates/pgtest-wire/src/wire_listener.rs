@@ -232,7 +232,7 @@ mod listener_test {
         config.dbname("pgtest");
         let (control, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
         let control_task = tokio::spawn(connection);
-        assert_eq!(control.query_one("SELECT 1", &[]).await.unwrap().get::<_, i32>(0), 1);
+        assert_control_queries(&control).await;
         drop(control);
         control_task.await.unwrap().unwrap();
 
@@ -257,5 +257,62 @@ mod listener_test {
 
         drop(client);
         let _ = conn_handle.await;
+    }
+
+    async fn assert_control_queries(control: &tokio_postgres::Client) {
+        // The simple protocol uses text rows; extended queries use binary rows.
+        for (query, column, value) in [
+            ("SELECT 1", "?column?", "1"),
+            ("SELECT pgtest_release('simple-release')", "pgtest_release", "t"),
+        ] {
+            let messages = control.simple_query(query).await.unwrap();
+            let row = messages
+                .iter()
+                .find_map(|message| match message {
+                    tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+                    _ => None,
+                })
+                .expect("query must return a data row");
+            assert_eq!(row.columns()[0].name(), column);
+            assert_eq!(row.get(0), Some(value));
+        }
+        let ping = control.query_one("SELECT 1", &[]).await.unwrap();
+        assert_eq!(ping.columns()[0].name(), "?column?");
+        assert_eq!(ping.get::<_, i32>(0), 1);
+        for query in
+            ["SELECT pgtest_release('extended-release')", "SELECT pgtest_release($1::text)"]
+        {
+            let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+                if query.contains('$') { &[&"parameter-release"] } else { &[] };
+            let row = control.query_one(query, parameters).await.unwrap();
+            assert_eq!(row.columns()[0].name(), "pgtest_release");
+            assert!(row.get::<_, bool>(0));
+        }
+
+        for (query, code) in [
+            ("SELECT pgtest_release($1)", "42P02"),
+            ("SELECT pgtest_release('a/b')", "22023"),
+            ("SELECT 2", "0A000"),
+        ] {
+            let error = control.simple_query(query).await.unwrap_err();
+            assert_eq!(error.as_db_error().unwrap().code().code(), code);
+        }
+        use tokio_postgres::types::Type;
+        for (query, types, code) in [
+            ("SELECT 1", vec![Type::TEXT], "42804"),
+            ("SELECT pgtest_release('literal')", vec![Type::TEXT], "42804"),
+            ("SELECT pgtest_release($1)", vec![Type::INT4], "42804"),
+            ("SELECT pgtest_release($1)", vec![Type::TEXT, Type::TEXT], "0A000"),
+        ] {
+            let error = control.prepare_typed(query, &types).await.unwrap_err();
+            assert_eq!(error.as_db_error().unwrap().code().code(), code);
+        }
+        for (value, code) in [(None, "22004"), (Some("a/b"), "22023")] {
+            let error =
+                control.query_one("SELECT pgtest_release($1::text)", &[&value]).await.unwrap_err();
+            assert_eq!(error.as_db_error().unwrap().code().code(), code);
+        }
+        // A Sync after Parse/Bind errors must leave the connection usable.
+        assert_eq!(control.query_one("SELECT 1", &[]).await.unwrap().get::<_, i32>(0), 1);
     }
 }
