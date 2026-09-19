@@ -9,7 +9,7 @@ async fn dropping_an_unread_attach_reply_detaches_the_registered_generation() {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let consumer = ConsumerWorker {
         oneshot_channel: reply_tx,
-        attachment: Some((LeaseId::from("test"), engine_tx)),
+        attachment: Some((LeaseId::new("test").unwrap(), engine_tx)),
     };
 
     assert!(
@@ -33,7 +33,7 @@ async fn failed_attach_delivery_leaves_rollback_to_the_engine() {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let consumer = ConsumerWorker {
         oneshot_channel: reply_tx,
-        attachment: Some((LeaseId::from("test"), engine_tx)),
+        attachment: Some((LeaseId::new("test").unwrap(), engine_tx)),
     };
     drop(reply_rx);
     assert!(

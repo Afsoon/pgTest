@@ -2,6 +2,7 @@ pub mod core;
 pub mod database_inventory;
 pub mod database_jobs;
 pub mod errors;
+mod lease_id;
 pub mod messages;
 pub mod traits;
 
@@ -28,7 +29,7 @@ mod worker_engine_test {
 
     fn attach(lease: &str, reply: &ConsumerWorker) -> EngineMessage<ConsumerWorker> {
         EngineMessage::AttachOrJoin {
-            lease: LeaseId::from(lease),
+            lease: LeaseId::new(lease).unwrap(),
             reply: reply.clone(),
             message_time: Instant::now(),
         }
@@ -96,7 +97,7 @@ mod worker_engine_test {
         let outcome = EngineSimulator::run(vec![
             attach("shared", &consumer),
             attach("shared", &consumer),
-            EngineMessage::Detach { lease: LeaseId::from("shared"), generation: 1 },
+            EngineMessage::Detach { lease: LeaseId::new("shared").unwrap(), generation: 1 },
         ])
         .await
         .unwrap();
@@ -112,8 +113,8 @@ mod worker_engine_test {
         let consumer = consumer();
         let outcome = EngineSimulator::run(vec![
             attach("first", &consumer),
-            EngineMessage::Detach { lease: LeaseId::from("first"), generation: 1 },
-            EngineMessage::Detach { lease: LeaseId::from("first"), generation: 1 },
+            EngineMessage::Detach { lease: LeaseId::new("first").unwrap(), generation: 1 },
+            EngineMessage::Detach { lease: LeaseId::new("first").unwrap(), generation: 1 },
         ])
         .await
         .unwrap();
@@ -127,7 +128,7 @@ mod worker_engine_test {
     #[tokio::test]
     async fn detach_unknown_lease_is_ignored() {
         let outcome = EngineSimulator::run(vec![EngineMessage::Detach {
-            lease: LeaseId::from("ghost"),
+            lease: LeaseId::new("ghost").unwrap(),
             generation: 1,
         }])
         .await
@@ -157,7 +158,7 @@ mod worker_engine_test {
         let mut messages = occupy_initial(&consumer);
         messages.extend([
             EngineMessage::AttachOrJoin {
-                lease: LeaseId::from("expired"),
+                lease: LeaseId::new("expired").unwrap(),
                 reply: consumer.clone(),
                 message_time: past_instant(),
             },
@@ -176,7 +177,7 @@ mod worker_engine_test {
         let consumer = consumer();
         let mut messages = occupy_initial(&consumer);
         messages.extend(["expired_a", "expired_b"].map(|lease| EngineMessage::AttachOrJoin {
-            lease: LeaseId::from(lease),
+            lease: LeaseId::new(lease).unwrap(),
             reply: consumer.clone(),
             message_time: past_instant(),
         }));
@@ -194,7 +195,10 @@ mod worker_engine_test {
         let consumer = consumer();
         let outcome = EngineSimulator::run(vec![
             attach("test", &consumer),
-            EngineMessage::LeaseMaxTimeReached { lease: LeaseId::from("test"), generation: 1 },
+            EngineMessage::LeaseMaxTimeReached {
+                lease: LeaseId::new("test").unwrap(),
+                generation: 1,
+            },
             attach("test", &consumer),
         ])
         .await
@@ -232,7 +236,7 @@ mod worker_engine_test {
             attach("first", &consumer),
             EngineMessage::Shutdown,
             attach("second", &consumer),
-            EngineMessage::Detach { lease: LeaseId::from("first"), generation: 1 },
+            EngineMessage::Detach { lease: LeaseId::new("first").unwrap(), generation: 1 },
         ])
         .await
         .unwrap();

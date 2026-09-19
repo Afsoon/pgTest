@@ -80,7 +80,10 @@ impl Fixture {
     }
 
     fn release(&self, lease: &str) -> EngineMessage<ConsumerWorker> {
-        EngineMessage::ReleaseLease { lease: LeaseId::from(lease), reply: self.consumer.clone() }
+        EngineMessage::ReleaseLease {
+            lease: LeaseId::new(lease).unwrap(),
+            reply: self.consumer.clone(),
+        }
     }
 
     async fn new(config: WorkerEngineConfig) -> Self {
@@ -94,7 +97,7 @@ impl Fixture {
 
     fn attach(&self, lease: &str) -> EngineMessage<ConsumerWorker> {
         EngineMessage::AttachOrJoin {
-            lease: LeaseId::from(lease),
+            lease: LeaseId::new(lease).unwrap(),
             reply: self.consumer.clone(),
             message_time: Instant::now(),
         }
@@ -321,7 +324,7 @@ async fn lost_release_reply_does_not_undo_closure_or_cleanup() {
     assert!(!old.cancellation.is_cancelled());
     fixture
         .process(vec![EngineMessage::ReleaseLease {
-            lease: LeaseId::from("test"),
+            lease: LeaseId::new("test").unwrap(),
             reply: ConsumerWorker::failing(Arc::default()),
         }])
         .await;
@@ -355,7 +358,7 @@ async fn old_generation_events_and_cleanup_cannot_retire_a_reused_lease_id() {
     let old = fixture.engine.leases["test"].clone();
     fixture
         .process(vec![EngineMessage::LeaseMaxTimeReached {
-            lease: LeaseId::from("test"),
+            lease: LeaseId::new("test").unwrap(),
             generation: old.generation,
         }])
         .await;
@@ -371,9 +374,12 @@ async fn old_generation_events_and_cleanup_cannot_retire_a_reused_lease_id() {
 
     fixture
         .process(vec![
-            EngineMessage::Detach { lease: LeaseId::from("test"), generation: old.generation },
+            EngineMessage::Detach {
+                lease: LeaseId::new("test").unwrap(),
+                generation: old.generation,
+            },
             EngineMessage::LeaseMaxTimeReached {
-                lease: LeaseId::from("test"),
+                lease: LeaseId::new("test").unwrap(),
                 generation: old.generation,
             },
         ])
@@ -396,11 +402,11 @@ async fn duplicate_expiry_schedules_cleanup_only_once() {
     fixture
         .process(vec![
             EngineMessage::LeaseMaxTimeReached {
-                lease: LeaseId::from("test"),
+                lease: LeaseId::new("test").unwrap(),
                 generation: old.generation,
             },
             EngineMessage::LeaseMaxTimeReached {
-                lease: LeaseId::from("test"),
+                lease: LeaseId::new("test").unwrap(),
                 generation: old.generation,
             },
         ])
@@ -420,7 +426,7 @@ async fn last_disconnect_keeps_the_database_for_reconnect() {
         ..WorkerEngineConfig::default()
     })
     .await;
-    let lease = LeaseId::from("reconnecting");
+    let lease = LeaseId::new("reconnecting").unwrap();
     fixture.process(vec![fixture.attach(&lease)]).await;
     let original = fixture.engine.leases[&lease].clone();
     let creates = fixture.creation_ids();
@@ -532,7 +538,7 @@ async fn one_creation_serves_only_one_distinct_waiting_lease() {
     assert!(!fixture.engine.leases.contains_key("second"));
     assert_eq!(
         fixture.engine.waiters.iter().cloned().collect::<Vec<_>>(),
-        vec![LeaseId::from("second")]
+        vec![LeaseId::new("second").unwrap()]
     );
     assert_eq!(fixture.consumer.messages().len(), 1);
     fixture.finish_creation(ids[1], Ok(ReadString::from("second_database"))).await;
@@ -612,7 +618,7 @@ async fn retiring_databases_do_not_count_as_supply_for_waiters() {
     fixture
         .process(vec![
             EngineMessage::LeaseMaxTimeReached {
-                lease: LeaseId::from("holder"),
+                lease: LeaseId::new("holder").unwrap(),
                 generation: old.generation,
             },
             fixture.attach("waiting"),
@@ -639,12 +645,12 @@ async fn expired_and_undeliverable_groups_do_not_block_live_groups() {
         .process(vec![
             fixture.attach("holder"),
             EngineMessage::AttachOrJoin {
-                lease: LeaseId::from("expired"),
+                lease: LeaseId::new("expired").unwrap(),
                 reply: fixture.consumer.clone(),
                 message_time: past_instant(),
             },
             EngineMessage::AttachOrJoin {
-                lease: LeaseId::from("gone"),
+                lease: LeaseId::new("gone").unwrap(),
                 reply: ConsumerWorker::failing(Arc::default()),
                 message_time: Instant::now(),
             },
@@ -673,7 +679,7 @@ async fn expired_groups_do_not_inflate_growth_demand() {
     fixture
         .process(vec![
             EngineMessage::AttachOrJoin {
-                lease: LeaseId::from("expired"),
+                lease: LeaseId::new("expired").unwrap(),
                 reply: fixture.consumer.clone(),
                 message_time: past_instant(),
             },

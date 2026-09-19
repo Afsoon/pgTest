@@ -29,11 +29,7 @@ pub struct WorkerEngineConfig {
     pub max_lease_records: usize,
 }
 
-pub type LeaseId = ReadString;
-
-pub fn is_valid_lease_id(lease: &str) -> bool {
-    !lease.is_empty() && lease.len() <= 256 && !lease.contains(['/', '\0'])
-}
+pub use super::lease_id::LeaseId;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LeaseStatus {
@@ -252,9 +248,6 @@ where
     }
 
     fn admit_lease(&mut self, lease: &LeaseId) -> Result<LeaseStatus, ReleaseError> {
-        if !is_valid_lease_id(lease) {
-            return Err(ReleaseError::InvalidLeaseId);
-        }
         if let Some(status) = self.lease_records.get(lease) {
             return Ok(*status);
         }

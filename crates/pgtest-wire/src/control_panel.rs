@@ -5,10 +5,7 @@ use futures::{Sink, SinkExt, StreamExt, stream};
 use pest::Parser;
 use pest_derive::Parser;
 use pgtest::{
-    worker_engine::{
-        core::{LeaseId, is_valid_lease_id},
-        errors::ReleaseError,
-    },
+    worker_engine::{core::LeaseId, errors::ReleaseError},
     worker_manager::WorkerEngineManager,
 };
 use pgwire::{
@@ -37,8 +34,8 @@ impl PgTestControlPanel {
         Self { manager }
     }
 
-    async fn release(&self, lease: &str, format: FieldFormat) -> PgWireResult<Response> {
-        self.manager.release(LeaseId::from(lease)).await.map_err(Self::release_error)?;
+    async fn release(&self, lease: LeaseId, format: FieldFormat) -> PgWireResult<Response> {
+        self.manager.release(lease).await.map_err(Self::release_error)?;
         let schema =
             Arc::new(vec![FieldInfo::new("pgtest_release".into(), None, None, Type::BOOL, format)]);
         let mut encoder = DataRowEncoder::new(schema.clone());
@@ -62,10 +59,14 @@ impl PgTestControlPanel {
         )))
     }
 
+    fn parse_lease_id(lease: String) -> PgWireResult<LeaseId> {
+        LeaseId::new(lease).map_err(|_| Self::release_error(ReleaseError::InvalidLeaseId))
+    }
+
     fn resolve_lease_id(
         lease_argument: &LeaseArgument,
         portal: &Portal<PgTestQueryTypeControlStatement>,
-    ) -> PgWireResult<String> {
+    ) -> PgWireResult<LeaseId> {
         let lease = match lease_argument {
             LeaseArgument::Literal(literal) => literal.clone(),
             LeaseArgument::Parameter { index } => {
@@ -81,10 +82,7 @@ impl PgTestControlPanel {
                 parameter
             }
         };
-        if !is_valid_lease_id(&lease) {
-            return Err(Self::release_error(ReleaseError::InvalidLeaseId));
-        }
-        Ok(lease)
+        Self::parse_lease_id(lease)
     }
 }
 
@@ -181,7 +179,8 @@ impl SimpleQueryHandler for PgTestControlPanel {
                 Ok(vec![Response::Query(QueryResponse::new(ping_schema, data_row_stream))])
             }
             Ok(PgTestQueryTypeControlStatement::Release(LeaseArgument::Literal(lease_id))) => {
-                Ok(vec![self.release(&lease_id, FieldFormat::Text).await?])
+                let lease_id = Self::parse_lease_id(lease_id)?;
+                Ok(vec![self.release(lease_id, FieldFormat::Text).await?])
             }
             Ok(PgTestQueryTypeControlStatement::Release(LeaseArgument::Parameter { .. })) => {
                 let error_info = ErrorInfo::new(
@@ -258,7 +257,7 @@ impl ExtendedQueryHandler for PgTestControlPanel {
             }
             PgTestQueryTypeControlStatement::Release(lease_argument) => {
                 let lease_id = Self::resolve_lease_id(lease_argument, portal)?;
-                self.release(&lease_id, portal.result_column_format.format_for(0)).await
+                self.release(lease_id, portal.result_column_format.format_for(0)).await
             }
         }
     }
@@ -535,9 +534,57 @@ impl QueryParser for PgTestControlPanel {
 
 #[cfg(test)]
 mod pgtest_control_panel_test {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use pgwire::{
+        api::{Type, portal::Portal, stmt::StoredStatement},
+        error::PgWireError,
+        messages::extendedquery::Bind,
+    };
+
     use crate::control_panel::{
         LeaseArgument, PgTestControlPanel, PgTestQueryTypeControlStatement,
     };
+
+    #[test]
+    fn release_lease_validation_preserves_protocol_errors() {
+        for value in ["".to_owned(), "a/b".to_owned(), "a\0b".to_owned(), "a".repeat(257)] {
+            let error = PgTestControlPanel::parse_lease_id(value).unwrap_err();
+            assert!(matches!(error, PgWireError::UserError(info) if info.code == "22023"));
+        }
+        let value = " Mixed Case 雪 ";
+        assert_eq!(PgTestControlPanel::parse_lease_id(value.to_owned()).unwrap().as_ref(), value);
+    }
+
+    #[test]
+    fn release_parameters_validate_ids_and_preserve_null_error() {
+        let argument = LeaseArgument::Parameter { index: 0 };
+        let statement = Arc::new(StoredStatement::new(
+            "release".to_owned(),
+            PgTestQueryTypeControlStatement::Release(argument.clone()),
+            vec![Some(Type::TEXT)],
+        ));
+        for format in [0, 1] {
+            for (value, error_code) in [
+                (None, Some("22004")),
+                (Some("a/b"), Some("22023")),
+                (Some(" Mixed Case 雪 "), None),
+            ] {
+                let bind =
+                    Bind::new(None, None, vec![format], vec![value.map(Bytes::from)], vec![]);
+                let portal = Portal::try_new(&bind, statement.clone()).unwrap();
+                let result = PgTestControlPanel::resolve_lease_id(&argument, &portal);
+                if let Some(code) = error_code {
+                    assert!(
+                        matches!(result, Err(PgWireError::UserError(info)) if info.code == code)
+                    );
+                } else {
+                    assert_eq!(result.unwrap().as_ref(), value.unwrap());
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_valid_ping_queries() {

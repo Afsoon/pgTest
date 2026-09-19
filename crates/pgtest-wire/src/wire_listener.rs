@@ -3,10 +3,7 @@ use std::{collections::BTreeMap, fmt::Debug, net::SocketAddr, sync::Arc, time::D
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use pgtest::{
-    worker_engine::{
-        core::{LeaseId, is_valid_lease_id},
-        errors::AttachError,
-    },
+    worker_engine::{core::LeaseId, errors::AttachError},
     worker_manager::{WorkerEngineManager, worker_io::LeaseSession},
 };
 use pgwire::{
@@ -558,10 +555,10 @@ pub fn parse_connection_field(decode_raw_string: &str) -> Result<(&str, LeaseId)
     let database_name = parts.next().unwrap();
     let Some(lease_id) = parts.next() else { return Err(()) };
 
-    if database_name.is_empty() || parts.next().is_some() || !is_valid_lease_id(lease_id) {
+    if database_name.is_empty() || parts.next().is_some() {
         return Err(());
     }
-    Ok((database_name, LeaseId::from(lease_id)))
+    Ok((database_name, LeaseId::new(lease_id).map_err(|_| ())?))
 }
 
 #[cfg(test)]
@@ -573,6 +570,20 @@ mod listener_test {
     use tracing_test::traced_test;
 
     use crate::wire_listener::WireListener;
+
+    #[test]
+    fn connection_field_validates_lease_ids() {
+        for input in ["", "template", "/lease", "template/", "template/a/b", "template/a\0b"] {
+            assert!(super::parse_connection_field(input).is_err(), "{input:?}");
+        }
+        assert!(super::parse_connection_field(&format!("template/{}", "a".repeat(257))).is_err());
+        for value in [" Mixed Case 雪 ".to_owned(), "é".repeat(128)] {
+            let input = format!("template/{value}");
+            let (database, lease) = super::parse_connection_field(&input).unwrap();
+            assert_eq!(database, "template");
+            assert_eq!(lease.as_ref(), value);
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

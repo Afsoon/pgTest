@@ -1,5 +1,9 @@
 use thiserror::Error;
 
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("lease ID must contain 1 to 256 UTF-8 bytes and cannot contain '/' or NUL")]
+pub struct InvalidLeaseId;
+
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseError {
     #[error("lease ID must contain 1 to 256 UTF-8 bytes and cannot contain '/' or NUL")]
