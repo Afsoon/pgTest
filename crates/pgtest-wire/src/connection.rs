@@ -1,5 +1,3 @@
-//! Client startup negotiation, routing, and lease attachment.
-
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::{SinkExt, StreamExt};
@@ -40,7 +38,8 @@ impl ClientStream {
             #[cfg(unix)]
             Self::Unix(stream) => {
                 use pgwire::api::{ClientInfo, DefaultClient, PgWireConnectionState};
-                // pgwire uses this placeholder address for local Unix peers.
+                // Pgwire needs an IP, even when the connection is made through
+                // unix sockets.
                 let client = DefaultClient::new(SocketAddr::from(([127, 0, 0, 1], 0)), false);
                 let mut framed =
                     Framed::new(MaybeTls::Unix(stream), PgWireMessageServerCodec::new(client));
@@ -129,6 +128,7 @@ pub(crate) async fn handle_connection(stream: ClientStream, manager: Arc<WorkerE
         result = PostgresUpstream::connect(
             &lease_session.database_name,
             params,
+            &manager.pg_client.host,
             manager.pg_client.port,
         ) => match result {
             Ok(session) => session,

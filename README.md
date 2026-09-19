@@ -57,6 +57,14 @@ Use the usual PostgreSQL configuration (`PGTEST_PG_HOST`, `PGTEST_PG_PORT`,
 report. The default report automatically includes each instrumented section with
 data; no report configuration is needed.
 
+`PGTEST_PG_HOST` and `PGTEST_PG_PORT` select the upstream endpoint for both the
+database pools and leased sessions. The defaults are `127.0.0.1` and `5432`.
+Set `PGTEST_PG_HOST=postgres` to use a Docker service hostname, or, on Unix,
+`PGTEST_PG_HOST=/var/run/postgresql` to use a socket directory. The socket path is
+`<directory>/.s.PGSQL.<PGTEST_PG_PORT>`; provide the directory, not the socket file.
+The socket must be accessible to the pgtest process. Unix upstream endpoints are
+unsupported on non-Unix platforms; no TCP fallback is attempted.
+
 Initial coverage includes database operations and SQLx queries, worker startup
 and lease transitions, connection handling and parsing, relay socket I/O, the
 worker inbox and lease reply channels, and Tokio runtime metrics. Socket byte
@@ -70,7 +78,8 @@ errors retain the same retry handling as query errors. Set `HOTPATH_LIMIT=0` to
 show all measured functions, including these acquisition timings.
 
 `PostgresUpstream::connect` includes three separately measured stages:
-`connect_tcp` opens the TCP connection and sets TCP_NODELAY; `authenticate` sends
+`connect_stream` opens the configured transport (`connect_tcp` also measures TCP
+connection setup and sets TCP_NODELAY); `authenticate` sends
 Startup and waits for AuthenticationOk; `wait_for_ready_for_query` consumes the
 remaining startup messages through ReadyForQuery (or ErrorResponse). Bytes already
 read during authentication remain buffered for the final stage. Use
@@ -151,10 +160,10 @@ await controlPool.query("SELECT pgtest_release($1::text)", [leaseId]);
 
 See node-postgres's [Unix socket configuration](https://node-postgres.com/features/connecting#unix-domain-sockets).
 Unix connections use plaintext PostgreSQL startup; configure clients with SSL
-disabled. They replace the test-to-proxy TCP hop. The proxy still opens its
-upstream PostgreSQL connection over TCP and performs the existing startup exchange.
-The reported `PostgresUpstream::connect_tcp` timing measures that upstream hop,
-not the frontend handshake eliminated here.
+disabled. They replace the test-to-proxy TCP hop. The upstream transport is chosen
+independently through `PGTEST_PG_HOST`; it can use TCP or a Unix socket and performs
+the existing startup exchange. The reported `PostgresUpstream::connect_stream`
+timing measures that upstream hop, not the frontend handshake eliminated here.
 
 The server removes its socket on Ctrl-C. Binding fails if the path already exists;
 it never removes an existing socket or regular file to make room. After abnormal

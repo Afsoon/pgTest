@@ -102,16 +102,61 @@ mod listener_test {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_application_and_control_connections_share_lease_state() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), unix_lease_flow(false))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_upstream_supports_database_pools_and_leased_sessions() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), unix_lease_flow(true))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn unix_lease_flow(use_unix_upstream: bool) {
         struct Directory(std::path::PathBuf);
         impl Drop for Directory {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let path = std::env::temp_dir().join(format!("pgi-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("pgi-{}-{use_unix_upstream}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         let directory = Directory(path);
-        let pg_config = pg_container_config().await;
+        let mut pg_config = pg_container_config().await;
+        let mut bridge_tasks = tokio::task::JoinSet::new();
+        if use_unix_upstream {
+            let upstream_directory = directory.0.join("upstream");
+            std::fs::create_dir(&upstream_directory).unwrap();
+            let listener = crate::unix_listener::BoundUnixListener::bind(
+                &upstream_directory,
+                pg_config.pgtest_pg_port,
+            )
+            .unwrap();
+            let host = pg_config.pgtest_pg_host.clone();
+            let port = pg_config.pgtest_pg_port;
+            bridge_tasks.spawn(async move {
+                let mut sessions = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let mut unix_stream = accepted.unwrap();
+                            let host = host.clone();
+                            sessions.spawn(async move {
+                                let mut tcp_stream = tokio::net::TcpStream::connect((host.as_str(), port)).await.unwrap();
+                                let _ = tokio::io::copy_bidirectional(&mut unix_stream, &mut tcp_stream).await;
+                            });
+                        }
+                        Some(result) = sessions.join_next(), if !sessions.is_empty() => { result.unwrap(); }
+                    }
+                }
+            });
+            pg_config.pgtest_pg_host = upstream_directory.to_str().unwrap().to_owned();
+        }
         let template = pg_config.pgtest_pg_database.clone();
         let engine = Arc::new(
             WorkerEngineManager::start(pg_config, WorkerEngineConfig::default()).await.unwrap(),
@@ -150,6 +195,7 @@ mod listener_test {
             .unwrap_or_else(|_| panic!("listener retained the manager"))
             .shutdown()
             .await;
+        bridge_tasks.shutdown().await;
     }
 
     #[tokio::test]

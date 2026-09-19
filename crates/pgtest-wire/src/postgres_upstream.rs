@@ -1,5 +1,3 @@
-//! PostgreSQL upstream connection and startup exchange.
-
 use std::collections::BTreeMap;
 
 use bytes::BytesMut;
@@ -11,6 +9,10 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+
+use crate::postgres_upstream::upstream_stream::UpstreamStream;
+
+pub(crate) mod upstream_stream;
 
 pub(crate) struct PostgresUpstream;
 
@@ -31,7 +33,7 @@ impl From<BytesMut> for RawBytes {
 }
 
 pub(crate) struct UpstreamSession {
-    pub(crate) stream: TcpStream,
+    pub(crate) stream: UpstreamStream,
     pub(crate) session_burst: RawBytes,
 }
 
@@ -40,9 +42,10 @@ impl PostgresUpstream {
     pub(crate) async fn connect(
         db_name: &str,
         client_params: &BTreeMap<String, String>,
+        pg_upstream_host: &str,
         pg_upstream_port: u16,
     ) -> Result<UpstreamSession, ()> {
-        let mut stream = Self::connect_tcp(pg_upstream_port).await?;
+        let mut stream = Self::connect_stream(pg_upstream_host, pg_upstream_port).await?;
         let mut decode_buffer = Self::authenticate(&mut stream, db_name, client_params).await?;
 
         let Ok(session_burst) =
@@ -55,20 +58,42 @@ impl PostgresUpstream {
         Ok(UpstreamSession { stream, session_burst })
     }
 
-    async fn connect_tcp(pg_upstream_port: u16) -> Result<TcpStream, ()> {
-        let Ok(stream) = TcpStream::connect(("127.0.0.1", pg_upstream_port)).await else {
-            tracing::error!("unable to connect upstream postgres");
-            return Err(());
-        };
+    async fn connect_stream(host: &str, port: u16) -> Result<UpstreamStream, ()> {
+        if host.starts_with('/') {
+            #[cfg(unix)]
+            {
+                let path = std::path::Path::new(host).join(format!(".s.PGSQL.{port}"));
+                return tokio::net::UnixStream::connect(&path).await.map(UpstreamStream::Unix).map_err(|error| {
+                    tracing::error!(path = %path.display(), %error, "unable to connect upstream postgres socket");
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                tracing::error!(
+                    host,
+                    port,
+                    "Unix upstream sockets are unsupported on this platform"
+                );
+                return Err(());
+            }
+        }
+        Self::connect_tcp(host, port).await.map(UpstreamStream::Tcp)
+    }
 
-        stream.set_nodelay(true).unwrap();
+    async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ()> {
+        let stream = TcpStream::connect((host, port)).await.map_err(|error| {
+            tracing::error!(host, port, %error, "unable to connect upstream postgres");
+        })?;
+        stream.set_nodelay(true).map_err(|error| {
+            tracing::error!(host, port, %error, "unable to set upstream TCP_NODELAY");
+        })?;
         Ok(stream)
     }
 
     // Includes sending Startup and waiting for AuthenticationOk. Preserve any
     // following bytes so the next stage can consume an already-buffered reply.
     async fn authenticate(
-        stream: &mut TcpStream,
+        stream: &mut UpstreamStream,
         db_name: &str,
         client_params: &BTreeMap<String, String>,
     ) -> Result<BytesMut, ()> {
@@ -151,7 +176,7 @@ impl PostgresUpstream {
     }
 
     async fn wait_for_ready_for_query(
-        stream: &mut TcpStream,
+        stream: &mut UpstreamStream,
         buf: &mut BytesMut,
     ) -> Result<RawBytes, ()> {
         const HEADER: usize = 5;
@@ -197,5 +222,68 @@ impl PostgresUpstream {
                 }
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tcp_uses_configured_hostname_and_port() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut stream = PostgresUpstream::connect_stream("localhost", port).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        assert!(matches!(&stream, UpstreamStream::Tcp(tcp) if tcp.nodelay().unwrap()));
+        stream.write_all(b"request").await.unwrap();
+        let mut request = [0; 7];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        peer.write_all(b"reply").await.unwrap();
+        let mut reply = [0; 5];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+        stream.shutdown().await.unwrap();
+        assert_eq!(peer.read(&mut request).await.unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_uses_directory_and_port_and_reports_missing_socket() {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            Directory(std::env::temp_dir().join(format!("pgu-up-{}", std::process::id())));
+        std::fs::create_dir(&directory.0).unwrap();
+        let host = directory.0.to_str().unwrap();
+        let listener = crate::unix_listener::BoundUnixListener::bind(&directory.0, 5433).unwrap();
+        let mut stream = PostgresUpstream::connect_stream(host, 5433).await.unwrap();
+        assert!(matches!(stream, UpstreamStream::Unix(_)));
+        let mut peer = listener.accept().await.unwrap();
+        stream.write_all(b"request").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut request = [0; 7];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        peer.write_all(b"reply").await.unwrap();
+        let mut reply = [0; 5];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+        stream.shutdown().await.unwrap();
+        assert_eq!(peer.read(&mut request).await.unwrap(), 0);
+        assert!(PostgresUpstream::connect_stream(host, 5434).await.is_err());
+        drop(listener);
+        assert!(PostgresUpstream::connect_stream(host, 5433).await.is_err());
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn unix_endpoint_is_rejected_on_unsupported_platforms() {
+        assert!(PostgresUpstream::connect_stream("/var/run/postgresql", 5432).await.is_err());
     }
 }

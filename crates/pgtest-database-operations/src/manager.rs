@@ -19,6 +19,7 @@ pub mod errors;
 
 pub struct PostgresManager {
     pub version: u8,
+    pub host: String,
     pub port: u16,
     pub template_database_name: PostgresDatabaseName,
     create_pool: Pool<Postgres>,
@@ -96,6 +97,7 @@ impl PostgresManager {
             create_pool,
             cleanup_pool,
             template_database_name: PostgresDatabaseName::new(postgres_config.pgtest_pg_database),
+            host: postgres_config.pgtest_pg_host,
             port: postgres_config.pgtest_pg_port,
         })
     }
