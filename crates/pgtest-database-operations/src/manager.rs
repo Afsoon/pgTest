@@ -31,7 +31,7 @@ const MIN_SERVER_VERSION_NUM: u8 = 13;
 #[hotpath::measure_all]
 impl PostgresManager {
     pub async fn start(postgres_config: PostgresConfig) -> Result<Self, PostgresClientError> {
-        if postgres_config.pgtest_pg_cretion_pool_connection == 0 {
+        if postgres_config.pgtest_pg_creation_pool_connection == 0 {
             return Err(PostgresClientError::InvalidPoolSize("PGTEST_CREATION_POOL_CONNECTION"));
         }
         if postgres_config.pgtest_pg_cleanup_pool_connection == 0 {
@@ -46,7 +46,7 @@ impl PostgresManager {
             .database("postgres");
 
         let create_pool = PgPoolOptions::new()
-            .max_connections(postgres_config.pgtest_pg_cretion_pool_connection)
+            .max_connections(postgres_config.pgtest_pg_creation_pool_connection)
             .connect_with(connection_options.clone())
             .await
             .map_err(|error| {
@@ -249,10 +249,10 @@ mod postgres_manager_test {
         for (config, variable) in [
             (
                 PostgresConfig {
-                    pgtest_pg_cretion_pool_connection: 0,
+                    pgtest_pg_creation_pool_connection: 0,
                     ..PostgresConfig::default()
                 },
-                "PGTEST_POOL_CONNECTION",
+                "PGTEST_CREATION_POOL_CONNECTION",
             ),
             (
                 PostgresConfig {
@@ -272,7 +272,7 @@ mod postgres_manager_test {
     #[tokio::test]
     async fn cleanup_and_creation_have_independent_connection_capacity() {
         let config = PostgresConfig {
-            pgtest_pg_cretion_pool_connection: 1,
+            pgtest_pg_creation_pool_connection: 1,
             pgtest_pg_cleanup_pool_connection: 1,
             ..pg_container_config().await
         };

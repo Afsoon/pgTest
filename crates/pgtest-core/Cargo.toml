@@ -37,7 +37,5 @@ default = []
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
 hotpath-prometheus = ["hotpath/hotpath-prometheus"]
-# Deterministic sequential database ids for the worker_engine simulations.
-stable_ids = []
 # Expose the container-backed PostgreSQL configuration to other crates' tests.
 test-support = ["dep:testcontainers"]

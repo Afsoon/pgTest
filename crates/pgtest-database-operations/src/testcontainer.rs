@@ -1,8 +1,16 @@
 // 99% of this files is the same as-is in https://github.com/testcontainers/testcontainers-rs-modules-community/blob/main/src/postgres/mod.rs.
 // I have only adapted for my needs, the config deactivate all PG safeguards for
 // data safety, non essential work, and persist our data in memory.
-use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
+use sqlx::{Connection, PgConnection, postgres::PgConnectOptions};
 use testcontainers::{
     Container, CopyDataSource, CopyToContainer, Image, ImageExt,
     core::{ContainerPort, WaitFor},
@@ -10,7 +18,7 @@ use testcontainers::{
 };
 
 #[cfg(any(test, feature = "test-support"))]
-use crate::manager::config::PostgresConfig;
+use crate::manager::{config::PostgresConfig, database_name::PostgresDatabaseName};
 
 const NAME: &str = "postgres";
 const TAG: &str = "18-alpine";
@@ -35,16 +43,17 @@ pub static POSTGRES_CONTAINER: LazyLock<Container<Postgres>> = LazyLock::new(|| 
 /// Starts an instance of Postgres.
 /// This module is based on the official [`Postgres docker image`].
 ///
-/// Default db name, user and password is `postgres`.
+/// The default database is `pgtest`; the user and password are `postgres`.
 ///
 /// # Example
 /// ```
-/// use testcontainers_modules::{postgres, testcontainers::runners::SyncRunner};
+/// use pgtest_database_operations::testcontainer::Postgres;
+/// use testcontainers::runners::SyncRunner;
 ///
-/// let postgres_instance = postgres::Postgres::default().start().unwrap();
+/// let postgres_instance = Postgres::default().start().unwrap();
 ///
 /// let connection_string = format!(
-///     "postgres://postgres:postgres@{}:{}/postgres",
+///     "postgres://postgres:postgres@{}:{}/pgtest",
 ///     postgres_instance.get_host().unwrap(),
 ///     postgres_instance.get_host_port_ipv4(5432).unwrap()
 /// );
@@ -91,13 +100,13 @@ impl Postgres {
     /// # Example
     ///
     /// ```
-    /// # use testcontainers_modules::postgres::Postgres;
+    /// # use pgtest_database_operations::testcontainer::Postgres;
     /// let postgres_image = Postgres::default()
     ///     .with_init_sql("CREATE EXTENSION IF NOT EXISTS hstore;".to_string().into_bytes());
     /// ```
     ///
     /// ```rust,ignore
-    /// # use testcontainers_modules::postgres::Postgres;
+    /// # use pgtest_database_operations::testcontainer::Postgres;
     /// let postgres_image = Postgres::default()
     ///                                .with_init_sql(include_str!("path_to_init.sql").to_string().into_bytes());
     /// ```
@@ -187,7 +196,7 @@ impl Default for PostgresConfig {
             pgtest_pg_port: 5432,
             pgtest_pg_user: String::from("postgres"),
             pgtest_pg_host: String::from("localhost"),
-            pgtest_pg_cretion_pool_connection: 5,
+            pgtest_pg_creation_pool_connection: 5,
             pgtest_pg_cleanup_pool_connection: 2,
         }
     }
@@ -203,7 +212,35 @@ impl<'a> From<&'a Container<Postgres>> for PostgresConfig {
     }
 }
 
-// https://github.com/tokio-rs/tokio/discussions/3857
+/// Provision a separate template for each test manager in the shared container.
+/// Templates and any remaining clones live until the container is removed.
 pub async fn pg_container_config() -> PostgresConfig {
-    tokio::task::spawn_blocking(|| PostgresConfig::from(&*POSTGRES_CONTAINER)).await.unwrap()
+    static NEXT_TEMPLATE_ID: AtomicU64 = AtomicU64::new(0);
+
+    // The synchronous container runner must not run inside a Tokio runtime.
+    // https://github.com/tokio-rs/tokio/discussions/3857
+    let mut config =
+        tokio::task::spawn_blocking(|| PostgresConfig::from(&*POSTGRES_CONTAINER)).await.unwrap();
+    let id = NEXT_TEMPLATE_ID.fetch_add(1, Ordering::Relaxed);
+
+    config.pgtest_pg_database = format!("pgt{id:016x}");
+    let options = PgConnectOptions::new()
+        .host(&config.pgtest_pg_host)
+        .port(config.pgtest_pg_port)
+        .username(&config.pgtest_pg_user)
+        .password("postgres")
+        .database("postgres");
+    let mut connection =
+        PgConnection::connect_with(&options).await.expect("connect to the shared test container");
+    let template = PostgresDatabaseName::quote_ident(&config.pgtest_pg_database);
+    sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
+        "CREATE DATABASE {template} TEMPLATE pgtest STRATEGY=FILE_COPY"
+    ))
+    .build()
+    .execute(&mut connection)
+    .await
+    .expect("create an isolated test template");
+
+    connection.close().await.expect("close the template creation connection");
+    config
 }

@@ -1,8 +1,8 @@
-crate := "pgtest-wire"
+crate := "pgtest-utils"
 
 # List available recipes
 help:
-    @just --list --unsorted --list-prefix '  ' --list-heading $'pgTest Wire\n'
+    @just --list --unsorted
 
 # Format this crate
 fmt:
@@ -20,15 +20,11 @@ lint:
 check:
     cargo check -p {{crate}} --all-targets
 
-# Check all targets with profiling enabled
-check-profile:
-    cargo check -p {{crate}} --all-targets --features hotpath
-
 # Run cargo build on this crate
 build:
     cargo build -p {{crate}} --all-targets
 
-# Run all tests in this crate (requires Docker)
+# Run cargo test on this crate
 test:
     cargo test -p {{crate}}
 

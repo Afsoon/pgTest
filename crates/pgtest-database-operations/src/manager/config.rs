@@ -11,7 +11,7 @@ pub struct PostgresConfig {
     #[envconfig(from = "PGTEST_PG_DATABASE", default = "pgtest")]
     pub pgtest_pg_database: String,
     #[envconfig(from = "PGTEST_CREATION_POOL_CONNECTION", default = "10")]
-    pub pgtest_pg_cretion_pool_connection: u32,
+    pub pgtest_pg_creation_pool_connection: u32,
     #[envconfig(from = "PGTEST_CLEANUP_POOL_CONNECTION", default = "5")]
     pub pgtest_pg_cleanup_pool_connection: u32,
 }

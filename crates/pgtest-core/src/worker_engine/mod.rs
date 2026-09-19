@@ -40,6 +40,28 @@ mod worker_engine_test {
     }
 
     #[tokio::test]
+    async fn simulations_restart_the_sequence_and_share_it_with_background_creation() {
+        for _ in 0..2 {
+            let consumer = consumer();
+            let outcome = EngineSimulator::run(occupy_initial(&consumer)).await.unwrap();
+            let mut databases: Vec<_> = outcome
+                .leases
+                .values()
+                .map(|entry| &entry.database)
+                .chain(outcome.inventory.ready.iter())
+                .collect();
+            databases.sort_by_key(|database| database.database_id.0);
+
+            // Four initial clones plus one background growth batch share a
+            // sequence.
+            assert_eq!(databases.len(), 8);
+            for (index, database) in databases.iter().enumerate() {
+                assert_eq!(database.database_name.as_ref(), format!("pgtest_{}", index + 1));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn immediate_available_templates() {
         let consumer = consumer();
         let outcome = EngineSimulator::run(vec![attach("first", &consumer)]).await.unwrap();

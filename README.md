@@ -1,5 +1,33 @@
 WIP
 
+## Development commands
+
+Run `just help` to list workspace commands and all five crate modules: `core`,
+`wire`, `server`, `database`, and `utils`. Each module provides `check`, `build`,
+`test`, `lint`, `fmt`, `fmt-check`, and `doc` (which opens the generated docs).
+`check` includes test targets; `lint` runs Clippy with warnings treated as errors.
+Use `fmt-check` separately to check formatting without modifying files.
+
+```sh
+just check
+just fmt-check
+just database::test
+just utils::test
+just core::test-unit
+just core::test-integration
+just check-profile
+just server::run-profile
+```
+
+Core unit tests run without Docker; its integration command runs the
+PostgreSQL-backed manager tests. Full core, wire, and database test suites require
+Docker for Testcontainers. Simulations always use their own sequential database
+names; production and PostgreSQL-backed tests use random names. The obsolete
+`stable_ids` Cargo feature has been removed.
+`check-profile` enables `hotpath` and is also available in every crate module
+except `utils`. Server startup uses an externally managed PostgreSQL instance;
+there are no Compose-backed `db-*` commands.
+
 The [v0.1 release plan](#v01-release-plan) covers independent database supply,
 architecture stabilization, a native server CLI, and distroless distribution.
 
@@ -35,9 +63,9 @@ Measured results: [Explicit lease release removes burst stalls](docs/explicit-re
 Implementation walkthrough: [Worker engine retirement retries](docs/worker-engine-retirement-retries.md).
 
 Database creation and cleanup run in separate workers with independent PostgreSQL
-connection pools. `PGTEST_POOL_CONNECTION` controls creation connections
-(default `5`), and `PGTEST_CLEANUP_POOL_CONNECTION` controls cleanup connections
-(default `2`). Both must be greater than zero. These settings limit connection
+connection pools. `PGTEST_CREATION_POOL_CONNECTION` controls creation connections
+(default `10`), and `PGTEST_CLEANUP_POOL_CONNECTION` controls cleanup connections
+(default `5`). Both must be greater than zero. These settings limit connection
 use; they do not cap queued jobs or database counts.
 
 The engine replenishes ready database supply independently of cleanup.
@@ -130,7 +158,7 @@ argument is `socket_dir` (default `/tmp/pgtest`); the preceding arguments remain
 `host user template port pool initial maximum`. To also enable burst summaries:
 
 ```sh
-PGTEST_PERF_WINDOWS=true just server::run-metered-unix
+just server::run-metered-unix
 ```
 
 The socket is `/tmp/pgtest/.s.PGSQL.6432`, following PostgreSQL's
@@ -171,14 +199,11 @@ termination, choose a fresh directory or confirm the old server has stopped
 before removing its stale socket. Library users keep the handle returned by
 `WireListener::run_unix` alive and call `shutdown().await` for completed cleanup.
 
-## Correlating attachment delays with bursts
+## Historical attachment-window metrics
 
-Set `PGTEST_PERF_WINDOWS=true` to collect 100 ms windows. This is independent of
-the `hotpath` feature and is disabled by default:
-
-```sh
-PGTEST_PERF_WINDOWS=true RUST_LOG=info cargo run -p pgtest-server
-```
+The current implementation does not read `PGTEST_PERF_WINDOWS` or emit the window
+events described below. This section documents earlier measurements. For current
+profiling, use `just server::run-profile`.
 
 Each occupied window produces `attachment_window`, `creation_window`, and
 `cleanup_window` events

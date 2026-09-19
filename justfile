@@ -1,20 +1,26 @@
+# List workspace and crate recipes
 help:
-    @just --list --unsorted --list-prefix '  ' --list-heading $'pgTest Workspace\n'
-    @echo ''
-    @just --list --unsorted --list-prefix '    ' --list-heading $'  pgTest Core\n' --justfile crates/pgtest-core/justfile
-    @echo ''
-    @just --list --unsorted --list-prefix '    ' --list-heading $'  pgTest Server\n' --justfile crates/pgtest-server/justfile
-    @echo ''
-    @just --list --unsorted --list-prefix '    ' --list-heading $'  pgTest Wire\n' --justfile crates/pgtest-wire/justfile
+    @just --list --list-submodules --unsorted
 
-# Run lints on the workspace members (cargo fmt and clippy)
-lint:
+# Format the workspace
+fmt:
+    cargo +nightly fmt --all
+
+# Check workspace formatting without changing files
+fmt-check:
     cargo +nightly fmt --all --check
+
+# Run Clippy on all workspace targets
+lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
 # Run cargo check on the workspace members
 check:
-    cargo check --workspace
+    cargo check --workspace --all-targets
+
+# Check all workspace targets with profiling enabled
+check-profile:
+    cargo check --workspace --all-targets --features hotpath
 
 # Run cargo build on the workspace members
 build:
@@ -24,32 +30,12 @@ build:
 clean:
     cargo clean
 
-# Run cargo test on the workspace members (both id-generation modes)
+# Run workspace tests, including deterministic simulations (requires Docker)
 test:
     cargo test --workspace
-    cargo test -p pgtest-core --features stable_ids
-
-# Start the development postgres container (waits until healthy)
-db-up:
-    docker compose up -d --wait
-
-# Stop the development postgres container (data volume is kept)
-db-down:
-    docker compose down
-
-# Stop the development postgres container and delete its data volume
-db-reset:
-    docker compose down -v
-    docker compose up -d --wait
-
-# Tail logs of the development postgres container
-db-logs:
-    docker compose logs -f postgres
-
-# Open a psql shell on the development database
-db-psql:
-    docker compose exec postgres psql -U trust -d pgtest
 
 mod core "crates/pgtest-core"
 mod server "crates/pgtest-server"
 mod wire "crates/pgtest-wire"
+mod database "crates/pgtest-database-operations"
+mod utils "crates/pgtest-utils"

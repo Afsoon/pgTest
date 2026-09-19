@@ -3,7 +3,3 @@
 # Default-on in current nightlies; kept explicit so the workspace still opts in
 # if the default flips, and fails loudly on toolchains without it.
 rustflags = ["-Znext-solver"]
-
-[env]
-# Keep test containers running after tests finish.
-TESTCONTAINERS_COMMAND = "keep"

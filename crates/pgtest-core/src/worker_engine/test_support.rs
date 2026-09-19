@@ -7,9 +7,7 @@ use std::{
     },
 };
 
-use pgtest_database_operations::manager::{
-    config::PostgresConfig, database_name::PostgresDatabaseName,
-};
+use pgtest_database_operations::manager::config::PostgresConfig;
 use pgtest_utils::read_string::ReadString;
 use rustc_hash::FxHashMap;
 use tokio_util::sync::CancellationToken;
@@ -55,7 +53,7 @@ impl ConsumerIO for ConsumerWorker {
 
 pub struct WorkerEngineIO<'a> {
     inbox: Arc<std::sync::Mutex<VecDeque<EngineMessage<ConsumerWorker>>>>,
-    database_progression_name: &'a PostgresDatabaseName,
+    database_progression_name: &'a SequentialDatabaseNames,
     fail: bool,
     messages_pushed: AtomicUsize,
     operations_before_fail: usize,
@@ -64,7 +62,7 @@ pub struct WorkerEngineIO<'a> {
 impl<'a> WorkerEngineIO<'a> {
     fn new(
         inbox: Arc<std::sync::Mutex<VecDeque<EngineMessage<ConsumerWorker>>>>,
-        database_progression_name: &'a PostgresDatabaseName,
+        database_progression_name: &'a SequentialDatabaseNames,
     ) -> Self {
         Self {
             inbox,
@@ -77,7 +75,7 @@ impl<'a> WorkerEngineIO<'a> {
 
     fn fail_once(
         inbox: Arc<std::sync::Mutex<VecDeque<EngineMessage<ConsumerWorker>>>>,
-        database_progression_name: &'a PostgresDatabaseName,
+        database_progression_name: &'a SequentialDatabaseNames,
         operations_before_fail: usize,
     ) -> Self {
         Self {
@@ -155,14 +153,34 @@ impl EngineInbox<ConsumerWorker> for WorkerInboxImpl {
     }
 }
 
+/// Each simulation owns its sequence; no global state or production naming
+/// policy.
+struct SequentialDatabaseNames {
+    template: String,
+    sequence: AtomicUsize,
+}
+
+impl SequentialDatabaseNames {
+    fn new(template: String) -> Self {
+        Self { template, sequence: AtomicUsize::new(0) }
+    }
+
+    fn generate_database_name(&self) -> String {
+        let id = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("{}_{id}", self.template)
+    }
+}
+
 pub struct PostgresConnection {
-    template_database_name: PostgresDatabaseName,
+    template_database_name: SequentialDatabaseNames,
 }
 
 impl PostgresConnection {
     pub(super) fn start(postgres_config: PostgresConfig) -> Self {
         Self {
-            template_database_name: PostgresDatabaseName::new(postgres_config.pgtest_pg_database),
+            template_database_name: SequentialDatabaseNames::new(
+                postgres_config.pgtest_pg_database,
+            ),
         }
     }
 }

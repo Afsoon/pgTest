@@ -1,8 +1,8 @@
-crate := "pgtest-core"
+crate := "pgtest-database-operations"
 
 # List available recipes
 help:
-    @just --list --unsorted --list-prefix '  ' --list-heading $'pgTest Core\n'
+    @just --list --unsorted
 
 # Format this crate
 fmt:
@@ -31,18 +31,6 @@ build:
 # Run all tests in this crate (requires Docker)
 test:
     cargo test -p {{crate}}
-
-# Run engine simulations and worker unit tests without Docker
-test-unit:
-    cargo test -p {{crate}} --lib -- --skip worker_manager::worker_engine_manager_test::
-    cargo test -p {{crate}} --lib worker_manager::worker_engine_manager_test::startup_future_fits_stack_budget -- --exact
-
-# Run PostgreSQL-backed manager tests (requires Docker)
-test-integration:
-    cargo test -p {{crate}} --lib worker_manager::worker_engine_manager_test:: -- --skip startup_future_fits_stack_budget
-
-test-debug:
-    RUST_LOG=debug cargo test -p {{crate}} -- --show-output
 
 # Build and open the docs of this crate
 doc:

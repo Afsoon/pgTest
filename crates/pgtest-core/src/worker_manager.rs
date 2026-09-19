@@ -263,7 +263,7 @@ impl WorkerEngineManager {
         let _ = self.engine_handle.await;
     }
 
-    #[cfg(all(test, not(feature = "stable_ids")))]
+    #[cfg(test)]
     async fn sync_inbox(&self) {
         let (reply, received) = tokio::sync::oneshot::channel();
         assert!(
@@ -273,7 +273,7 @@ impl WorkerEngineManager {
         received.await.expect("engine must acknowledge the inbox barrier");
     }
 
-    #[cfg(all(test, not(feature = "stable_ids")))]
+    #[cfg(test)]
     async fn drain_and_snapshot(self) -> WorkerEngineType {
         self.sync_inbox().await;
         // Receiver loops now live in the tracker too. Cancel them before
@@ -297,7 +297,7 @@ impl WorkerEngineManager {
     }
 }
 
-#[cfg(all(test, not(feature = "stable_ids")))]
+#[cfg(test)]
 mod worker_engine_manager_test {
     use std::{future::poll_fn, pin::Pin, task::Poll, time::Duration};
 
@@ -436,6 +436,62 @@ mod worker_engine_manager_test {
     }
 
     #[tokio::test]
+    async fn startup_cleanup_is_isolated_between_test_managers() {
+        use pgtest_database_operations::manager::PostgresManager;
+        use sqlx::{Connection, PgConnection, postgres::PgConnectOptions};
+
+        let first_config = pg_container_config().await;
+        let options = PgConnectOptions::new()
+            .host(&first_config.pgtest_pg_host)
+            .port(first_config.pgtest_pg_port)
+            .username(&first_config.pgtest_pg_user)
+            .password("postgres")
+            .database("postgres");
+        let first = WorkerEngineManager::start(first_config, no_growth_config(1)).await.unwrap();
+        let session = first
+            .attach(
+                first.pg_client.template_database_name.template_name(),
+                LeaseId::new("active").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let second_config = pg_container_config().await;
+        let stale_database = {
+            let client = PostgresManager::start(PostgresConfig {
+                pgtest_pg_database: second_config.pgtest_pg_database.clone(),
+                pgtest_pg_host: second_config.pgtest_pg_host.clone(),
+                pgtest_pg_user: second_config.pgtest_pg_user.clone(),
+                ..second_config
+            })
+            .await
+            .unwrap();
+            client.create_ddl_database().await.unwrap()
+        };
+
+        // Run startup cleanup after the first manager has assigned a database,
+        // making the destructive interleaving deterministic.
+        let second = WorkerEngineManager::start(second_config, no_growth_config(0)).await.unwrap();
+        let mut connection = PgConnection::connect_with(&options).await.unwrap();
+        let databases: Vec<String> = sqlx::query_scalar("SELECT datname FROM pg_database")
+            .fetch_all(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        first.shutdown().await;
+        second.shutdown().await;
+
+        assert!(
+            databases.iter().any(|name| name == session.database_name.as_ref()),
+            "startup cleanup must preserve another test manager's active database"
+        );
+        assert!(
+            !databases.iter().any(|name| name == stale_database.as_ref()),
+            "startup cleanup must still remove its own stale databases"
+        );
+    }
+
+    #[tokio::test]
     async fn when_the_last_lease_session_is_dropped_then_the_database_remains_assigned() {
         let worker_engine_config =
             WorkerEngineConfig { lease_claim_timeout_ms: 5_000, ..WorkerEngineConfig::default() };
@@ -443,7 +499,7 @@ mod worker_engine_manager_test {
 
         let lease = LeaseId::new("connection1").unwrap();
         let session = manager
-            .attach("pgtest", lease.clone())
+            .attach(manager.pg_client.template_database_name.template_name(), lease.clone())
             .await
             .expect("attach against the template database succeeds");
         let assigned_database = session.database_name.to_string();
@@ -479,12 +535,12 @@ mod worker_engine_manager_test {
 
         let lease = LeaseId::new("connection1").unwrap();
         let _no_dropped_session = manager
-            .attach("pgtest", lease.clone())
+            .attach(manager.pg_client.template_database_name.template_name(), lease.clone())
             .await
             .expect("attach against the template database succeeds");
 
         let session = manager
-            .attach("pgtest", lease.clone())
+            .attach(manager.pg_client.template_database_name.template_name(), lease.clone())
             .await
             .expect("attach against the template database succeeds");
 
@@ -528,7 +584,9 @@ mod worker_engine_manager_test {
         tokio::time::pause();
         let lease = LeaseId::new("connection1").unwrap();
         let started_at = tokio::time::Instant::now();
-        let result = manager.attach("pgtest", lease.clone()).await;
+        let result = manager
+            .attach(manager.pg_client.template_database_name.template_name(), lease.clone())
+            .await;
         assert!(result.is_err(), "attach must time out when no slot can ever free up");
         assert!(
             started_at.elapsed()
@@ -552,7 +610,10 @@ mod worker_engine_manager_test {
     async fn creation_after_attach_timeout_leaves_the_new_database_ready() {
         let (mut manager, mut workers) = start_with_deferred_workers().await;
         let session = manager
-            .attach("pgtest", LeaseId::new("holder").unwrap())
+            .attach(
+                manager.pg_client.template_database_name.template_name(),
+                LeaseId::new("holder").unwrap(),
+            )
             .await
             .expect("first lease must occupy the only slot");
         let original_database = session.database_name.clone();
@@ -561,7 +622,12 @@ mod worker_engine_manager_test {
         // only the caller's deadline, then explicitly deliver lifetime expiry.
         manager.lease_claim_timeout = 100;
         let started_at = Instant::now();
-        let result = manager.attach("pgtest", LeaseId::new("timed_out").unwrap()).await;
+        let result = manager
+            .attach(
+                manager.pg_client.template_database_name.template_name(),
+                LeaseId::new("timed_out").unwrap(),
+            )
+            .await;
         assert!(result.is_err(), "the occupied slot cannot satisfy the request");
         assert!(started_at.elapsed() >= Duration::from_millis(100));
 
@@ -590,11 +656,14 @@ mod worker_engine_manager_test {
         let holder = LeaseId::new("holder").unwrap();
         let waiting = LeaseId::new("waiting").unwrap();
         let session = manager
-            .attach("pgtest", holder.clone())
+            .attach(manager.pg_client.template_database_name.template_name(), holder.clone())
             .await
             .expect("first lease must occupy the only slot");
 
-        let mut attach = Box::pin(manager.attach("pgtest", waiting.clone()));
+        let mut attach = Box::pin(
+            manager
+                .attach(manager.pg_client.template_database_name.template_name(), waiting.clone()),
+        );
         enqueue_attach(&manager, attach.as_mut()).await;
         drop(session);
         manager
@@ -624,13 +693,19 @@ mod worker_engine_manager_test {
     async fn creation_skips_a_cancelled_attach_and_keeps_the_database_ready() {
         let (manager, mut workers) = start_with_deferred_workers().await;
         let session = manager
-            .attach("pgtest", LeaseId::new("holder").unwrap())
+            .attach(
+                manager.pg_client.template_database_name.template_name(),
+                LeaseId::new("holder").unwrap(),
+            )
             .await
             .expect("first lease must occupy the only slot");
         let original_database = session.database_name.clone();
 
         let started_at = Instant::now();
-        let mut attach = Box::pin(manager.attach("pgtest", LeaseId::new("cancelled").unwrap()));
+        let mut attach = Box::pin(manager.attach(
+            manager.pg_client.template_database_name.template_name(),
+            LeaseId::new("cancelled").unwrap(),
+        ));
         enqueue_attach(&manager, attach.as_mut()).await;
         drop(attach);
         drop(session);
@@ -664,7 +739,12 @@ mod worker_engine_manager_test {
         drop(engine);
         assert!(manager.worker_inbox_tx.is_closed());
 
-        let result = manager.attach("pgtest", LeaseId::new("after_shutdown").unwrap()).await;
+        let result = manager
+            .attach(
+                manager.pg_client.template_database_name.template_name(),
+                LeaseId::new("after_shutdown").unwrap(),
+            )
+            .await;
 
         manager.shutdown_token.cancel();
         manager.tracker.close();
