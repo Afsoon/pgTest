@@ -11,6 +11,7 @@ use pgtest::{
 use pgwire::{
     api::{
         ClientInfo, ClientPortalStore, DEFAULT_NAME, PgWireServerHandlers, Type,
+        auth::StartupHandler,
         portal::{Format, Portal},
         query::{ExtendedQueryHandler, SimpleQueryHandler},
         results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response},
@@ -19,10 +20,60 @@ use pgwire::{
     },
     error::{ErrorInfo, PgWireError, PgWireResult},
     messages::{
-        PgWireBackendMessage,
+        PgWireBackendMessage, PgWireFrontendMessage,
         extendedquery::{Bind, BindComplete, Parse, ParseComplete},
+        startup::Startup,
     },
+    tokio::server::{process_error, process_message},
 };
+
+use crate::connection::ClientConnection;
+
+#[hotpath::measure]
+pub(crate) async fn serve(
+    mut framed: ClientConnection,
+    startup: Startup,
+    manager: Arc<WorkerEngineManager>,
+) -> std::io::Result<()> {
+    let handlers = Arc::new(PgTestControlPanel::new(manager));
+    let startup_handler = handlers.startup_handler();
+
+    if let Err(error) =
+        startup_handler.on_startup(&mut framed, PgWireFrontendMessage::Startup(startup)).await
+    {
+        process_error(&mut framed, error, false).await?;
+        return Ok(());
+    }
+
+    let copy_handler = handlers.copy_handler();
+    let cancel_handler = handlers.cancel_handler();
+
+    while let Some(message) = framed.next().await {
+        let message = message?;
+        if matches!(message, PgWireFrontendMessage::Terminate(_)) {
+            break;
+        }
+
+        let wait_for_sync = message.is_extended_query();
+        // Use the concrete query handler so its Statement type matches the
+        // codec.
+        if let Err(error) = process_message(
+            message,
+            &mut framed,
+            startup_handler.clone(),
+            handlers.clone(),
+            handlers.clone(),
+            copy_handler.clone(),
+            cancel_handler.clone(),
+        )
+        .await
+        {
+            process_error(&mut framed, error, wait_for_sync).await?;
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct PgTestControlPanel {

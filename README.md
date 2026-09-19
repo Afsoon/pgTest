@@ -76,6 +76,13 @@ remaining startup messages through ReadyForQuery (or ErrorResponse). Bytes alrea
 read during authentication remain buffered for the final stage. Use
 `HOTPATH_LIMIT=0` to include all three stages even when their totals are small.
 
+Within `pgtest-wire`, `wire_listener` owns the accept loops, `connection` handles
+startup and routing, and `control_panel::serve` processes control connections.
+`postgres_upstream` owns the upstream startup exchange, while `session_relay`
+forwards bytes for the lifetime of an attached lease. Connection handling and
+control-session profiling now appear under `connection::handle_connection` and
+`control_panel::serve`.
+
 The internal MPSC endpoint types use `hotpath::wrap`; these resolve to the
 original Tokio types when profiling is disabled. Oneshot replies use proxy mode.
 The regular, non-optional hotpath dependency is safe to keep: without the
