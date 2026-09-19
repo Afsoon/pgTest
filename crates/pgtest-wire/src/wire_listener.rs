@@ -108,7 +108,7 @@ impl WireListener {
                         let connection_ctx = ConnectionContext { engine_manager: manager.clone() };
 
                         pg_connection_sessions.spawn(async move {
-                            WireListener::handle_coonection(ClientStream::Tcp(stream), connection_ctx).await
+                            WireListener::handle_connection(ClientStream::Tcp(stream), connection_ctx).await
                         });
                     }
                     Some(_finished) = pg_connection_sessions.join_next(), if !pg_connection_sessions.is_empty() => {}
@@ -138,7 +138,7 @@ impl WireListener {
                         match accepted {
                             Ok(stream) => {
                                 let context = ConnectionContext { engine_manager: manager.clone() };
-                                sessions.spawn(Self::handle_coonection(ClientStream::Unix(stream), context));
+                                sessions.spawn(Self::handle_connection(ClientStream::Unix(stream), context));
                             }
                             Err(error) => tracing::warn!(%error, "failed to accept Unix connection"),
                         }
@@ -150,7 +150,7 @@ impl WireListener {
         Ok(UnixWireListener { task: Some(task), stop: Some(stop), path })
     }
 
-    async fn handle_coonection(stream: ClientStream, connection_ctx: ConnectionContext) {
+    async fn handle_connection(stream: ClientStream, connection_ctx: ConnectionContext) {
         let Ok(Some((mut framed, startup))) =
             tokio::time::timeout(Duration::from_secs(60), stream.startup()).await
         else {
@@ -198,19 +198,8 @@ impl WireListener {
             .unwrap();
 
         tracing::debug!("connection string is {database}");
-        let decoded_connection_string =
-            match iri_string::percent_encode::decode::decode_whatwg_bytes(database.as_bytes())
-                .into_string()
-            {
-                Ok(value) => value,
-                Err(_) => {
-                    Self::reject_connection(&mut framed, "22023", "database name must be UTF-8")
-                        .await;
-                    return;
-                }
-            };
 
-        let (database_name, lease_id) = match parse_connection_field(&decoded_connection_string) {
+        let (database_name, lease_id) = match parse_connection_field(&database) {
             Ok(parse_result) => parse_result,
             Err(_) => {
                 Self::reject_connection(

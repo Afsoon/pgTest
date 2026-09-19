@@ -17,7 +17,6 @@ bytes = "1.12.1"
 pgwire = "0.41.0"
 futures = "0.3.34"
 tokio-util = { version = "0.7.19", features = ["codec"] }
-iri-string = "0.7.14"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

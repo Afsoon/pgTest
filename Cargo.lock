@@ -1438,16 +1438,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iri-string"
-version = "0.7.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1663ee7d8cf2900cc1414b1e1eec9f348d6eaa3bcab07579f4726a4b8499f447"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1999,7 +1989,6 @@ dependencies = [
  "bytes",
  "futures",
  "hotpath",
- "iri-string",
  "pest",
  "pest_derive",
  "pgtest-core",
