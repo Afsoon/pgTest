@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use hotpath::wrap::tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use pgtest_database_operations::manager::PostgresManager;
 use pgtest_utils::read_string::ReadString;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -157,7 +156,7 @@ impl WorkerEngineIO {
     }
 }
 
-impl EngineIO<ConsumerWorker, PostgresManager> for WorkerEngineIO {
+impl EngineIO<ConsumerWorker> for WorkerEngineIO {
     fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
         let Err(error) = self.database_worker_senders.creation_tx.send(request) else {
             return Ok(());

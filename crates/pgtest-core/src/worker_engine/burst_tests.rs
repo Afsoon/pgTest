@@ -39,7 +39,7 @@ struct DeferredIO {
     operations: Arc<Mutex<Operations>>,
 }
 
-impl EngineIO<ConsumerWorker, PostgresConnection> for DeferredIO {
+impl EngineIO<ConsumerWorker> for DeferredIO {
     fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
         let mut operations = self.operations.lock().unwrap();
         operations.creates.push(request.database_id);

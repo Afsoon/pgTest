@@ -88,7 +88,7 @@ impl<'a> WorkerEngineIO<'a> {
     }
 }
 
-impl<'a> EngineIO<ConsumerWorker, PostgresConnection> for WorkerEngineIO<'a> {
+impl<'a> EngineIO<ConsumerWorker> for WorkerEngineIO<'a> {
     fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
         let request_number = self.messages_pushed.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -317,7 +317,7 @@ impl ScriptedWorkerIO {
     }
 }
 
-impl EngineIO<ConsumerWorker, PostgresConnection> for ScriptedWorkerIO {
+impl EngineIO<ConsumerWorker> for ScriptedWorkerIO {
     fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
         self.script
             .lock()

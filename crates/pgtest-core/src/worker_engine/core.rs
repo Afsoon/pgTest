@@ -50,7 +50,7 @@ pub(crate) struct LeaseEntry {
 pub(crate) struct WorkerEngine<Consumer, IO, Inbox, Postgres>
 where
     Consumer: ConsumerIO,
-    IO: EngineIO<Consumer, Postgres>,
+    IO: EngineIO<Consumer>,
     Inbox: EngineInbox<Consumer>,
     Postgres: PostgresClient,
 {
@@ -85,7 +85,7 @@ pub struct EngineCounters {
 impl<Consumer, IO, Inbox, Postgres> WorkerEngine<Consumer, IO, Inbox, Postgres>
 where
     Consumer: ConsumerIO,
-    IO: EngineIO<Consumer, Postgres>,
+    IO: EngineIO<Consumer>,
     Inbox: EngineInbox<Consumer>,
     Postgres: PostgresClient,
 {

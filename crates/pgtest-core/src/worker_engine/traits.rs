@@ -11,7 +11,7 @@ pub trait ConsumerIO: Send + 'static {
     fn reply(self, msg: ConsumerReply) -> Result<(), ConsumerReply>;
 }
 
-pub trait EngineIO<C: ConsumerIO, P: PostgresClient> {
+pub trait EngineIO<C: ConsumerIO> {
     fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError>;
     fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError>;
 
