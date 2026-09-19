@@ -11,8 +11,6 @@ use crate::connection::{ClientStream, handle_connection};
 pub use crate::unix_listener::UnixWireListener;
 pub use crate::{connection::parse_connection_field, postgres_upstream::RawBytes};
 
-pub struct WireListener {}
-
 #[derive(Error, Debug)]
 pub enum WireError {
     #[error("failed to open wire listener: {0}")]
@@ -21,72 +19,66 @@ pub enum WireError {
 
 const DEFAULT_WIRE_PORT: u16 = 6432;
 
-#[hotpath::measure_all]
-impl WireListener {
-    #[hotpath::skip]
-    pub fn new() -> Self {
-        Self {}
-    }
+#[hotpath::measure]
+pub async fn run(manager: Arc<WorkerEngineManager>) -> Result<SocketAddr, WireError> {
+    let address = SocketAddr::from(([127, 0, 0, 1], DEFAULT_WIRE_PORT));
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let local_address = listener.local_addr()?;
 
-    pub async fn run(manager: Arc<WorkerEngineManager>) -> Result<SocketAddr, WireError> {
-        let address = SocketAddr::from(([127, 0, 0, 1], DEFAULT_WIRE_PORT));
-        let listener = tokio::net::TcpListener::bind(address).await?;
-        let local_address = listener.local_addr()?;
+    let mut pg_connection_sessions: JoinSet<()> = JoinSet::new();
 
-        let mut pg_connection_sessions: JoinSet<()> = JoinSet::new();
-
-        tokio::spawn(async move {
-            tracing::debug!("to wait connection");
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (stream, _peer) = match accepted {
-                            Ok(client) => client,
-                            Err(error) => {
-                                tracing::warn!("Unable to connect, failed due: {}", error);
-                                continue;
-                            }
-                        };
-
-                        pg_connection_sessions.spawn(handle_connection(ClientStream::Tcp(stream), manager.clone()));
-                    }
-                    Some(_finished) = pg_connection_sessions.join_next(), if !pg_connection_sessions.is_empty() => {}
-                }
-            }
-        });
-
-        Ok(local_address)
-    }
-
-    #[cfg(unix)]
-    pub async fn run_unix(
-        manager: Arc<WorkerEngineManager>,
-        directory: &std::path::Path,
-    ) -> Result<UnixWireListener, WireError> {
-        let listener = crate::unix_listener::BoundUnixListener::bind(directory, DEFAULT_WIRE_PORT)?;
-        let path = listener.path().to_owned();
-        let (stop, mut stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let mut sessions = JoinSet::new();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut stopped => break,
-                    Some(_finished) = sessions.join_next(), if !sessions.is_empty() => {}
-                    accepted = listener.accept() => {
-                        match accepted {
-                            Ok(stream) => {
-                                sessions.spawn(handle_connection(ClientStream::Unix(stream), manager.clone()));
-                            }
-                            Err(error) => tracing::warn!(%error, "failed to accept Unix connection"),
+    tokio::spawn(async move {
+        tracing::debug!("to wait connection");
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _peer) = match accepted {
+                        Ok(client) => client,
+                        Err(error) => {
+                            tracing::warn!("Unable to connect, failed due: {}", error);
+                            continue;
                         }
+                    };
+
+                    pg_connection_sessions.spawn(handle_connection(ClientStream::Tcp(stream), manager.clone()));
+                }
+                Some(_finished) = pg_connection_sessions.join_next(), if !pg_connection_sessions.is_empty() => {}
+            }
+        }
+    });
+
+    Ok(local_address)
+}
+
+#[cfg(unix)]
+#[hotpath::measure]
+pub async fn run_unix(
+    manager: Arc<WorkerEngineManager>,
+    directory: &std::path::Path,
+) -> Result<UnixWireListener, WireError> {
+    let listener = crate::unix_listener::BoundUnixListener::bind(directory, DEFAULT_WIRE_PORT)?;
+    let path = listener.path().to_owned();
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut sessions = JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stopped => break,
+                Some(_finished) = sessions.join_next(), if !sessions.is_empty() => {}
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok(stream) => {
+                            sessions.spawn(handle_connection(ClientStream::Unix(stream), manager.clone()));
+                        }
+                        Err(error) => tracing::warn!(%error, "failed to accept Unix connection"),
                     }
                 }
             }
-            sessions.shutdown().await;
-        });
-        Ok(UnixWireListener { task: Some(task), stop: Some(stop), path })
-    }
+        }
+        sessions.shutdown().await;
+    });
+    Ok(UnixWireListener { task: Some(task), stop: Some(stop), path })
 }
 
 #[cfg(test)]
@@ -97,7 +89,7 @@ mod listener_test {
     use pgtest_database_operations::testcontainer::pg_container_config;
     use tracing_test::traced_test;
 
-    use crate::wire_listener::WireListener;
+    use crate::wire_listener;
 
     #[cfg(unix)]
     #[tokio::test]
@@ -161,7 +153,7 @@ mod listener_test {
         let engine = Arc::new(
             WorkerEngineManager::start(pg_config, WorkerEngineConfig::default()).await.unwrap(),
         );
-        let listener = WireListener::run_unix(engine.clone(), &directory.0).await.unwrap();
+        let listener = wire_listener::run_unix(engine.clone(), &directory.0).await.unwrap();
         let socket_path = listener.path().to_owned();
         let mut config = tokio_postgres::Config::new();
         config.host_path(&directory.0).port(6432).user("postgres");
@@ -211,7 +203,7 @@ mod listener_test {
                 .expect("Manager started up"),
         );
 
-        let address = WireListener::run(engine.clone()).await.unwrap();
+        let address = wire_listener::run(engine.clone()).await.unwrap();
 
         let mut config = tokio_postgres::Config::new();
         config.host("127.0.0.1").port(address.port()).user("postgres");

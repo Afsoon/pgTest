@@ -111,12 +111,12 @@ impl Fixture {
         let mut seen = FxHashSet::default();
 
         let ids = inventory
-            .creating
+            .creating()
             .iter()
             .copied()
-            .chain(inventory.ready.iter().map(|database| database.database_id))
+            .chain(inventory.ready().iter().map(|database| database.database_id))
             .chain(self.engine.leases.values().map(|entry| entry.database.database_id))
-            .chain(inventory.retiring.keys().copied());
+            .chain(inventory.retiring().keys().copied());
 
         for database_id in ids {
             assert!(
@@ -193,13 +193,13 @@ async fn release_allows_new_attachments_while_cleanup_is_pending() {
     assert!(!next.cancellation.is_cancelled());
     assert!(fixture.engine.waiters.is_empty());
     assert_eq!(
-        fixture.engine.inventory.retiring.get(&old.database.database_id),
+        fixture.engine.inventory.retiring().get(&old.database.database_id),
         Some(&old.database.database_name)
     );
 
     fixture.finish_cleanup(old.database.database_id, Ok(())).await;
     fixture.process(vec![fixture.attach("test")]).await;
-    assert!(fixture.engine.inventory.retiring.is_empty());
+    assert!(fixture.engine.inventory.retiring().is_empty());
     assert!(!fixture.engine.leases.contains_key("test"));
     assert_eq!(fixture.engine.leases["next"].database.database_id, next_id);
     assert_eq!(fixture.engine.leases["next"].generation, next.generation);
@@ -225,14 +225,14 @@ async fn releasing_an_unseen_id_does_not_allocate_a_database() {
     let mut fixture =
         Fixture::new(WorkerEngineConfig { initial_slots: 1, ..WorkerEngineConfig::default() })
             .await;
-    let original = fixture.engine.inventory.ready[0].clone();
+    let original = fixture.engine.inventory.ready()[0].clone();
     fixture.process(vec![fixture.release("late"), fixture.attach("late")]).await;
 
     assert!(fixture.engine.leases.is_empty());
-    assert_eq!(fixture.engine.inventory.ready.len(), 1);
-    assert_eq!(fixture.engine.inventory.ready[0].database_id, original.database_id);
-    assert!(fixture.engine.inventory.creating.is_empty());
-    assert!(fixture.engine.inventory.retiring.is_empty());
+    assert_eq!(fixture.engine.inventory.ready().len(), 1);
+    assert_eq!(fixture.engine.inventory.ready()[0].database_id, original.database_id);
+    assert!(fixture.engine.inventory.creating().is_empty());
+    assert!(fixture.engine.inventory.retiring().is_empty());
     assert!(fixture.creation_ids().is_empty());
     assert!(fixture.io.operations.lock().unwrap().cleanups.is_empty());
     assert!(matches!(
@@ -333,7 +333,7 @@ async fn lost_release_reply_does_not_undo_closure_or_cleanup() {
     assert!(old.cancellation.is_cancelled());
     assert!(!fixture.engine.leases.contains_key("test"));
     assert_eq!(
-        fixture.engine.inventory.retiring.get(&old.database.database_id),
+        fixture.engine.inventory.retiring().get(&old.database.database_id),
         Some(&old.database.database_name)
     );
     let operations = fixture.io.operations.lock().unwrap();
@@ -390,7 +390,7 @@ async fn old_generation_events_and_cleanup_cannot_retire_a_reused_lease_id() {
     assert_eq!(fixture.engine.leases["test"].generation, new.generation);
     assert_eq!(fixture.engine.leases["test"].conns, 1);
     assert!(!new.cancellation.is_cancelled());
-    assert!(fixture.engine.inventory.retiring.is_empty());
+    assert!(fixture.engine.inventory.retiring().is_empty());
     assert_eq!(fixture.io.operations.lock().unwrap().cleanups.len(), 1);
 }
 
@@ -413,7 +413,7 @@ async fn duplicate_expiry_schedules_cleanup_only_once() {
         .await;
     assert!(fixture.engine.leases.is_empty());
     assert!(old.cancellation.is_cancelled());
-    assert_eq!(fixture.engine.inventory.retiring.len(), 1);
+    assert_eq!(fixture.engine.inventory.retiring().len(), 1);
     assert_eq!(fixture.io.operations.lock().unwrap().cleanups.len(), 1);
     assert_eq!(fixture.engine.counters.rejected_attach_max_lifetime, 1);
 }
@@ -459,9 +459,9 @@ async fn startup_does_not_prefill_beyond_initial_size() {
         ..WorkerEngineConfig::default()
     })
     .await;
-    assert_eq!(fixture.engine.inventory.ready.len(), 1);
-    assert!(fixture.engine.inventory.creating.is_empty());
-    assert!(fixture.engine.inventory.retiring.is_empty());
+    assert_eq!(fixture.engine.inventory.ready().len(), 1);
+    assert!(fixture.engine.inventory.creating().is_empty());
+    assert!(fixture.engine.inventory.retiring().is_empty());
     assert!(fixture.creation_ids().is_empty());
 }
 
@@ -475,9 +475,9 @@ async fn covered_burst_does_not_schedule_redundant_batches() {
     })
     .await;
     fixture.process(vec![fixture.attach("holder"), fixture.attach("a"), fixture.attach("b")]).await;
-    assert_eq!(fixture.engine.inventory.creating.len(), 4);
+    assert_eq!(fixture.engine.inventory.creating().len(), 4);
     assert_eq!(fixture.creation_ids(), (2..=5).map(DatabaseId).collect::<Vec<_>>());
-    assert!(fixture.engine.inventory.ready.is_empty());
+    assert!(fixture.engine.inventory.ready().is_empty());
     assert_eq!(fixture.consumer.messages().len(), 1);
 }
 
@@ -491,10 +491,10 @@ async fn excess_demand_grows_in_full_batches_before_any_completion() {
     })
     .await;
     fixture.process(vec![fixture.attach("holder")]).await;
-    assert_eq!(fixture.engine.inventory.creating.len(), 4);
+    assert_eq!(fixture.engine.inventory.creating().len(), 4);
     let burst = (0..10).map(|n| fixture.attach(&format!("waiting_{n}"))).collect();
     fixture.process(burst).await;
-    assert_eq!(fixture.engine.inventory.creating.len(), 12, "ten waiting leases plus reserve");
+    assert_eq!(fixture.engine.inventory.creating().len(), 12, "ten waiting leases plus reserve");
     assert_eq!(fixture.creation_ids(), (2..=13).map(DatabaseId).collect::<Vec<_>>());
     assert_eq!(fixture.engine.waiters.len(), 10);
     assert_eq!(fixture.consumer.messages().len(), 1, "no creation has completed yet");
@@ -511,7 +511,7 @@ async fn connections_for_one_lease_share_demand_and_one_completion() {
     .await;
     let burst = (0..20).map(|_| fixture.attach("shared")).collect();
     fixture.process(burst).await;
-    assert_eq!(fixture.engine.inventory.creating.len(), 4);
+    assert_eq!(fixture.engine.inventory.creating().len(), 4);
     assert_eq!(fixture.engine.waiters.len(), 1);
     let id = fixture.creation_ids()[0];
     fixture.finish_creation(id, Ok(ReadString::from("shared_database"))).await;
@@ -519,7 +519,7 @@ async fn connections_for_one_lease_share_demand_and_one_completion() {
     assert_eq!(fixture.engine.leases["shared"].conns, 20);
     assert_eq!(fixture.engine.leases["shared"].database.database_id, id);
     assert!(fixture.engine.waiters.is_empty());
-    assert_eq!(fixture.engine.inventory.creating.len(), 3);
+    assert_eq!(fixture.engine.inventory.creating().len(), 3);
 }
 
 #[tokio::test]
@@ -560,12 +560,12 @@ async fn settled_success_is_not_counted_as_both_ready_and_pending() {
     fixture.finish_creation(ids[0], Ok(ReadString::from("a_database"))).await;
     fixture.finish_creation(ids[1], Ok(ReadString::from("spare"))).await;
     fixture.finish_creation(ids[1], Ok(ReadString::from("duplicate"))).await;
-    assert!(fixture.engine.inventory.creating.is_empty());
-    assert_eq!(fixture.engine.inventory.ready.len(), 1);
-    assert_eq!(fixture.engine.inventory.ready[0].database_name, ReadString::from("spare"));
+    assert!(fixture.engine.inventory.creating().is_empty());
+    assert_eq!(fixture.engine.inventory.ready().len(), 1);
+    assert_eq!(fixture.engine.inventory.ready()[0].database_name, ReadString::from("spare"));
     fixture.process(vec![fixture.attach("b")]).await;
     assert_eq!(fixture.engine.leases["b"].database.database_id, ids[1]);
-    assert_eq!(fixture.engine.inventory.creating.len(), 2);
+    assert_eq!(fixture.engine.inventory.creating().len(), 2);
     assert_eq!(fixture.creation_ids().len(), 4);
 }
 
@@ -581,8 +581,8 @@ async fn failed_creation_keeps_waiter_and_replenishes_without_reusing_failed_ids
     fixture.process(vec![fixture.attach("a")]).await;
     let ids = fixture.creation_ids();
     fixture.finish_creation(ids[0], Err(creation_failure())).await;
-    assert_eq!(fixture.engine.inventory.creating.len(), 2);
-    assert!(!fixture.engine.inventory.creating.contains(&ids[0]));
+    assert_eq!(fixture.engine.inventory.creating().len(), 2);
+    assert!(!fixture.engine.inventory.creating().contains(&ids[0]));
     assert!(fixture.engine.leases.is_empty());
     assert_eq!(fixture.engine.waiters.len(), 1);
     assert!(fixture.consumer.messages().is_empty());
@@ -597,7 +597,7 @@ async fn failed_creation_keeps_waiter_and_replenishes_without_reusing_failed_ids
     assert_eq!(fixture.engine.leases["a"].database.database_id, all_ids[2]);
     assert_eq!(fixture.consumer.messages().len(), 1);
     assert!(fixture.engine.waiters.is_empty());
-    assert_eq!(fixture.engine.inventory.creating.len(), 1, "a spare is still being created");
+    assert_eq!(fixture.engine.inventory.creating().len(), 1, "a spare is still being created");
 }
 
 fn creation_failure() -> PostgresDDLClientError {
@@ -624,12 +624,16 @@ async fn retiring_databases_do_not_count_as_supply_for_waiters() {
             fixture.attach("waiting"),
         ])
         .await;
-    assert_eq!(fixture.engine.inventory.retiring.len(), 1);
-    assert_eq!(fixture.engine.inventory.creating.len(), 2, "waiter plus spare, excluding cleanup");
+    assert_eq!(fixture.engine.inventory.retiring().len(), 1);
+    assert_eq!(
+        fixture.engine.inventory.creating().len(),
+        2,
+        "waiter plus spare, excluding cleanup"
+    );
     assert_eq!(fixture.creation_ids(), vec![DatabaseId(3), DatabaseId(4)]);
     fixture.finish_creation(DatabaseId(3), Ok(ReadString::from("waiting_database"))).await;
     assert_eq!(fixture.engine.leases["waiting"].database.database_id, DatabaseId(3));
-    assert!(fixture.engine.inventory.retiring.contains_key(&old.database.database_id));
+    assert!(fixture.engine.inventory.retiring().contains_key(&old.database.database_id));
 }
 
 #[tokio::test]
@@ -686,7 +690,7 @@ async fn expired_groups_do_not_inflate_growth_demand() {
             fixture.attach("live"),
         ])
         .await;
-    assert_eq!(fixture.engine.inventory.creating.len(), 2, "one live lease plus one spare");
+    assert_eq!(fixture.engine.inventory.creating().len(), 2, "one live lease plus one spare");
     let id = fixture.creation_ids()[0];
     fixture.finish_creation(id, Ok(ReadString::from("live_database"))).await;
     assert!(fixture.engine.leases.contains_key("live"));
@@ -710,7 +714,7 @@ async fn failed_creation_submission_releases_reservation_without_retrying_inline
         .push_back(Err(IOError::FailedToSendTheMessage));
     fixture.process(vec![fixture.attach("a")]).await;
     let rejected_id = fixture.creation_ids()[0];
-    assert!(fixture.engine.inventory.creating.is_empty());
+    assert!(fixture.engine.inventory.creating().is_empty());
     assert_eq!(fixture.creation_ids().len(), 1);
     assert_eq!(fixture.engine.counters.unable_to_start_database_slots, 1);
     assert_eq!(fixture.engine.waiters.len(), 1);
@@ -743,7 +747,7 @@ async fn repeated_submission_failure_does_not_loop_or_accumulate_reservations() 
         .extend((0..3).map(|_| Err(IOError::FailedToSendTheMessage)));
     for expected in 1..=3 {
         fixture.process(vec![fixture.attach("a")]).await;
-        assert!(fixture.engine.inventory.creating.is_empty());
+        assert!(fixture.engine.inventory.creating().is_empty());
         assert_eq!(fixture.creation_ids().len(), expected);
         assert_eq!(fixture.engine.waiters.len(), 1);
     }
@@ -765,10 +769,66 @@ async fn unknown_creation_completion_cannot_supply_a_database() {
     let requested = fixture.creation_ids();
     fixture.finish_creation(DatabaseId(999), Ok(ReadString::from("unrequested"))).await;
     assert!(fixture.engine.leases.is_empty());
-    assert!(fixture.engine.inventory.ready.is_empty());
+    assert!(fixture.engine.inventory.ready().is_empty());
     assert_eq!(fixture.creation_ids(), requested);
-    assert_eq!(fixture.engine.inventory.creating.len(), requested.len());
+    assert_eq!(fixture.engine.inventory.creating().len(), requested.len());
     assert_eq!(fixture.engine.waiters.len(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_creation_completions_cannot_restore_an_assigned_database() {
+    let mut fixture = Fixture::new(WorkerEngineConfig {
+        initial_slots: 0,
+        starvation_threshold: 0,
+        grow_batch_size: 1,
+        ..WorkerEngineConfig::default()
+    })
+    .await;
+    fixture.process(vec![fixture.attach("holder")]).await;
+    let database_id = fixture.creation_ids()[0];
+    fixture.finish_creation(database_id, Ok(ReadString::from("assigned"))).await;
+    let requested = fixture.creation_ids();
+
+    fixture.finish_creation(database_id, Ok(ReadString::from("duplicate"))).await;
+    fixture
+        .finish_creation(
+            database_id,
+            Err(PostgresDDLClientError::NonRecoverableError("stale failure".into())),
+        )
+        .await;
+
+    let assigned = &fixture.engine.leases["holder"].database;
+    assert_eq!(assigned.database_id, database_id);
+    assert_eq!(assigned.database_name, ReadString::from("assigned"));
+    assert!(fixture.engine.inventory.ready().is_empty());
+    assert_eq!(fixture.engine.inventory.creating().len(), 1, "only the spare is pending");
+    assert_eq!(fixture.creation_ids(), requested);
+    assert_eq!(fixture.engine.counters.template_create_failures, 0);
+}
+
+#[tokio::test]
+async fn cleanup_completions_cannot_remove_ready_or_assigned_databases() {
+    let mut fixture = Fixture::new(WorkerEngineConfig {
+        initial_slots: 1,
+        grow_batch_size: 0,
+        ..WorkerEngineConfig::default()
+    })
+    .await;
+    let database_id = fixture.engine.inventory.ready()[0].database_id;
+    fixture.finish_cleanup(database_id, Ok(())).await;
+    assert_eq!(fixture.engine.inventory.ready()[0].database_id, database_id);
+
+    fixture.process(vec![fixture.attach("holder")]).await;
+    fixture.finish_cleanup(database_id, Ok(())).await;
+    assert_eq!(fixture.engine.leases["holder"].database.database_id, database_id);
+
+    fixture.process(vec![fixture.release("holder")]).await;
+    assert!(fixture.engine.inventory.retiring().contains_key(&database_id));
+    fixture.finish_cleanup(database_id, Ok(())).await;
+    fixture.finish_cleanup(database_id, Ok(())).await;
+    assert!(fixture.engine.inventory.retiring().is_empty());
+    assert_eq!(fixture.engine.inventory.supply_len(), 0);
+    assert_eq!(fixture.io.operations.lock().unwrap().cleanups.len(), 1);
 }
 
 #[tokio::test]
@@ -804,7 +864,7 @@ async fn cleanup_failure_retains_database_identity_without_blocking_creation() {
                 .await;
         }
         assert_eq!(
-            fixture.engine.inventory.retiring.get(&old.database_id),
+            fixture.engine.inventory.retiring().get(&old.database_id),
             Some(&old.database_name)
         );
         let new_id = fixture.creation_ids()[0];
@@ -827,8 +887,8 @@ async fn zero_batch_size_disables_growth() {
     })
     .await;
     fixture.process(vec![fixture.attach("a"), fixture.attach("b")]).await;
-    assert!(fixture.engine.inventory.ready.is_empty());
-    assert!(fixture.engine.inventory.creating.is_empty());
+    assert!(fixture.engine.inventory.ready().is_empty());
+    assert!(fixture.engine.inventory.creating().is_empty());
     assert!(fixture.creation_ids().is_empty());
     assert_eq!(fixture.engine.waiters.len(), 2);
 }

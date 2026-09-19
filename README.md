@@ -105,7 +105,7 @@ queue wait, connection opening, and validation performed by SQLx. Acquisition
 errors retain the same retry handling as query errors. Set `HOTPATH_LIMIT=0` to
 show all measured functions, including these acquisition timings.
 
-`PostgresUpstream::connect` includes three separately measured stages:
+`postgres_upstream::connect` includes three separately measured stages:
 `connect_stream` opens the configured transport (`connect_tcp` also measures TCP
 connection setup and sets TCP_NODELAY); `authenticate` sends
 Startup and waits for AuthenticationOk; `wait_for_ready_for_query` consumes the
@@ -190,14 +190,14 @@ See node-postgres's [Unix socket configuration](https://node-postgres.com/featur
 Unix connections use plaintext PostgreSQL startup; configure clients with SSL
 disabled. They replace the test-to-proxy TCP hop. The upstream transport is chosen
 independently through `PGTEST_PG_HOST`; it can use TCP or a Unix socket and performs
-the existing startup exchange. The reported `PostgresUpstream::connect_stream`
+the existing startup exchange. The reported `postgres_upstream::connect_stream`
 timing measures that upstream hop, not the frontend handshake eliminated here.
 
 The server removes its socket on Ctrl-C. Binding fails if the path already exists;
 it never removes an existing socket or regular file to make room. After abnormal
 termination, choose a fresh directory or confirm the old server has stopped
 before removing its stale socket. Library users keep the handle returned by
-`WireListener::run_unix` alive and call `shutdown().await` for completed cleanup.
+`wire_listener::run_unix` alive and call `shutdown().await` for completed cleanup.
 
 ## Historical attachment-window metrics
 

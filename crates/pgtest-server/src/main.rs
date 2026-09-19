@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use envconfig::Envconfig;
 use pgtest::{worker_engine::core::WorkerEngineConfig, worker_manager::WorkerEngineManager};
 use pgtest_database_operations::manager::config::PostgresConfig;
-use pgtest_pg_wire::wire_listener::WireListener;
+use pgtest_pg_wire::wire_listener;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 #[derive(Envconfig)]
@@ -48,12 +48,12 @@ async fn main() -> Result<()> {
             |()| anyhow!("failed to start worker engine manager; see logs for details"),
         )?);
     let address =
-        WireListener::run(engine.clone()).await.context("failed to start wire listener")?;
+        wire_listener::run(engine.clone()).await.context("failed to start wire listener")?;
     tracing::info!(%address, "pgtest server listening");
 
     #[cfg(unix)]
     let unix_listener = if let Some(directory) = &server_config.unix_socket_dir {
-        let listener = WireListener::run_unix(engine, directory)
+        let listener = wire_listener::run_unix(engine, directory)
             .await
             .context("failed to start Unix wire listener")?;
         tracing::info!(path = %listener.path().display(), "pgtest Unix socket listening");

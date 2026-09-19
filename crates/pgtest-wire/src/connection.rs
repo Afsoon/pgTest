@@ -16,8 +16,7 @@ use tokio_util::codec::Framed;
 
 use crate::{
     control_panel::{self, PgTestQueryTypeControlStatement},
-    postgres_upstream::PostgresUpstream,
-    session_relay::SessionRelay,
+    postgres_upstream, session_relay,
 };
 
 pub(crate) type ClientConnection =
@@ -125,7 +124,7 @@ pub(crate) async fn handle_connection(stream: ClientStream, manager: Arc<WorkerE
             reject_connection(&mut framed, "55000", "lease was closed during connection startup").await;
             return;
         }
-        result = PostgresUpstream::connect(
+        result = postgres_upstream::connect(
             &lease_session.database_name,
             params,
             &manager.pg_client.host,
@@ -139,7 +138,7 @@ pub(crate) async fn handle_connection(stream: ClientStream, manager: Arc<WorkerE
         }
     };
     let parts = framed.into_parts();
-    let _ = SessionRelay::run(parts.io, upstream_session, parts.read_buf, lease_session).await;
+    let _ = session_relay::run(parts.io, upstream_session, parts.read_buf, lease_session).await;
 }
 
 #[hotpath::measure]

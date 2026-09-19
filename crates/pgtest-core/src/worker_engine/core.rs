@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::worker_engine::{
     database_inventory::{Database, DatabaseInventory},
-    database_jobs::{CleanupDatabase, DatabaseWorkerMessages},
+    database_jobs::DatabaseWorkerMessages,
     errors::{AttachError, ReleaseError},
     messages::{ConsumerReply, EngineMessage},
     traits::{ConsumerIO, EngineIO, EngineInbox, PostgresClient},
@@ -123,28 +123,17 @@ where
 
             let result = self.pg_client.create_database().await;
 
-            self.inventory.creating.remove(&database_id);
-
-            match result {
-                Ok(database_name) => {
-                    tracing::info!(
-                        ?database_id,
-                        %database_name,
-                        "created initial database"
-                    );
-
-                    self.inventory.ready.push_back(Database { database_id, database_name });
-                }
-                Err(error) => {
-                    tracing::error!(
-                        ?database_id,
-                        %error,
-                        "initial database creation failed"
-                    );
-
-                    panic!("failed to create the initial batch of databases");
-                }
-            };
+            if let Ok(database_name) = &result {
+                tracing::info!(?database_id, %database_name, "created initial database");
+            }
+            if let Err(error) = self
+                .inventory
+                .complete_creation(database_id, result)
+                .expect("initial creation must have a pending reservation")
+            {
+                tracing::error!(?database_id, %error, "initial database creation failed");
+                panic!("failed to create the initial batch of databases");
+            }
         }
     }
 
@@ -202,46 +191,27 @@ where
     fn handle_database_worker_message(&mut self, message: DatabaseWorkerMessages) {
         match message {
             DatabaseWorkerMessages::CreationFinished { database_id, result } => {
-                if !self.inventory.creating.remove(&database_id) {
-                    tracing::warn!(?database_id, "cretion result without a pending reservation");
+                let Some(result) = self.inventory.complete_creation(database_id, result) else {
+                    tracing::warn!(?database_id, "creation result without a pending reservation");
                     return;
-                }
+                };
 
-                match result {
-                    Ok(database_name) => {
-                        self.inventory.ready.push_back(Database { database_id, database_name });
-                    }
-                    Err(error) => {
-                        self.counters.template_create_failures += 1;
-
-                        tracing::error!(
-                            ?database_id,
-                            %error,
-                            "database creation failed"
-                        );
-                    }
+                if let Err(error) = result {
+                    self.counters.template_create_failures += 1;
+                    tracing::error!(?database_id, %error, "database creation failed");
                 }
 
                 self.dispatch_waiters();
                 self.grow();
             }
             DatabaseWorkerMessages::CleanupFinished { database_id, result } => {
-                if !self.inventory.retiring.contains_key(&database_id) {
+                let Some(result) = self.inventory.complete_cleanup(database_id, result) else {
                     tracing::warn!(?database_id, "cleanup result without a retirement record");
                     return;
-                }
+                };
 
-                match result {
-                    Ok(()) => {
-                        self.inventory.retiring.remove(&database_id);
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            ?database_id,
-                            %error,
-                            "database cleanup failed; retaining retirement record"
-                        )
-                    }
+                if let Err(error) = result {
+                    tracing::error!(?database_id, %error, "database cleanup failed; retaining retirement record");
                 }
             }
         }
@@ -300,7 +270,7 @@ where
             return;
         }
 
-        let Some(database) = self.inventory.ready.pop_front() else {
+        let Some(database) = self.inventory.take_ready() else {
             if !self.group_waiters.contains_key(&lease) {
                 self.waiters.push_back(lease.clone());
             }
@@ -321,7 +291,7 @@ where
 
     #[hotpath::measure]
     fn dispatch_waiters(&mut self) {
-        while !self.inventory.ready.is_empty() {
+        while !self.inventory.ready().is_empty() {
             let Some(lease) = self.waiters.pop_front() else {
                 break;
             };
@@ -353,8 +323,7 @@ where
                     None => {
                         let database = self
                             .inventory
-                            .ready
-                            .pop_front()
+                            .take_ready()
                             .expect("dispatch requires a ready database");
 
                         self.assign_database(&lease, database)
@@ -395,7 +364,7 @@ where
         }
         let entry = self.leases.remove(lease).unwrap();
         entry.cancellation.cancel();
-        self.inventory.ready.push_front(entry.database);
+        self.inventory.return_ready(entry.database);
 
         true
     }
@@ -469,7 +438,7 @@ where
             let database_id = request.database_id;
 
             if let Err(error) = self.engine_io.request_creation(request) {
-                self.inventory.creating.remove(&database_id);
+                self.inventory.cancel_creation(database_id);
                 self.counters.unable_to_start_database_slots += 1;
 
                 tracing::error!(
@@ -491,11 +460,8 @@ where
 
         entry.cancellation.cancel();
 
-        let Database { database_id, database_name } = entry.database;
-
-        self.inventory.retiring.insert(database_id, database_name.clone());
-
-        let request = CleanupDatabase { database_id, database_name };
+        let request = self.inventory.retire(entry.database);
+        let database_id = request.database_id;
 
         if let Err(error) = self.engine_io.request_cleanup(request) {
             tracing::error!(?database_id, %lease, %error, "unable to enqueue cleanup; retaining retirement record")

@@ -48,7 +48,7 @@ mod worker_engine_test {
                 .leases
                 .values()
                 .map(|entry| &entry.database)
-                .chain(outcome.inventory.ready.iter())
+                .chain(outcome.inventory.ready().iter())
                 .collect();
             databases.sort_by_key(|database| database.database_id.0);
 
@@ -72,7 +72,7 @@ mod worker_engine_test {
         };
         assert_eq!(outcome.leases["first"].database.database_name, *database_name);
         assert_eq!(outcome.leases["first"].database.database_id, DatabaseId(1));
-        assert_eq!(outcome.inventory.ready.len(), 3);
+        assert_eq!(outcome.inventory.ready().len(), 3);
         assert!(!cancellation.is_cancelled(), "pumping a fake inbox must not shut down sessions");
     }
 
@@ -87,8 +87,8 @@ mod worker_engine_test {
         .await
         .unwrap();
         assert_eq!(outcome.leases.len(), 3);
-        assert_eq!(outcome.inventory.ready.len(), 5);
-        assert!(outcome.inventory.creating.is_empty());
+        assert_eq!(outcome.inventory.ready().len(), 5);
+        assert!(outcome.inventory.creating().is_empty());
     }
 
     #[tokio::test]
@@ -109,7 +109,7 @@ mod worker_engine_test {
         }
         assert_eq!(outcome.leases.len(), 1);
         assert_eq!(outcome.leases["shared"].conns, 2);
-        assert_eq!(outcome.inventory.ready.len(), 3);
+        assert_eq!(outcome.inventory.ready().len(), 3);
         assert!(outcome.waiters.is_empty());
     }
 
@@ -125,8 +125,8 @@ mod worker_engine_test {
         .unwrap();
         assert_eq!(outcome.leases["shared"].conns, 1);
         assert_eq!(outcome.leases["shared"].database.database_id, DatabaseId(1));
-        assert_eq!(outcome.inventory.ready.len(), 3);
-        assert!(outcome.inventory.retiring.is_empty());
+        assert_eq!(outcome.inventory.ready().len(), 3);
+        assert!(outcome.inventory.retiring().is_empty());
         assert_eq!(outcome.counters.detach_on_zero, 0);
     }
 
@@ -142,8 +142,8 @@ mod worker_engine_test {
         .unwrap();
         assert_eq!(outcome.leases["first"].conns, 0);
         assert_eq!(outcome.leases["first"].database.database_id, DatabaseId(1));
-        assert_eq!(outcome.inventory.ready.len(), 3);
-        assert!(outcome.inventory.retiring.is_empty());
+        assert_eq!(outcome.inventory.ready().len(), 3);
+        assert!(outcome.inventory.retiring().is_empty());
         assert_eq!(outcome.counters.detach_on_zero, 1);
     }
 
@@ -156,7 +156,7 @@ mod worker_engine_test {
         .await
         .unwrap();
         assert!(outcome.leases.is_empty());
-        assert_eq!(outcome.inventory.ready.len(), 4);
+        assert_eq!(outcome.inventory.ready().len(), 4);
         assert_eq!(outcome.counters.detach_on_zero, 0);
     }
 
@@ -205,8 +205,8 @@ mod worker_engine_test {
         }));
         let outcome = EngineSimulator::run(messages).await.unwrap();
         assert_eq!(outcome.leases.len(), 4);
-        assert_eq!(outcome.inventory.ready.len(), 4);
-        assert!(outcome.inventory.ready.iter().any(|db| db.database_id == DatabaseId(5)));
+        assert_eq!(outcome.inventory.ready().len(), 4);
+        assert!(outcome.inventory.ready().iter().any(|db| db.database_id == DatabaseId(5)));
         assert_eq!(outcome.counters.waiter_timeouts, 2);
         assert!(outcome.waiters.is_empty());
         assert_eq!(consumer.messages().len(), 4);
@@ -248,7 +248,7 @@ mod worker_engine_test {
         assert!(!new_cancel.is_cancelled());
         assert_eq!(outcome.leases["test"].database.database_name, *new_name);
         assert_eq!(outcome.counters.rejected_attach_max_lifetime, 1);
-        assert!(outcome.inventory.retiring.is_empty());
+        assert!(outcome.inventory.retiring().is_empty());
     }
 
     #[tokio::test]
@@ -287,7 +287,7 @@ mod worker_engine_test {
         assert_eq!(outcome.leases["waiting"].database.database_id, DatabaseId(2));
         assert!(outcome.waiters.is_empty());
         assert_eq!(consumer.messages().len(), 1);
-        assert_eq!(outcome.inventory.ready.len(), 1);
+        assert_eq!(outcome.inventory.ready().len(), 1);
     }
 
     #[tokio::test]
@@ -298,8 +298,8 @@ mod worker_engine_test {
         let outcome = EngineSimulator::run(messages).await.unwrap();
         assert_eq!(outcome.leases["shared"].conns, 2);
         assert_eq!(outcome.leases["shared"].database.database_id, DatabaseId(5));
-        assert_eq!(outcome.inventory.ready.len(), 3);
-        assert!(outcome.inventory.ready.iter().any(|db| db.database_id == DatabaseId(6)));
+        assert_eq!(outcome.inventory.ready().len(), 3);
+        assert!(outcome.inventory.ready().iter().any(|db| db.database_id == DatabaseId(6)));
         assert!(outcome.waiters.is_empty());
         assert_eq!(consumer.messages().len(), 6);
     }
@@ -315,10 +315,10 @@ mod worker_engine_test {
         .await
         .unwrap();
         assert_eq!(
-            outcome.inventory.ready.iter().map(|db| db.database_id).collect::<Vec<_>>(),
+            outcome.inventory.ready().iter().map(|db| db.database_id).collect::<Vec<_>>(),
             (4..=8).map(DatabaseId).collect::<Vec<_>>()
         );
-        assert!(outcome.inventory.creating.is_empty());
+        assert!(outcome.inventory.creating().is_empty());
     }
 
     #[tokio::test]
@@ -338,7 +338,7 @@ mod worker_engine_test {
             assert_eq!(outcome.leases["shared"].conns, 2);
             assert!(!outcome.leases["shared"].cancellation.is_cancelled());
             assert!(outcome.waiters.is_empty());
-            assert!(outcome.inventory.retiring.is_empty());
+            assert!(outcome.inventory.retiring().is_empty());
         }
     }
 
@@ -352,9 +352,9 @@ mod worker_engine_test {
             let outcome = EngineSimulator::run(messages).await.unwrap();
             assert!(!outcome.leases.contains_key("unreachable"));
             assert!(outcome.waiters.is_empty());
-            assert!(outcome.inventory.retiring.is_empty());
+            assert!(outcome.inventory.retiring().is_empty());
             let unused_id = DatabaseId(if queued { 5 } else { 1 });
-            assert!(outcome.inventory.ready.iter().any(|db| db.database_id == unused_id));
+            assert!(outcome.inventory.ready().iter().any(|db| db.database_id == unused_id));
             assert_eq!(consumer.messages().len(), if queued { 4 } else { 0 });
         }
     }
@@ -371,15 +371,15 @@ mod grow_test {
     #[tokio::test]
     async fn later_growth_recovers_after_submission_failure_with_a_fresh_id() {
         let (mut worker, io) = run_grow(vec![Err(IOError::FailedToSendTheMessage), Ok(())]).await;
-        assert!(worker.inventory.creating.is_empty());
-        assert_eq!(worker.inventory.ready.len(), 1);
+        assert!(worker.inventory.creating().is_empty());
+        assert_eq!(worker.inventory.ready().len(), 1);
         assert_eq!(worker.counters.unable_to_start_database_slots, 1);
         assert_eq!(io.remaining(), 1, "submission failure must not retry inline");
 
         worker.grow();
         worker.process_messages().await;
         assert_eq!(
-            worker.inventory.ready.iter().map(|db| db.database_id).collect::<Vec<_>>(),
+            worker.inventory.ready().iter().map(|db| db.database_id).collect::<Vec<_>>(),
             vec![DatabaseId(1), DatabaseId(3)]
         );
         assert_eq!(io.remaining(), 0);
@@ -393,8 +393,8 @@ mod grow_test {
             Err(IOError::FailedToSendTheMessage),
         ])
         .await;
-        assert!(worker.inventory.creating.is_empty());
-        assert_eq!(worker.inventory.ready.len(), 1);
+        assert!(worker.inventory.creating().is_empty());
+        assert_eq!(worker.inventory.ready().len(), 1);
         assert_eq!(worker.counters.unable_to_start_database_slots, 1);
         assert_eq!(io.remaining(), 2, "one attempt per growth event");
     }
@@ -412,10 +412,10 @@ mod grow_test {
         )
         .await;
         assert_eq!(
-            worker.inventory.ready.iter().map(|db| db.database_id).collect::<Vec<_>>(),
+            worker.inventory.ready().iter().map(|db| db.database_id).collect::<Vec<_>>(),
             vec![DatabaseId(1), DatabaseId(2), DatabaseId(3)]
         );
-        assert!(worker.inventory.creating.is_empty());
+        assert!(worker.inventory.creating().is_empty());
         assert_eq!(io.remaining(), 0);
     }
 
@@ -431,9 +431,9 @@ mod grow_test {
             vec![Ok(()), Ok(()), Ok(()), Ok(())],
         )
         .await;
-        assert_eq!(worker.inventory.ready.len(), 7);
-        assert_eq!(worker.inventory.ready.back().unwrap().database_id, DatabaseId(7));
-        assert!(worker.inventory.creating.is_empty());
+        assert_eq!(worker.inventory.ready().len(), 7);
+        assert_eq!(worker.inventory.ready().back().unwrap().database_id, DatabaseId(7));
+        assert!(worker.inventory.creating().is_empty());
         assert_eq!(io.remaining(), 0);
     }
 
@@ -449,8 +449,8 @@ mod grow_test {
             vec![],
         )
         .await;
-        assert_eq!(worker.inventory.ready.len(), 4);
-        assert!(worker.inventory.creating.is_empty());
+        assert_eq!(worker.inventory.ready().len(), 4);
+        assert!(worker.inventory.creating().is_empty());
         assert_eq!(io.remaining(), 0);
     }
 }

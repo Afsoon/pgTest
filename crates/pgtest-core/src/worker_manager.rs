@@ -401,7 +401,7 @@ mod worker_engine_manager_test {
         assert_eq!(snapshot.leases.get(&lease).expect("lease must remain assigned").conns, 0);
         assert_eq!(snapshot.leases.len(), 1);
         assert_eq!(
-            snapshot.inventory.ready.len(),
+            snapshot.inventory.ready().len(),
             usize::from(WorkerEngineConfig::default().initial_slots - 1)
         );
 
@@ -442,7 +442,7 @@ mod worker_engine_manager_test {
         assert_eq!(snapshot.leases.len(), 1);
         assert_eq!(snapshot.leases[&lease].conns, 1);
         assert_eq!(
-            snapshot.inventory.ready.len(),
+            snapshot.inventory.ready().len(),
             usize::from(WorkerEngineConfig::default().initial_slots - 1)
         );
     }
@@ -533,10 +533,10 @@ mod worker_engine_manager_test {
         let snapshot = engine.snapshot();
         assert!(snapshot.leases.is_empty());
         assert!(snapshot.waiters.is_empty(), "creation must skip the closed reply channel");
-        assert_eq!(snapshot.inventory.ready.len(), 1);
-        assert_eq!(snapshot.inventory.ready[0].database_name, created);
+        assert_eq!(snapshot.inventory.ready().len(), 1);
+        assert_eq!(snapshot.inventory.ready()[0].database_name, created);
         assert_ne!(created, original_database);
-        assert_eq!(snapshot.inventory.retiring.len(), 1, "cleanup has not completed");
+        assert_eq!(snapshot.inventory.retiring().len(), 1, "cleanup has not completed");
     }
 
     #[tokio::test]
@@ -573,8 +573,8 @@ mod worker_engine_manager_test {
             snapshot.leases[&waiting].database.database_name,
             received_session.database_name
         );
-        assert_eq!(snapshot.inventory.retiring.len(), 1, "attachment did not wait for cleanup");
-        assert_eq!(snapshot.inventory.ready.len(), 0);
+        assert_eq!(snapshot.inventory.retiring().len(), 1, "attachment did not wait for cleanup");
+        assert_eq!(snapshot.inventory.ready().len(), 0);
         drop(received_session);
     }
 
@@ -615,9 +615,9 @@ mod worker_engine_manager_test {
         let snapshot = engine.snapshot();
         assert!(snapshot.leases.is_empty());
         assert!(snapshot.waiters.is_empty());
-        assert_eq!(snapshot.inventory.ready[0].database_name, created);
+        assert_eq!(snapshot.inventory.ready()[0].database_name, created);
         assert_ne!(created, original_database);
-        assert_eq!(snapshot.inventory.ready.len(), 1);
+        assert_eq!(snapshot.inventory.ready().len(), 1);
     }
 
     #[tokio::test]
