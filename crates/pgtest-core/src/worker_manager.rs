@@ -4,9 +4,7 @@ use std::{
 };
 
 use hotpath::wrap::tokio::sync::mpsc::UnboundedSender;
-use pgtest_database_operations::manager::{
-    PostgresManager, config::PostgresConfig, errors::PostgresClientError,
-};
+use pgtest_database_operations::manager::{PostgresManager, config::PostgresConfig};
 use tokio::time::timeout_at;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -16,19 +14,21 @@ use crate::{
         errors::{AttachError, ReleaseError},
         messages::{ConsumerReply, EngineMessage},
     },
-    worker_manager::{
-        database_cleanup_worker::DatabaseCleanupWorker,
-        database_creation_worker::DatabaseCreationWorker,
-        worker_io::{
-            ConsumerWorker, DatabaseWorkerSenders, LeaseSession, ManagerReply, WorkerEngineIO,
-            WorkerEngineInbox,
-        },
+    worker_manager::worker_io::{
+        ConsumerWorker, LeaseSession, ManagerReply, WorkerEngineIO, WorkerEngineInbox,
     },
 };
 
 mod database_cleanup_worker;
 mod database_creation_worker;
+mod startup;
 pub mod worker_io;
+
+#[cfg(test)]
+use self::{
+    database_cleanup_worker::DatabaseCleanupWorker,
+    database_creation_worker::DatabaseCreationWorker, worker_io::DatabaseWorkerSenders,
+};
 
 #[cfg(test)]
 mod cleanup_tests;
@@ -59,119 +59,8 @@ impl WorkerEngineManager {
             return Err(());
         }
 
-        let postgres_client = match PostgresManager::start(postgres_config).await {
-            Ok(pg_client) => Arc::new(pg_client),
-            Err(error @ PostgresClientError::InvalidPoolSize(_)) => {
-                tracing::error!(%error, "invalid PostgreSQL pool configuration");
-                return Err(());
-            }
-            Err(PostgresClientError::DatabaseDoesNotExist(database_name)) => {
-                tracing::error!(
-                    "pgTest couldn't find {database_name} database to be used as template"
-                );
-                return Err(());
-            }
-            Err(PostgresClientError::UnsupportedVersion(version)) => {
-                tracing::error!(
-                    "The minimal version supported by pgTest is PostgreSQL 13; Detected \
-                     PostgresSQL {version}"
-                );
-                return Err(());
-            }
-            Err(PostgresClientError::UnableToFetchPostgresVersion) => {
-                tracing::error!(
-                    "pgTest failed to query the Postgres version; Query used \"SELECT \
-                     current_setting('server_version_num')::int8\" "
-                );
-                return Err(());
-            }
-            Err(PostgresClientError::UnableToFetchDatabaseList) => {
-                tracing::error!(
-                    "pgTest failed to query all databases created in Postgres; Query used \
-                     \"SELECT datname from pg_database WHERE datname LIKE $1\" "
-                );
-                return Err(());
-            }
-            Err(PostgresClientError::UnableToConnectToPostgres(connection_string)) => {
-                tracing::error!(
-                    "Unable to connect using this connection string \"{connection_string}\" "
-                );
-                return Err(());
-            }
-            Err(PostgresClientError::UnexpectedServerVersionFormatFetched(server_version)) => {
-                tracing::error!(
-                    "The version query by pgTest have an unexpected format. The value obtained is \
-                     {server_version}. Please report this as a bug"
-                );
-                return Err(());
-            }
-        };
-
-        // Keep the large, instrumented startup futures out of this future's
-        // inline state; nested profiling wrappers otherwise overflow the stack.
-        let _ = Box::pin(postgres_client.drop_ddl_templates_like()).await;
-
-        let (inbox_tx, inbox_rx) =
-            hotpath::channel!(tokio::sync::mpsc::unbounded_channel(), label = "worker-inbox");
-
-        let timeout_claim = worker_engine_config.lease_claim_timeout_ms.clone();
-
-        let tracker = TaskTracker::new();
-        let shutdown_token = CancellationToken::new();
-
-        let (database_worker_senders, creation_rx, cleanup_rx) =
-            DatabaseWorkerSenders::init_database_worker_channels();
-
-        let creation_worker = DatabaseCreationWorker::new(
-            inbox_tx.clone(),
-            tracker.clone(),
-            shutdown_token.clone(),
-            postgres_client.clone(),
-            creation_rx,
-        );
-
-        let cleanup_worker = DatabaseCleanupWorker::new(
-            inbox_tx.clone(),
-            tracker.clone(),
-            shutdown_token.clone(),
-            postgres_client.clone(),
-            cleanup_rx,
-        );
-
-        let worker_engine_inbox = WorkerEngineInbox::new(inbox_rx);
-
-        let worker_engine_io = WorkerEngineIO::new(
-            inbox_tx.clone(),
-            tracker.clone(),
-            shutdown_token.clone(),
-            database_worker_senders,
-        );
-
-        let mut worker_engine: WorkerEngineType = WorkerEngine::new(
-            worker_engine_config,
-            postgres_client.clone(),
-            worker_engine_io,
-            worker_engine_inbox,
-        );
-
-        Box::pin(worker_engine.try_init()).await;
-
-        tracker.spawn(creation_worker.run());
-        tracker.spawn(cleanup_worker.run());
-
-        let engine_handle = tokio::spawn(async move {
-            worker_engine.run().await;
-            worker_engine
-        });
-
-        Ok(Self {
-            worker_inbox_tx: inbox_tx.clone(),
-            pg_client: postgres_client,
-            lease_claim_timeout: timeout_claim,
-            engine_handle,
-            tracker,
-            shutdown_token,
-        })
+        let postgres_client = startup::prepare_postgres(postgres_config).await?;
+        Ok(startup::start_workers(postgres_client, worker_engine_config).await)
     }
 
     #[hotpath::measure]
