@@ -34,11 +34,11 @@
 !apps/**/
 !apps/**/*.rs
 
-!example/
-!example/example-js-containers/
-!example/example-js-containers/**
-!example/example-rust-cli/
-!example/example-rust-cli/**
+!examples/
+!examples/example-js-containers/
+!examples/example-js-containers/**
+!examples/example-rust-cli/
+!examples/example-rust-cli/**
 
 # SQL grammar
 !crates/**/*.pest
