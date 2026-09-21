@@ -1,8 +1,8 @@
-crate := "pgtest-database-operations"
+crate := "cli"
 
 # List available recipes
 help:
-    @just --list --unsorted
+    @just --list --unsorted --list-prefix '  ' --list-heading $'pgTest CLI\n'
 
 # Format this crate
 fmt:
@@ -24,15 +24,28 @@ check:
 check-profile:
     cargo check -p {{crate}} --all-targets --features hotpath
 
-# Run cargo build on this crate
+# Build all targets in this crate
 build:
     cargo build -p {{crate}} --all-targets
+
+# Build the release CLI binary
+build-release:
+    cargo build --locked --release -p {{crate}} --bin pgtest
 
 # Run all tests in this crate (requires Docker)
 test:
     cargo nextest run --locked -p {{crate}} --no-fail-fast
-    cargo test --locked -p {{crate}} --doc --no-fail-fast
 
 # Build and open the docs of this crate
 doc:
     cargo doc -p {{crate}} --no-deps --open
+
+# Run the CLI, passing any extra arguments through
+[positional-arguments]
+run *ARGS:
+    cargo run -p {{crate}} --bin pgtest -- "$@"
+
+# Run the CLI with hotpath profiling enabled
+[positional-arguments]
+run-profile *ARGS:
+    cargo run -p {{crate}} --bin pgtest --features hotpath -- "$@"

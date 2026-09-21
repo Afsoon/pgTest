@@ -48,10 +48,12 @@ clean:
 
 # Run workspace tests, including deterministic simulations (requires Docker)
 test:
-    cargo test --workspace
+    cargo nextest run --locked --workspace --no-fail-fast
+    cargo test --locked --workspace --doc --no-fail-fast
 
 mod core "crates/pgtest-core"
 mod server "crates/pgtest-server"
 mod wire "crates/pgtest-wire"
 mod database "crates/pgtest-database-operations"
 mod utils "crates/pgtest-utils"
+mod cli "apps/cli"

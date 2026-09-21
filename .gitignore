@@ -11,6 +11,8 @@
 !compose.yaml
 !.cargo/
 !.cargo/config.toml
+!.config/
+!.config/nextest.toml
 !rust-toolchain.toml
 !Dockerfile
 !.dockerignore
