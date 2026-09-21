@@ -9,6 +9,61 @@ Connect using a lease ID to get a database cloned from your template. Connection
 with the same lease ID share that database; different IDs get separate databases.
 Your application uses its usual PostgreSQL client.
 
+PgTest is still under active development. Version 1.0 will mark the point where
+it has proven reliable and performant across test suites of all sizes, both on
+local machines and in CI environments.
+You can use the current version to see how it works with your test suite.
+
+## Motivation
+
+I built PgTest because I was tired of mocking PostgreSQL clients in tests,
+especially for complex queries. I wanted to run those queries against real
+PostgreSQL databases without making test setup expensive or cumbersome.
+
+[IntegreSQL](https://github.com/allaboutapps/integresql) was an inspiration, but
+its latest listed [commit](https://github.com/allaboutapps/integresql/commits/master/)
+and [release](https://github.com/allaboutapps/integresql/releases/tag/v1.1.0)
+date to January 2024, as checked in September 2026. My biggest difficulty with
+it was managing test databases through a service outside the PostgreSQL
+connection lifecycle. In my experience, its timing assumptions and speculative
+recycling required too much tuning for my test suites. I wanted database
+assignment and explicit cleanup to happen through PostgreSQL connections.
+
+I also wanted an IntegreSQL-like library for JavaScript that fit this workflow,
+beyond the options available in Go. PgTest's CLI provides a way to use it from
+different test runners until libraries that wrap it are available.
+
+## Goals
+
+- Require minimal changes to application code and test setup. Keep using the
+  existing PostgreSQL client, including for administrative operations exposed
+  as SQL commands, following the approach of
+  [PgBouncer's admin console](https://www.pgbouncer.org/usage.html#admin-console).
+- Minimize proxy overhead so that creating databases from a template becomes
+  the bottleneck, rather than the proxy itself.
+
+## Non-goals
+
+Managing multiple PostgreSQL upstream instances through one proxy is outside
+the scope of PgTest and its planned development. Use one PgTest proxy per
+PostgreSQL instance.
+
+## Constraints
+
+- **PostgreSQL 13 or later is required.** Some optional tuning settings shown
+  below require newer versions.
+- **Lease IDs must contain 1–256 UTF-8 bytes**, with no `/` or NUL characters.
+  This allows up to 256 ASCII characters; multibyte characters use more of the
+  limit.
+- **The upstream `postgres` database must exist and be accessible to the
+  configured user.** PgTest connects to it for database management. Use a
+  separate database as the template, and keep all connections to that template
+  closed while PgTest is cloning it: cloning requires zero active connections
+  to the template.
+- **The connection database name `pgtest` is reserved for administrative
+  operations.** It selects the virtual control database. Test connections must
+  use `<template>/<lease-id>`.
+
 ## Install
 
 TBA after first release
@@ -217,6 +272,19 @@ A released lease ID cannot be reused during the same PgTest process. An expired
 lease ID can reconnect, but receives a fresh database cloned from the template;
 do not rely on its previous data remaining available.
 
+### Hash migration files in watch mode
+
+When running tests in watch mode, hash the migration file paths and contents in
+a stable order. Keep the prepared template database between runs and reuse it
+when the hash is unchanged. This avoids invoking the migration runner and paying
+its database round trips on every test execution. Store the hash only after
+template preparation succeeds, and rebuild if the template no longer exists.
+
+When migrations change, finish the active test run, stop PgTest, rebuild the
+template, and restart PgTest so its pool contains databases with the updated
+schema. Include seed files in the hash if they also determine the template's
+contents.
+
 ## Configuration
 
 The CLI reads `serve` arguments. The server executable used by Docker reads
@@ -276,7 +344,23 @@ and the [server documentation](apps/server/README.md) for listener details.
 
 WIP
 
+## Contributing
+
+Issues are welcome for bug reports, ideas, and feedback from your test suites.
+Pull requests are currently limited to project collaborators. This is a solo
+development project, and I want to focus on the vision I have for it.
+
 ## License
 
 PgTest is available under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your
 option.
+
+## Thanks
+
+- [IntegreSQL](https://github.com/allaboutapps/integresql), which inspired me to
+  build PgTest.
+- [pgwire](https://github.com/sunng87/pgwire), for handling PostgreSQL wire
+  protocol parsing and making it easier to build an administrative interface
+  like PgBouncer's.
+- [Pest](https://pest.rs/), for simplifying SQL grammar parsing for the
+  administrative interface and making it easy to extend.
