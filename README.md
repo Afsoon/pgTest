@@ -107,6 +107,116 @@ The [Rust example](example/example-rust-cli/README.md) uses Tokio and
 `tokio-postgres`, starts PostgreSQL with Testcontainers, and builds and runs the
 native PgTest CLI automatically.
 
+## Recommendations
+
+### Prefer Unix sockets
+
+Use Unix sockets whenever possible, both from the test suite to PgTest and from
+PgTest to PostgreSQL, when the processes run on the same host and can access the
+socket directories. Unix sockets avoid the TCP connection handshake and reduce
+networking overhead. These savings can accumulate across long test suites that
+open many connections.
+
+Set `--unix-socket-dir` (or `PGTEST_UNIX_SOCKET_DIR`) for the test suite's
+connections to PgTest, and set `--pg-host` (or `PGTEST_PG_HOST`) to PostgreSQL's
+absolute socket directory for upstream connections. Configure your test suite's
+PostgreSQL client to use the PgTest socket directory as its host.
+
+### Configure PostgreSQL for disposable tests
+
+Create the PostgreSQL container with these settings to reduce overhead during
+tests. **`POSTGRES_HOST_AUTH_METHOD=trust` is mandatory** for PgTest's current
+upstream authentication support.
+
+```sh
+docker run --rm --name pgtest-postgres \
+  -p 127.0.0.1:5432:5432 \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_DB=test_template \
+  -e POSTGRES_HOST_AUTH_METHOD=trust \
+  postgres:18-alpine \
+  postgres \
+  -c file_copy_method=clone \
+  -c fsync=off \
+  -c synchronous_commit=off \
+  -c full_page_writes=off \
+  -c wal_level=minimal \
+  -c max_wal_senders=0 \
+  -c archive_mode=off \
+  -c summarize_wal=off \
+  -c autovacuum=off \
+  -c random_page_cost=1.1
+```
+
+Use this configuration only for isolated, disposable test databases: `trust`
+allows connections without a password, and the
+[non-durable settings](https://www.postgresql.org/docs/18/non-durability.html)
+trade crash safety for reduced disk overhead. The example uses PostgreSQL 18 for
+`file_copy_method=clone`; its performance benefit depends on the underlying
+filesystem.
+
+### Prefer the CLI over Docker
+
+Run PgTest with the native [CLI](#cli) whenever possible. The Docker image is
+provided for environments where the CLI cannot be used. Using the CLI avoids
+starting a container for the proxy and simplifies using Unix sockets with your
+test suite. Build the binary once and reuse it across test runs. PostgreSQL can
+still run in Docker, as shown in the
+[Rust example](example/example-rust-cli/README.md).
+
+### Size the initial database pool for test concurrency
+
+Set `--pool-initial-size` (or `PGTEST_POOL_INITIAL_SIZE`) using:
+
+```text
+initial pool size = (test parallelism × test concurrency) + ready database buffer
+```
+
+Here, test parallelism is the number of test workers, and test concurrency is the
+number of tests running simultaneously within each worker. Assuming one lease
+per test, their product covers the active tests. The buffer keeps databases ready
+for the next execution batches while the pool replenishes.
+
+For example, 4 workers running 8 tests each, plus a buffer of 16 ready databases,
+calls for an initial pool size of `48`.
+
+### Tune pool replenishment for subsequent batches
+
+Size `--pool-starvation-threshold` and `--pool-grow-batch-size` (or
+`PGTEST_POOL_STARVATION_THRESHOLD` and `PGTEST_POOL_GROW_BATCH_SIZE`) alongside
+the initial pool. Start replenishing early enough and in large enough batches
+to keep databases available as tests consume them. An adequate initial pool
+alone does not sustain a long suite; a growth batch size of `0` disables
+replenishment.
+
+### Release leases explicitly
+
+Close the test's connections and call `SELECT pgtest_release('<lease-id>');`
+through the `pgtest` control database in teardown or a `finally` block, including
+when the test fails. Disconnecting the last client does not release its database.
+For a shared lease, release it only after every test using it has finished.
+See [Connect and release](#connect-and-release) for an example.
+
+### Allow enough time for each lease
+
+Set `--lease-claim-timeout-ms` (or `PGTEST_LEASE_CLAIM_TIMEOUT_MS`) above the
+longest expected test duration, with room for setup and teardown. For a shared
+lease, account for the entire group of tests using it. The default is **30
+seconds**, measured from database assignment; additional connections do not
+reset the timer. Expiry closes active connections and schedules database cleanup.
+Setting the value to `0` disables expiry, so explicit release is essential.
+
+### Share leases only when shared state is safe
+
+Use a fresh lease ID for each test invocation that needs isolated data. Tests
+can share an active lease to reduce database creation when they are read-only
+or explicitly manage shared state. Independent tests can still interfere with
+each other if they modify the same database.
+
+A released lease ID cannot be reused during the same PgTest process. An expired
+lease ID can reconnect, but receives a fresh database cloned from the template;
+do not rely on its previous data remaining available.
+
 ## Configuration
 
 The CLI reads `serve` arguments. The server executable used by Docker reads
