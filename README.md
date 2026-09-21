@@ -103,6 +103,10 @@ See the [JavaScript / TypeScript example](example/example-js-containers/README.m
 for a Hono API tested with Vitest and Testcontainers. It demonstrates concurrent
 test isolation, shared connections, and explicit lease cleanup through PgTest.
 
+The [Rust example](example/example-rust-cli/README.md) uses Tokio and
+`tokio-postgres`, starts PostgreSQL with Testcontainers, and builds and runs the
+native PgTest CLI automatically.
+
 ## Configuration
 
 The CLI reads `serve` arguments. The server executable used by Docker reads

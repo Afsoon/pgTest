@@ -37,6 +37,8 @@
 !example/
 !example/example-js-containers/
 !example/example-js-containers/**
+!example/example-rust-cli/
+!example/example-rust-cli/**
 
 # SQL grammar
 !crates/**/*.pest
