@@ -3,7 +3,6 @@ use rand::{RngExt, rng};
 const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
 abcdefghijklmnopqrstuvwxyz";
 
-/// Length of the random identifier appended to generated database names.
 const GENERATED_ID_LEN: usize = 32;
 
 pub struct PostgresDatabaseName {

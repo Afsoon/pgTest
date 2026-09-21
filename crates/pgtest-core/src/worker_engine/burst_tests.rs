@@ -719,7 +719,6 @@ async fn failed_creation_submission_releases_reservation_without_retrying_inline
     assert_eq!(fixture.engine.counters.unable_to_start_database_slots, 1);
     assert_eq!(fixture.engine.waiters.len(), 1);
 
-    // A later demand event can try again, with fresh IDs.
     fixture.process(vec![fixture.attach("a")]).await;
     let ids = fixture.creation_ids();
     assert_eq!(ids.len(), 3);

@@ -1,5 +1,3 @@
-//! Byte forwarding and cancellation for an attached lease session.
-
 use bytes::BytesMut;
 use pgtest::worker_manager::worker_io::LeaseSession;
 use pgwire::tokio::server::MaybeTls;
@@ -33,7 +31,6 @@ pub(crate) async fn run(
         .await?;
         Ok::<(), std::io::Error>(())
     };
-    // Both sockets and the session guard are dropped on every exit path.
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Ok(()),

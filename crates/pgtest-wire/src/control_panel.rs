@@ -1,5 +1,3 @@
-//! Control connection lifecycle and execution of manager commands.
-
 use std::sync::Arc;
 
 use futures::StreamExt;

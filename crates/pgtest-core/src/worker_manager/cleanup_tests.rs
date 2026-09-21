@@ -1,5 +1,3 @@
-//! Exercise the real worker loops with explicitly completed PostgreSQL
-//! operations.
 use pgtest_utils::read_string::ReadString;
 use tokio::sync::{mpsc, oneshot};
 
@@ -175,7 +173,6 @@ async fn blocked_cleanup_does_not_delay_creation() {
         DatabaseWorkerMessages::CreationFinished { database_id: DatabaseId(100), result: Ok(_) }
     ));
 
-    // Every old database is still blocked when creation completes.
     assert!(blocked.iter().all(|request| !request.finish.is_closed()));
     for request in blocked {
         request.finish.send(Ok(())).unwrap();
@@ -277,7 +274,7 @@ async fn ddl_failures_are_reported_and_workers_accept_later_jobs() {
         fixture.next_result().await,
         DatabaseWorkerMessages::CleanupFinished { database_id: DatabaseId(4), result: Ok(()) }
     ));
-    // Worker-level retry policy has not been introduced by the split.
+    // These workers do not retry failed DDL jobs.
     fixture.finish().await;
     assert!(fixture.creates.try_recv().is_err());
     assert!(fixture.drops.try_recv().is_err());

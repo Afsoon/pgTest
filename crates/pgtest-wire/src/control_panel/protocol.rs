@@ -1,5 +1,3 @@
-//! pgwire query handlers and Parse/Bind parameter validation.
-
 use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
@@ -194,7 +192,6 @@ impl ExtendedQueryHandler for PgTestControlPanel {
     }
 }
 
-/// The control SQL parser has no dependency on a running worker manager.
 pub struct ControlQueryParser;
 
 #[async_trait]

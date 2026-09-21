@@ -45,8 +45,6 @@ pub(crate) struct LeaseEntry {
     pub(crate) cancellation: CancellationToken,
 }
 
-// TBR: Once test are completed, it's time to revisit how the data it's
-// persisted.
 pub(crate) struct WorkerEngine<Consumer, IO, Inbox, Postgres>
 where
     Consumer: ConsumerIO,
@@ -60,7 +58,6 @@ where
     next_generation: u64,
     config: WorkerEngineConfig,
     pg_client: Arc<Postgres>,
-    /// Connections waiting for a free slot to lease.
     pub(crate) waiters: VecDeque<LeaseId>,
     group_waiters: FxHashMap<LeaseId, Vec<(Consumer, Instant)>>,
     pub(crate) counters: EngineCounters,
@@ -102,7 +99,7 @@ where
             leases,
             lease_records: FxHashMap::default(),
             next_generation: 0,
-            config: pool_worker_config.clone(), // TODO: Do we need all the config?
+            config: pool_worker_config.clone(),
             pg_client: postgres_manager,
             waiters: VecDeque::new(),
             group_waiters: FxHashMap::default(),

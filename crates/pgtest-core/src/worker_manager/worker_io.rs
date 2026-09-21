@@ -136,9 +136,7 @@ impl WorkerEngineIO {
         Self { send_message, tracker, shutdown_token, database_worker_senders }
     }
 
-    /// Every background task races against the shutdown token: cancelling it
-    /// ends all in-flight work at its next await point, so shutdown never
-    /// waits out a long timer or a slow DDL.
+    // Shutdown must interrupt timers and DDL rather than wait for them.
     fn spawn_cancellable<F, T>(&self, fut: F)
     where
         F: Future<Output = T> + Send + 'static,

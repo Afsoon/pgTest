@@ -325,8 +325,6 @@ mod worker_engine_test {
     async fn failed_join_reply_does_not_count_a_connection() {
         let consumer = consumer();
         let failing = ConsumerWorker::failing(Arc::default());
-        // Exercise both an existing lease and multiple replies parked for one
-        // lease.
         for queued in [false, true] {
             let mut messages = if queued { occupy_initial(&consumer) } else { vec![] };
             messages.extend([
@@ -360,8 +358,6 @@ mod worker_engine_test {
     }
 }
 
-/// Creation submission failures release reservations; a later growth attempt
-/// uses a fresh ID.
 #[cfg(test)]
 mod grow_test {
     use super::{

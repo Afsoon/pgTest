@@ -23,7 +23,6 @@ use crate::manager::{config::PostgresConfig, database_name::PostgresDatabaseName
 const NAME: &str = "postgres";
 const TAG: &str = "18-alpine";
 
-// Const donsn't work to keep a shared state between threads
 pub static POSTGRES_CONTAINER: LazyLock<Container<Postgres>> = LazyLock::new(|| {
     let postgres = Postgres::default()
         .with_host_config_modifier(|config| {
@@ -38,10 +37,7 @@ pub static POSTGRES_CONTAINER: LazyLock<Container<Postgres>> = LazyLock::new(|| 
     postgres
 });
 
-/// Module to work with [`Postgres`] inside of tests.
-///
-/// Starts an instance of Postgres.
-/// This module is based on the official [`Postgres docker image`].
+/// PostgreSQL test container based on the official [`Postgres docker image`].
 ///
 /// The default database is `pgtest`; the user and password are `postgres`.
 ///
@@ -68,19 +64,16 @@ pub struct Postgres {
 }
 
 impl Postgres {
-    /// Sets the db name for the Postgres instance.
     pub fn with_db_name(mut self, db_name: &str) -> Self {
         self.env_vars.insert("POSTGRES_DB".to_owned(), db_name.to_owned());
         self
     }
 
-    /// Sets the user for the Postgres instance.
     pub fn with_user(mut self, user: &str) -> Self {
         self.env_vars.insert("POSTGRES_USER".to_owned(), user.to_owned());
         self
     }
 
-    /// Sets the password for the Postgres instance.
     pub fn with_password(mut self, password: &str) -> Self {
         self.env_vars.insert("POSTGRES_PASSWORD".to_owned(), password.to_owned());
         self

@@ -117,9 +117,6 @@ impl<'a> EngineIO<ConsumerWorker> for WorkerEngineIO<'a> {
         _wait_duration: u32,
         _cancel_token: CancellationToken,
     ) -> Result<(), IOError> {
-        // TODO(user): timer semantics undecided — deliberately inert for now.
-        // NOTE: max-lifetime timers never fire in the simulator until
-        // this is implemented.
         Ok(())
     }
 
@@ -346,7 +343,6 @@ impl EngineIO<ConsumerWorker> for ScriptedWorkerIO {
         _wait_duration: u32,
         _cancel_token: CancellationToken,
     ) -> Result<(), IOError> {
-        // TODO(user): timer semantics undecided — deliberately inert for now.
         Ok(())
     }
 

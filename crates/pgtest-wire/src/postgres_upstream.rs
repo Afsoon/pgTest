@@ -96,8 +96,7 @@ async fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
-// Includes sending Startup and waiting for AuthenticationOk. Preserve any
-// following bytes so the next stage can consume an already-buffered reply.
+// Preserve bytes after AuthenticationOk for the next stage.
 #[hotpath::measure]
 async fn authenticate(
     stream: &mut UpstreamStream,
