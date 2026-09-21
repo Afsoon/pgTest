@@ -1,0 +1,35 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "pgtest"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bpaf = { version = "0.9.28", features = ["derive", "autocomplete"] }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+mimalloc = "0.1.52"
+hotpath = { workspace = true, features = ["sqlx"] }
+pgtest-core = { path = "../../crates/pgtest-core" }
+pgtest-wire = { path = "../../crates/pgtest-wire" }
+pgtest-database-operations = { path = "../../crates/pgtest-database-operations" }
+
+[dev-dependencies]
+pgtest-database-operations = { path = "../../crates/pgtest-database-operations", features = ["test-support"] }
+tokio-postgres = "0.7.18"
+tempfile = "3"
+
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "pgtest-core/hotpath", "pgtest-wire/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "pgtest-core/hotpath-alloc", "pgtest-wire/hotpath-alloc"]
+hotpath-prometheus = ["hotpath", "hotpath/hotpath-prometheus", "pgtest-core/hotpath-prometheus", "pgtest-wire/hotpath-prometheus"]

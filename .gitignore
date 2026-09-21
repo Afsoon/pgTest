@@ -27,5 +27,10 @@
 !crates/**/
 !crates/**/*.rs
 
+#allowlist `apps` directories and their children, regardless of place
+!apps
+!apps/**/
+!apps/**/*.rs
+
 # SQL grammar
 !crates/**/*.pest

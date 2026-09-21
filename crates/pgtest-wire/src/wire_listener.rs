@@ -1,10 +1,9 @@
-//! TCP and Unix listeners and their connection task lifecycles.
-
 use std::{net::SocketAddr, sync::Arc};
 
 use pgtest::worker_manager::WorkerEngineManager;
 use thiserror::Error;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 
 use crate::connection::{ClientStream, handle_connection};
 #[cfg(unix)]
@@ -22,20 +21,67 @@ pub enum WireError {
 
 const DEFAULT_WIRE_PORT: u16 = 6432;
 
+pub struct TcpWireListener {
+    task: Option<JoinHandle<()>>,
+    stop: CancellationToken,
+    address: SocketAddr,
+}
+
+impl TcpWireListener {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub async fn shutdown(mut self) {
+        self.stop.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+
+    fn detach(mut self) -> SocketAddr {
+        // Dropping a JoinHandle detaches it; dropping a token does not cancel
+        // it.
+        self.task.take();
+        self.address
+    }
+}
+
+impl Drop for TcpWireListener {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            self.stop.cancel();
+            task.abort();
+        }
+    }
+}
+
 #[hotpath::measure]
 pub async fn run(
     manager: Arc<WorkerEngineManager>,
     address: SocketAddr,
 ) -> Result<SocketAddr, WireError> {
+    Ok(run_with_handle(manager, address).await?.detach())
+}
+
+#[hotpath::measure]
+pub async fn run_with_handle(
+    manager: Arc<WorkerEngineManager>,
+    address: SocketAddr,
+) -> Result<TcpWireListener, WireError> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let local_address = listener.local_addr()?;
 
     let mut pg_connection_sessions: JoinSet<()> = JoinSet::new();
 
-    tokio::spawn(async move {
+    let stop = CancellationToken::new();
+    let stopped = stop.clone();
+    let task = tokio::spawn(async move {
         tracing::debug!("to wait connection");
         loop {
             tokio::select! {
+                biased;
+                _ = stopped.cancelled() => break,
                 accepted = listener.accept() => {
                     let (stream, _peer) = match accepted {
                         Ok(client) => client,
@@ -50,9 +96,10 @@ pub async fn run(
                 Some(_finished) = pg_connection_sessions.join_next(), if !pg_connection_sessions.is_empty() => {}
             }
         }
+        pg_connection_sessions.shutdown().await;
     });
 
-    Ok(local_address)
+    Ok(TcpWireListener { task: Some(task), stop, address: local_address })
 }
 
 #[cfg(unix)]
@@ -61,7 +108,18 @@ pub async fn run_unix(
     manager: Arc<WorkerEngineManager>,
     directory: &std::path::Path,
 ) -> Result<UnixWireListener, WireError> {
-    let listener = crate::unix_listener::BoundUnixListener::bind(directory, DEFAULT_WIRE_PORT)?;
+    run_unix_on_port(manager, directory, DEFAULT_WIRE_PORT).await
+}
+
+/// Listen on `<directory>/.s.PGSQL.<port>` in an existing directory.
+#[cfg(unix)]
+#[hotpath::measure]
+pub async fn run_unix_on_port(
+    manager: Arc<WorkerEngineManager>,
+    directory: &std::path::Path,
+    port: u16,
+) -> Result<UnixWireListener, WireError> {
+    let listener = crate::unix_listener::BoundUnixListener::bind(directory, port)?;
     let path = listener.path().to_owned();
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
@@ -95,6 +153,69 @@ mod listener_test {
     use tracing_test::traced_test;
 
     use crate::wire_listener;
+
+    #[tokio::test]
+    async fn owned_tcp_shutdown_closes_sessions_and_releases_manager() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let engine = Arc::new(
+                WorkerEngineManager::start(
+                    pg_container_config().await,
+                    WorkerEngineConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let listener =
+                wire_listener::run_with_handle(engine.clone(), ([127, 0, 0, 1], 0).into())
+                    .await
+                    .unwrap();
+            let address = listener.local_addr();
+            let (client, connection) = tokio_postgres::Config::new()
+                .host("127.0.0.1")
+                .port(address.port())
+                .user("postgres")
+                .dbname("pgtest")
+                .connect(tokio_postgres::NoTls)
+                .await
+                .unwrap();
+            let task = tokio::spawn(connection);
+            client.query_one("SELECT 1", &[]).await.unwrap();
+            listener.shutdown().await;
+            let _ = task.await.unwrap();
+            assert!(client.is_closed());
+            assert!(tokio::net::TcpStream::connect(address).await.is_err());
+            Arc::try_unwrap(engine).unwrap_or_else(|_| panic!("manager retained")).shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_owned_tcp_listener_aborts_its_task() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let engine = Arc::new(
+                WorkerEngineManager::start(
+                    pg_container_config().await,
+                    WorkerEngineConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let listener =
+                wire_listener::run_with_handle(engine.clone(), ([127, 0, 0, 1], 0).into())
+                    .await
+                    .unwrap();
+            let address = listener.local_addr();
+            drop(listener);
+            while Arc::strong_count(&engine) != 1 {
+                tokio::task::yield_now().await;
+            }
+            assert!(tokio::net::TcpStream::connect(address).await.is_err());
+            Arc::try_unwrap(engine).unwrap_or_else(|_| panic!("manager retained")).shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -158,10 +279,16 @@ mod listener_test {
         let engine = Arc::new(
             WorkerEngineManager::start(pg_config, WorkerEngineConfig::default()).await.unwrap(),
         );
-        let listener = wire_listener::run_unix(engine.clone(), &directory.0).await.unwrap();
+        let port = if use_unix_upstream { 7432 } else { 6432 };
+        let listener = if use_unix_upstream {
+            wire_listener::run_unix_on_port(engine.clone(), &directory.0, port).await.unwrap()
+        } else {
+            wire_listener::run_unix(engine.clone(), &directory.0).await.unwrap()
+        };
         let socket_path = listener.path().to_owned();
+        assert_eq!(socket_path.file_name().unwrap(), format!(".s.PGSQL.{port}").as_str());
         let mut config = tokio_postgres::Config::new();
-        config.host_path(&directory.0).port(6432).user("postgres");
+        config.host_path(&directory.0).port(port).user("postgres");
         let mut control_config = config.clone();
         control_config.dbname("pgtest");
         config.dbname(&format!("{template}/unix-test"));
@@ -186,8 +313,6 @@ mod listener_test {
 
         listener.shutdown().await;
         assert!(!socket_path.exists());
-        // The listener no longer retains the manager once its accept task
-        // exits.
         Arc::try_unwrap(engine)
             .unwrap_or_else(|_| panic!("listener retained the manager"))
             .shutdown()

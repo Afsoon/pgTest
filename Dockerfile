@@ -29,7 +29,8 @@ FROM gcr.io/distroless/cc-debian13
 COPY --from=build /out/pgtest-server /usr/local/bin/pgtest-server
 USER 65532:65532
 WORKDIR /tmp
-ENV PGTEST_LISTEN_ADDR=0.0.0.0:6432
+ENV PGTEST_LISTEN_ADDR=0.0.0.0
+ENV PGTEST_LISTEN_PORT=6432
 EXPOSE 6432
 STOPSIGNAL SIGINT
 ENTRYPOINT ["/usr/local/bin/pgtest-server"]

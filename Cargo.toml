@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/pgtest-core", "crates/pgtest-server", "crates/pgtest-wire", "crates/pgtest-utils", "crates/pgtest-database-operations"]
+members = ["crates/pgtest-core", "crates/pgtest-server", "crates/pgtest-wire", "crates/pgtest-utils", "crates/pgtest-database-operations", "apps/cli"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
