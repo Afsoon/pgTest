@@ -1,8 +1,10 @@
 [package]
 name = "pgtest-wire"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [lib]
 name = "pgtest_pg_wire"
@@ -23,15 +25,15 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 hotpath = { workspace = true }
-pgtest-core = { path = "../pgtest-core"}
+pgtest-core = { version = "=0.1.0", path = "../pgtest-core"}
 
 [dev-dependencies]
-pgtest-core = { path = "../pgtest-core", features = ["test-support"] }
+pgtest-core = { version = "=0.1.0", path = "../pgtest-core", features = ["test-support"] }
 tokio-postgres = "0.7.18"
 tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
-pgtest-database-operations = { path = "../pgtest-database-operations", features = ["test-support"]}
+pgtest-database-operations = { version = "=0.1.0", path = "../pgtest-database-operations", features = ["test-support"]}
 
 [features]
 default = []

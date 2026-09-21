@@ -3,6 +3,10 @@ name = "cli"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+repository.workspace = true
+publish = false
+description = "Isolated PostgreSQL databases for integration tests"
+homepage = "https://github.com/Afsoon/pgTest#readme"
 
 [[bin]]
 name = "pgtest"
@@ -19,12 +23,12 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 mimalloc = "0.1.52"
 hotpath = { workspace = true, features = ["sqlx"] }
-pgtest-core = { path = "../../crates/pgtest-core" }
-pgtest-wire = { path = "../../crates/pgtest-wire" }
-pgtest-database-operations = { path = "../../crates/pgtest-database-operations" }
+pgtest-core = { version = "=0.1.0", path = "../../crates/pgtest-core" }
+pgtest-wire = { version = "=0.1.0", path = "../../crates/pgtest-wire" }
+pgtest-database-operations = { version = "=0.1.0", path = "../../crates/pgtest-database-operations" }
 
 [dev-dependencies]
-pgtest-database-operations = { path = "../../crates/pgtest-database-operations", features = ["test-support"] }
+pgtest-database-operations = { version = "=0.1.0", path = "../../crates/pgtest-database-operations", features = ["test-support"] }
 tokio-postgres = "0.7.18"
 tempfile = "3"
 
@@ -33,3 +37,6 @@ default = []
 hotpath = ["hotpath/hotpath", "pgtest-core/hotpath", "pgtest-wire/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "pgtest-core/hotpath-alloc", "pgtest-wire/hotpath-alloc"]
 hotpath-prometheus = ["hotpath", "hotpath/hotpath-prometheus", "pgtest-core/hotpath-prometheus", "pgtest-wire/hotpath-prometheus"]
+
+[package.metadata.dist]
+dist = true

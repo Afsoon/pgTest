@@ -1,0 +1,47 @@
+[workspace]
+git_only = true
+publish = false
+git_release_enable = false
+git_tag_enable = false
+semver_check = false
+dependencies_update = false
+features_always_increment_minor = true
+changelog_update = false
+pr_branch_prefix = "release-plz-"
+
+[[package]]
+name = "cli"
+git_tag_enable = true
+git_tag_name = "cli-v{{ version }}"
+changelog_update = true
+changelog_path = "apps/cli/CHANGELOG.md"
+changelog_include = ["pgtest-core", "pgtest-wire", "pgtest-database-operations", "pgtest-utils"]
+
+[[package]]
+name = "server"
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "server-v{{ version }}"
+changelog_update = true
+changelog_path = "apps/server/CHANGELOG.md"
+changelog_include = ["pgtest-core", "pgtest-wire", "pgtest-database-operations", "pgtest-utils"]
+
+[[package]]
+name = "pgtest-core"
+git_tag_enable = true
+git_tag_name = "internals-v{{ version }}"
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = ["pgtest-wire", "pgtest-database-operations", "pgtest-utils"]
+
+[[package]]
+name = "pgtest-wire"
+git_tag_name = "internals-v{{ version }}"
+
+[[package]]
+name = "pgtest-database-operations"
+git_tag_name = "internals-v{{ version }}"
+
+[[package]]
+name = "pgtest-utils"
+git_tag_name = "internals-v{{ version }}"

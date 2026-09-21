@@ -1,8 +1,10 @@
 [package]
 name = "pgtest-database-operations"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -20,7 +22,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 testcontainers = { workspace = true, optional = true }
-pgtest-utils = { path = "../pgtest-utils"}
+pgtest-utils = { version = "=0.1.0", path = "../pgtest-utils"}
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

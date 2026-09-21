@@ -1,6 +1,11 @@
 name: Tests
 
 on:
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
   pull_request:
     types: [opened, synchronize, reopened]
   push:
@@ -28,6 +33,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
 
       - name: Install mold
@@ -39,10 +45,13 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
 
-      - name: Install cargo-nextest
+      - name: Install CI tools
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9
+          tool: nextest@0.9,actionlint@1.7.7
+
+      - name: Validate workflows
+        run: actionlint
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2

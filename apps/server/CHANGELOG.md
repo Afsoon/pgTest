@@ -1,0 +1,3 @@
+# Server changelog
+
+## [Unreleased]
