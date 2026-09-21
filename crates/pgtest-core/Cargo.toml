@@ -1,0 +1,40 @@
+[package]
+name = "pgtest-core"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+name = "pgtest"
+
+
+[lints]
+workspace = true
+
+[dependencies]
+hotpath = { workspace = true }
+sqlx = { version = "=0.9.0", features = ["postgres", "runtime-tokio"] }
+rand = "0.10.2"
+rustc-hash = "2.1.3"
+tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-retry2 =  { version = "0.9.1", features = ["jitter", "tracing"] }
+envconfig = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+pgtest-utils = { path = "../pgtest-utils"}
+pgtest-database-operations = { path = "../pgtest-database-operations"}
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tracing-test = { workspace = true }
+pgtest-database-operations = { path = "../pgtest-database-operations", features = ["test-support"]}
+
+[features]
+default = []
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-prometheus = ["hotpath/hotpath-prometheus"]
+# Expose configuration defaults to other crates' tests.
+test-support = []

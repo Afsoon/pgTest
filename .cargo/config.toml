@@ -1,0 +1,8 @@
+# Target rustflags combine; build.rustflags would be overridden by target flags.
+[target.'cfg(all())']
+# Require the next-generation trait solver (rust-lang/rust#160895).
+rustflags = ["-Znext-solver"]
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))']
+linker = "gcc"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

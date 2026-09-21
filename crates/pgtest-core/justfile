@@ -1,0 +1,50 @@
+crate := "pgtest-core"
+
+# List available recipes
+help:
+    @just --list --unsorted --list-prefix '  ' --list-heading $'pgTest Core\n'
+
+# Format this crate
+fmt:
+    cargo +nightly fmt -p {{crate}}
+
+# Check this crate's formatting without changing files
+fmt-check:
+    cargo +nightly fmt -p {{crate}} --check
+
+# Run Clippy on all targets in this crate
+lint:
+    cargo clippy -p {{crate}} --all-targets -- -D warnings
+
+# Run cargo check on this crate
+check:
+    cargo check -p {{crate}} --all-targets
+
+# Check all targets with profiling enabled
+check-profile:
+    cargo check -p {{crate}} --all-targets --features hotpath
+
+# Run cargo build on this crate
+build:
+    cargo build -p {{crate}} --all-targets
+
+# Run all tests in this crate (requires Docker)
+test:
+    cargo nextest run --locked -p {{crate}} --no-fail-fast
+    cargo test --locked -p {{crate}} --doc --no-fail-fast
+
+# Run engine simulations and worker unit tests without Docker
+test-unit:
+    cargo nextest run --locked -p {{crate}} --lib --no-fail-fast -E 'not test(worker_manager::worker_engine_manager_test::) or test(=worker_manager::worker_engine_manager_test::startup_future_fits_stack_budget)'
+
+# Run PostgreSQL-backed manager tests (requires Docker)
+test-integration:
+    cargo nextest run --locked -p {{crate}} --lib --no-fail-fast -E 'test(worker_manager::worker_engine_manager_test::) and not test(=worker_manager::worker_engine_manager_test::startup_future_fits_stack_budget)'
+
+test-debug:
+    RUST_LOG=debug cargo nextest run --locked -p {{crate}} --no-fail-fast --success-output immediate --failure-output immediate-final
+    RUST_LOG=debug cargo test --locked -p {{crate}} --doc --no-fail-fast -- --show-output
+
+# Build and open the docs of this crate
+doc:
+    cargo doc -p {{crate}} --no-deps --open

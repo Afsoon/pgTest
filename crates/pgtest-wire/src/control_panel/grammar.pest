@@ -1,0 +1,11 @@
+ws = _{ " " | "\t" | "\r" | "\n" }
+
+ping = { ^"SELECT" ~ ws+ ~ "1" }
+
+text_literal = @{ "'" ~ ("''" | !"'" ~ ANY)* ~ "'" }
+
+parameter = @{ "$1" ~ (ws* ~ "::" ~ ws* ~ ^"text"){0,1}}
+
+release = { ^"SELECT" ~ ws+ ~ ^"pgtest_release" ~ ws* ~ "(" ~ ws* ~ (text_literal | parameter) ~ ws* ~")"  }
+
+query = _{ SOI ~ ws* ~ (ping | release) ~ ws* ~ ";"? ~ ws* ~ EOI }
