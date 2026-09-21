@@ -10,11 +10,14 @@ use pgtest_database_operations::manager::config::PostgresConfig;
 
 /// Run pgtest against an existing PostgreSQL instance.
 #[derive(Clone, Debug, Bpaf)]
-#[bpaf(options, generate(options), version)]
+#[bpaf(options, generate(options), version(crate::version::display().as_str()))]
 pub enum Command {
     /// Start the test database server.
     #[bpaf(command)]
     Serve(#[bpaf(external(serve_options))] ServeOptions),
+    /// Show the compiled version and commit SHA.
+    #[bpaf(command)]
+    Version,
 }
 
 #[derive(Clone, Debug, Bpaf)]
@@ -171,7 +174,10 @@ mod tests {
 
     fn parse(extra: &[&str]) -> Result<ServeOptions, bpaf::ParseFailure> {
         let args = [UPSTREAM, extra].concat();
-        options().run_inner(args.as_slice()).map(|Command::Serve(value)| value)
+        options().run_inner(args.as_slice()).map(|command| match command {
+            Command::Serve(value) => value,
+            Command::Version => panic!("expected serve command"),
+        })
     }
 
     #[test]

@@ -23,8 +23,9 @@ check-profile:
     cargo check --workspace --all-targets --features hotpath
 
 # Run cargo build on the workspace members
-build:
-    cargo build --workspace --all-targets
+build version commit_sha:
+    @test -n {{quote(version)}} && test -n {{quote(commit_sha)}} || { echo 'version and commit_sha must not be empty' >&2; exit 1; }
+    PGTEST_VERSION={{quote(version)}} PGTEST_COMMIT_SHA={{quote(commit_sha)}} cargo build --workspace --all-targets
 
 # Build the local release server binary
 build-release:

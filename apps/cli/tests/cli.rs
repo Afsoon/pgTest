@@ -25,6 +25,8 @@ async fn help_version_and_completion_work_without_postgres() {
         vec!["--help"],
         vec!["serve", "--help"],
         vec!["--version"],
+        vec!["version"],
+        vec!["version", "--help"],
         vec!["--bpaf-complete-style-bash"],
         vec!["--bpaf-complete-style-zsh"],
         vec!["--bpaf-complete-style-fish"],
@@ -37,6 +39,7 @@ async fn help_version_and_completion_work_without_postgres() {
     }
     for (args, expected) in [
         (vec!["--bpaf-complete-rev=7", ""], "serve"),
+        (vec!["--bpaf-complete-rev=7", ""], "version"),
         (vec!["--bpaf-complete-rev=7", "serve", "--pg-"], "--pg-host"),
         (vec!["--bpaf-complete-rev=7", "serve", "--unix-socket-dir", ""], "_files -/"),
     ] {
@@ -53,6 +56,30 @@ async fn help_version_and_completion_work_without_postgres() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--pg-host"));
+}
+
+#[tokio::test]
+async fn version_reports_compiled_metadata_and_ignores_runtime_overrides() {
+    let version = option_env!("PGTEST_VERSION").filter(|value| !value.is_empty()).unwrap_or("dev");
+    let commit =
+        option_env!("PGTEST_COMMIT_SHA").filter(|value| !value.is_empty()).unwrap_or("dev");
+    let expected = format!("Version: {version} (commit {commit})");
+    for arg in ["version", "--version", "-V"] {
+        let output = timeout(
+            Duration::from_secs(5),
+            command()
+                .arg(arg)
+                .env("PGTEST_VERSION", "runtime-version")
+                .env("PGTEST_COMMIT_SHA", "runtime-commit")
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(output.status.success(), "{arg}: {output:?}");
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim_end(), expected);
+        assert!(output.stderr.is_empty());
+    }
 }
 
 #[cfg(unix)]

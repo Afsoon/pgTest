@@ -10,10 +10,24 @@ The user needs permission to create and drop databases. Upstream TLS is not supp
 ## Build and run
 
 ```sh
-cargo build --locked --release -p cli
+just cli::build-release dev dev
 ./target/release/pgtest --help
 ./target/release/pgtest serve --help
 ```
+
+`pgtest version` (also `--version` or `-V`) prints the compiled version and commit
+SHA. The CLI build recipes and the root workspace `build` recipe require a
+nonempty version and commit SHA, which they pass as `PGTEST_VERSION` and
+`PGTEST_COMMIT_SHA` to the compiler:
+
+```sh
+just cli::build-release 0.1.0 "$(git rev-parse HEAD)"
+./target/release/pgtest version
+```
+
+Use `just cli::build dev dev` or `just build dev dev` for development. Direct Cargo
+builds default each value to `dev` when its environment variable is unset or
+empty. Changing these variables at runtime does not change the reported metadata.
 
 All four upstream arguments are required. Choose TCP, a Unix socket, or both:
 

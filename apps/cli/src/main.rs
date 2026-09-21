@@ -1,5 +1,6 @@
 mod args;
 mod server;
+mod version;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -9,7 +10,13 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<()> {
-    let args::Command::Serve(options) = args::options().run();
+    let options = match args::options().run() {
+        args::Command::Serve(options) => options,
+        args::Command::Version => {
+            println!("Version: {}", version::display());
+            return Ok(());
+        }
+    };
     options.validate()?;
     let filter = EnvFilter::try_new(&options.log_filter).context("invalid --log-filter")?;
     let subscriber = tracing_subscriber::registry().with(
