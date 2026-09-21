@@ -17,6 +17,11 @@
 !LICENSE-APACHE
 !LICENSE-MIT
 
+# GitHub Actions workflows
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+
 # allowlist `crates` directories and their children, regardless of place
 !crates/
 !crates/**/

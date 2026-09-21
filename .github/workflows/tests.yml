@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  test:
+    name: Workspace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install mold
+        uses: rui314/setup-mold@v1
+        with:
+          # The workspace already selects mold in .cargo/config.toml.
+          make-default: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Docker is available
+        run: docker info
+
+      - name: Run all workspace tests
+        run: cargo test --locked --workspace --no-fail-fast
