@@ -2004,22 +2004,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgtest-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "envconfig",
- "hotpath",
- "mimalloc",
- "pgtest-core",
- "pgtest-database-operations",
- "pgtest-wire",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "pgtest-utils"
 version = "0.1.0"
 
@@ -2708,6 +2692,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "envconfig",
+ "hotpath",
+ "mimalloc",
+ "pgtest-core",
+ "pgtest-database-operations",
+ "pgtest-wire",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

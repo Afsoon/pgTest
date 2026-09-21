@@ -12,6 +12,7 @@ RUN rustup set profile minimal && rustup show active-toolchain
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ .cargo/
 COPY crates/ crates/
+COPY apps/ apps/
 
 ARG CARGO_FEATURES=""
 ARG TARGETARCH
@@ -21,9 +22,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     set -eu; \
     set --; \
     if [ -n "$CARGO_FEATURES" ]; then set -- --features "$CARGO_FEATURES"; fi; \
-    cargo build --locked --release -p pgtest-server --bin pgtest-server "$@"; \
-    readelf -p .comment target/release/pgtest-server | grep mold; \
-    install -D -m 0755 target/release/pgtest-server /out/pgtest-server
+    cargo build --locked --release -p server --bin server "$@"; \
+    readelf -p .comment target/release/server | grep mold; \
+    install -D -m 0755 target/release/server /out/pgtest-server
 
 FROM gcr.io/distroless/cc-debian13
 COPY --from=build /out/pgtest-server /usr/local/bin/pgtest-server

@@ -1,4 +1,4 @@
-crate := "pgtest-server"
+crate := "server"
 
 # List available recipes
 help:

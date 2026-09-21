@@ -29,11 +29,11 @@ build version commit_sha:
 
 # Build the local release server binary
 build-release:
-    cargo build --locked --release -p pgtest-server --bin pgtest-server
+    cargo build --locked --release -p server --bin server
 
 # Build the local release server binary with Hotpath
 build-release-profile:
-    cargo build --locked --release -p pgtest-server --bin pgtest-server --features hotpath
+    cargo build --locked --release -p server --bin server --features hotpath
 
 # Build the release Docker image (pgtest-server:<tag>)
 docker-build tag="latest":
@@ -53,7 +53,7 @@ test:
     cargo test --locked --workspace --doc --no-fail-fast
 
 mod core "crates/pgtest-core"
-mod server "crates/pgtest-server"
+mod server "apps/server"
 mod wire "crates/pgtest-wire"
 mod database "crates/pgtest-database-operations"
 mod utils "crates/pgtest-utils"

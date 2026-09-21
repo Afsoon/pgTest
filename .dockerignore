@@ -11,5 +11,9 @@
 !crates/**/Cargo.toml
 !crates/**/*.rs
 !crates/**/*.pest
+!apps/
+!apps/**/
+!apps/**/Cargo.toml
+!apps/**/*.rs
 **/target/
 **/.git/

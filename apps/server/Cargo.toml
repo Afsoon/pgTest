@@ -1,11 +1,12 @@
 [package]
-name = "pgtest-server"
+name = "server"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
 [lints]
 workspace = true
+
 
 [dependencies]
 mimalloc = "0.1.52"
@@ -15,9 +16,9 @@ envconfig = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-pgtest-core = { path = "../pgtest-core"}
-pgtest-wire = { path = "../pgtest-wire"}
-pgtest-database-operations = { path = "../pgtest-database-operations"}
+pgtest-core = { path = "../../crates/pgtest-core" }
+pgtest-wire = { path = "../../crates/pgtest-wire" }
+pgtest-database-operations = { path = "../../crates/pgtest-database-operations" }
 
 [features]
 default = []
