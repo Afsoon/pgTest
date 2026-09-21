@@ -1,0 +1,66 @@
+# Releases
+
+[Release-plz](https://release-plz.dev/docs/github/quickstart) prepares version and
+changelog PRs automatically on `main`. Publication starts manually with the
+**Publish** workflow. No push or tag automatically publishes artifacts.
+
+The internal crates share the workspace version. The CLI and server keep their
+own versions. App-only changes bump that app; internal changes also bump the apps
+that depend on them. Nothing is published to crates.io.
+
+## Publish
+
+1. Review and merge the release-plz PR. Use Conventional Commit titles for code
+   changes so release-plz can determine the next versions.
+2. Run **Actions → Publish → Run workflow** on `main`. It automatically selects
+   the latest merged release PR and runs nextest and doctests.
+3. Release-plz creates the pending `cli-v<version>`, `server-v<version>`, and
+   `internals-v<version>` tags. The internal tag is a version baseline only.
+4. Changed apps are published: Docker builds both Linux architectures in one job;
+   the CLI starts the separate **Release** workflow (`cli-release.yml`) generated
+   by cargo-dist.
+   Check that workflow too: **Publish** finishes once the CLI run is started.
+
+The Docker image is `ghcr.io/afsoon/pgtest`, with `sha-<12-character-commit>`
+(recommended) and `v<server-version>` tags for the same multi-platform image.
+It supports `linux/amd64` and `linux/arm64`.
+
+[Cargo-dist](https://axodotdev.github.io/cargo-dist/book/installers/homebrew.html)
+builds CLI archives for Linux x86_64/ARM64 and Apple Silicon macOS, publishes
+GitHub downloads and a shell installer, and updates Homebrew:
+
+```sh
+brew install Afsoon/tap/pgtest
+```
+
+The CLI embeds its version and full source commit at build time. Both publishers
+build the tags created by release-plz, so later changes to `main` are excluded.
+Prereleases do not update Homebrew.
+
+## macOS signing and notarization
+
+Developer ID signing and notarization are not part of the release plan or
+requirements for version 1.0. The CLI workflow requires no Apple signing or
+notarization credentials. Keep the toolchain's default ad-hoc signing intact; it does not
+identify the publisher or provide notarization.
+
+Downloaded macOS binaries may require explicit user approval. The root
+[README](README.md#macos-releases) documents this limitation.
+
+## Validation and retries
+
+Run **Release** with its default `dry-run` tag to build the CLI artifacts
+without publishing. PRs also check cargo-dist's release plan.
+
+For failures, use GitHub's **Re-run failed jobs** on the affected workflow.
+Re-running the entire Publish workflow skips versions already tagged by
+release-plz; it is not a publication retry. If the CLI dispatch itself needs to
+be repeated, use its existing tag as both the workflow ref and tag input:
+
+```sh
+gh workflow run cli-release.yml --ref cli-v0.1.0 -f tag=cli-v0.1.0
+```
+
+Edit `dist-workspace.toml` and `.github/dist/build-setup.yml`, then run
+`dist generate` to update the generated CLI workflow. Do not edit
+`.github/workflows/cli-release.yml` directly.

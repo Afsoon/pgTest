@@ -68,6 +68,14 @@ PostgreSQL instance.
 
 TBA after first release
 
+### macOS releases
+
+macOS CLI releases ship without Apple Developer ID signing or
+notarization. Depending on how the binary is downloaded, macOS may warn or block
+its first launch. If you trust the download, follow
+[Apple's instructions](https://support.apple.com/en-us/102445) to approve it in
+**System Settings → Privacy & Security → Open Anyway**, when available.
+
 ## Usage
 
 Start with an existing PostgreSQL instance and a template database containing your

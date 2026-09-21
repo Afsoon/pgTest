@@ -1,0 +1,37 @@
+name: Prepare release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'Afsoon/pgTest'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - uses: rui314/setup-mold@v1
+        with:
+          make-default: false
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+          version: '0.3.169'
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}

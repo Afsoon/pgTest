@@ -3,6 +3,8 @@ resolver = "3"
 members = ["crates/pgtest-core", "crates/pgtest-wire", "crates/pgtest-utils", "crates/pgtest-database-operations", "apps/cli", "apps/server"]
 
 [workspace.package]
+version = "0.1.0"
+repository = "https://github.com/Afsoon/pgTest"
 license = "MIT OR Apache-2.0"
 
 [workspace.lints.clippy]
@@ -15,7 +17,16 @@ hotpath = { version = "0.25", features = ["tokio"] }
 envconfig = "0.11.1"
 anyhow = "1.0.104"
 thiserror = "2.0.20"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-test = "0.2.6"
 testcontainers = { version = "0.28.0", features = ["blocking"] }
+
+[profile.release]
+opt-level = 3
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+
+[profile.dist]
+inherits = "release"

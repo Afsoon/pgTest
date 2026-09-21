@@ -1,6 +1,11 @@
 name: Tests
 
 on:
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
   pull_request:
     types: [opened, synchronize, reopened]
   push:
@@ -17,6 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_TEST_CODEGEN_UNITS: "256"
   RUST_BACKTRACE: "1"
 
 jobs:
@@ -28,6 +34,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
 
       - name: Install mold
@@ -39,7 +46,7 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
 
-      - name: Install cargo-nextest
+      - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9

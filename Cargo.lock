@@ -1967,7 +1967,6 @@ dependencies = [
 name = "pgtest-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "envconfig",
  "hotpath",
  "pgtest-database-operations",
@@ -1980,14 +1979,12 @@ dependencies = [
  "tokio-retry2",
  "tokio-util",
  "tracing",
- "tracing-test",
 ]
 
 [[package]]
 name = "pgtest-database-operations"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "envconfig",
  "hotpath",
  "pgtest-utils",
@@ -2000,7 +1997,6 @@ dependencies = [
  "tokio-retry2",
  "tokio-util",
  "tracing",
- "tracing-test",
 ]
 
 [[package]]
@@ -2011,7 +2007,6 @@ version = "0.1.0"
 name = "pgtest-wire"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "bytes",
  "futures",

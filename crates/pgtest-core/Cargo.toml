@@ -1,8 +1,10 @@
 [package]
 name = "pgtest-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [lib]
 name = "pgtest"
@@ -19,17 +21,15 @@ rustc-hash = "2.1.3"
 tokio-util = { version = "0.7.19", features = ["rt"] }
 tokio-retry2 =  { version = "0.9.1", features = ["jitter", "tracing"] }
 envconfig = { workspace = true }
-anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-pgtest-utils = { path = "../pgtest-utils"}
-pgtest-database-operations = { path = "../pgtest-database-operations"}
+pgtest-utils = { version = "=0.1.0", path = "../pgtest-utils"}
+pgtest-database-operations = { version = "=0.1.0", path = "../pgtest-database-operations"}
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tracing-test = { workspace = true }
-pgtest-database-operations = { path = "../pgtest-database-operations", features = ["test-support"]}
+pgtest-database-operations = { version = "=0.1.0", path = "../pgtest-database-operations", features = ["test-support"]}
 
 [features]
 default = []

@@ -1,0 +1,136 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: github.ref == 'refs/heads/main' && github.repository == 'Afsoon/pgTest'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select the latest merged release PR
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls?state=closed&base=main&per_page=100" \
+            --jq '[.[][] | select(.merged_at != null and (.head.ref | startswith("release-plz-")))] | max_by(.merged_at).merge_commit_sha')
+          test -n "$sha" && test "$sha" != null
+          git merge-base --is-ancestor "$sha" origin/main
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Release source: $sha" >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    needs: source
+    uses: ./.github/workflows/tests.yml
+    with:
+      source_sha: ${{ needs.source.outputs.sha }}
+
+  tags:
+    needs: [source, tests]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      cli_tag: ${{ steps.apps.outputs.cli_tag }}
+      server_tag: ${{ steps.apps.outputs.server_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: release-plz/action@v0.5
+        id: release
+        with:
+          command: release
+          version: '0.3.169'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Read released applications
+        id: apps
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          echo "cli_tag=$(jq -r '.[] | select(.package_name == "cli") | .tag' <<< "$RELEASES")" >> "$GITHUB_OUTPUT"
+          echo "server_tag=$(jq -r '.[] | select(.package_name == "server") | .tag' <<< "$RELEASES")" >> "$GITHUB_OUTPUT"
+
+  cli:
+    needs: tags
+    if: needs.tags.outputs.cli_tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Start cargo-dist on the released tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLI_TAG: ${{ needs.tags.outputs.cli_tag }}
+        run: gh workflow run cli-release.yml --repo "$GITHUB_REPOSITORY" --ref "$CLI_TAG" -f "tag=$CLI_TAG"
+
+  docker:
+    needs: tags
+    if: needs.tags.outputs.server_tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.tags.outputs.server_tag }}
+          persist-credentials: false
+      - name: Read image version and commit
+        id: image
+        env:
+          SERVER_TAG: ${{ needs.tags.outputs.server_tag }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "version=${SERVER_TAG#server-v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/afsoon/pgtest
+          flavor: latest=false
+          tags: |
+            type=raw,value=sha-${{ steps.image.outputs.short_sha }}
+            type=raw,value=v${{ steps.image.outputs.version }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.image.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

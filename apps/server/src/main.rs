@@ -1,7 +1,6 @@
-use mimalloc::MiMalloc;
-
+#[cfg(not(feature = "hotpath-alloc"))]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -30,7 +29,7 @@ struct ServerConfig {
 }
 
 #[tokio::main]
-#[hotpath::main]
+#[hotpath::main(allocator = mimalloc::MiMalloc)]
 async fn main() -> Result<()> {
     let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let subscriber = tracing_subscriber::registry()
