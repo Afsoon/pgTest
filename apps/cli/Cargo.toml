@@ -28,6 +28,7 @@ pgtest-wire = { version = "=0.1.0", path = "../../crates/pgtest-wire" }
 pgtest-database-operations = { version = "=0.1.0", path = "../../crates/pgtest-database-operations" }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
 pgtest-database-operations = { version = "=0.1.0", path = "../../crates/pgtest-database-operations", features = ["test-support"] }
 tokio-postgres = "0.7.18"
 tempfile = "3"
