@@ -99,7 +99,9 @@ the supported commands and parameterized release syntax.
 
 ## Integrate
 
-TBA
+See the [JavaScript / TypeScript example](example/example-js-containers/README.md)
+for a Hono API tested with Vitest and Testcontainers. It demonstrates concurrent
+test isolation, shared connections, and explicit lease cleanup through PgTest.
 
 ## Configuration
 

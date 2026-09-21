@@ -171,8 +171,6 @@ impl Image for Postgres {
             "-c",
             "autovacuum=off",
             "-c",
-            "timescaledb.max_background_workers=0",
-            "-c",
             "random_page_cost=1.1",
         ]
     }

@@ -34,5 +34,9 @@
 !apps/**/
 !apps/**/*.rs
 
+!example/
+!example/example-js-containers/
+!example/example-js-containers/**
+
 # SQL grammar
 !crates/**/*.pest
