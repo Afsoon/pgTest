@@ -23,8 +23,10 @@ pub enum WireError {
 const DEFAULT_WIRE_PORT: u16 = 6432;
 
 #[hotpath::measure]
-pub async fn run(manager: Arc<WorkerEngineManager>) -> Result<SocketAddr, WireError> {
-    let address = SocketAddr::from(([127, 0, 0, 1], DEFAULT_WIRE_PORT));
+pub async fn run(
+    manager: Arc<WorkerEngineManager>,
+    address: SocketAddr,
+) -> Result<SocketAddr, WireError> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let local_address = listener.local_addr()?;
 
@@ -206,7 +208,9 @@ mod listener_test {
                 .expect("Manager started up"),
         );
 
-        let address = wire_listener::run(engine.clone()).await.unwrap();
+        let address = wire_listener::run(engine.clone(), ([0, 0, 0, 0], 0).into()).await.unwrap();
+        assert!(address.ip().is_unspecified());
+        assert_ne!(address.port(), 0);
 
         let mut config = tokio_postgres::Config::new();
         config.host("127.0.0.1").port(address.port()).user("postgres");

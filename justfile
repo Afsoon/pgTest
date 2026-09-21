@@ -26,6 +26,22 @@ check-profile:
 build:
     cargo build --workspace --all-targets
 
+# Build the local release server binary
+build-release:
+    cargo build --locked --release -p pgtest-server --bin pgtest-server
+
+# Build the local release server binary with Hotpath
+build-release-profile:
+    cargo build --locked --release -p pgtest-server --bin pgtest-server --features hotpath
+
+# Build the release Docker image (pgtest-server:<tag>)
+docker-build tag="latest":
+    docker build --build-arg CARGO_FEATURES= -t {{quote("pgtest-server:" + tag)}} .
+
+# Build the Docker image with Hotpath (pgtest-server-hotpath:<tag>)
+docker-build-profile tag="latest":
+    docker build --build-arg CARGO_FEATURES=hotpath -t {{quote("pgtest-server-hotpath:" + tag)}} .
+
 # Run cargo clean on the workspace members
 clean:
     cargo clean

@@ -1,0 +1,15 @@
+# Send only the workspace inputs needed to compile the server.
+**
+!Dockerfile
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!.cargo/
+!.cargo/config.toml
+!crates/
+!crates/**/
+!crates/**/Cargo.toml
+!crates/**/*.rs
+!crates/**/*.pest
+**/target/
+**/.git/

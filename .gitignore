@@ -12,6 +12,10 @@
 !.cargo/
 !.cargo/config.toml
 !rust-toolchain.toml
+!Dockerfile
+!.dockerignore
+!LICENSE-APACHE
+!LICENSE-MIT
 
 # allowlist `crates` directories and their children, regardless of place
 !crates/

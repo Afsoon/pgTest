@@ -2,6 +2,9 @@
 resolver = "3"
 members = ["crates/pgtest-core", "crates/pgtest-server", "crates/pgtest-wire", "crates/pgtest-utils", "crates/pgtest-database-operations"]
 
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 restriction = { level = "warn", priority = -1 }

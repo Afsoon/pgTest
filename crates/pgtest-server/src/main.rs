@@ -3,7 +3,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use envconfig::Envconfig;
@@ -14,6 +14,8 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 
 #[derive(Envconfig)]
 struct ServerConfig {
+    #[envconfig(from = "PGTEST_LISTEN_ADDR", default = "127.0.0.1:6432")]
+    listen_addr: SocketAddr,
     #[envconfig(from = "PGTEST_UNIX_SOCKET_DIR")]
     unix_socket_dir: Option<PathBuf>,
 }
@@ -48,8 +50,9 @@ async fn main() -> Result<()> {
             .await
             .context("failed to start worker engine manager")?,
     );
-    let address =
-        wire_listener::run(engine.clone()).await.context("failed to start wire listener")?;
+    let address = wire_listener::run(engine.clone(), server_config.listen_addr)
+        .await
+        .context("failed to start wire listener")?;
     tracing::info!(%address, "pgtest server listening");
 
     #[cfg(unix)]
@@ -70,4 +73,34 @@ async fn main() -> Result<()> {
         listener.shutdown().await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn default_listener_stays_on_loopback() {
+        let config = ServerConfig::init_from_hashmap(&HashMap::new()).unwrap();
+        assert_eq!(config.listen_addr, "127.0.0.1:6432".parse().unwrap());
+    }
+
+    #[test]
+    fn listener_accepts_explicit_ipv4_and_ipv6_addresses() {
+        for address in ["0.0.0.0:6432", "127.0.0.1:0", "[::]:6432"] {
+            let vars = HashMap::from([("PGTEST_LISTEN_ADDR".to_owned(), address.to_owned())]);
+            let config = ServerConfig::init_from_hashmap(&vars).unwrap();
+            assert_eq!(config.listen_addr, address.parse().unwrap());
+        }
+    }
+
+    #[test]
+    fn invalid_listener_address_is_rejected() {
+        for address in ["localhost:6432", "0.0.0.0", "127.0.0.1:65536", ""] {
+            let vars = HashMap::from([("PGTEST_LISTEN_ADDR".to_owned(), address.to_owned())]);
+            assert!(ServerConfig::init_from_hashmap(&vars).is_err());
+        }
+    }
 }
