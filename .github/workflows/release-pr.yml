@@ -21,7 +21,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
@@ -32,6 +32,6 @@ jobs:
       - uses: release-plz/action@v0.5
         with:
           command: release-pr
-          version: '0.3.169'
+          version: "0.3.169"
         env:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}
