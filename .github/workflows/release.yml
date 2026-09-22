@@ -19,6 +19,7 @@ jobs:
       github.event.pull_request.merged == true &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'release-plz-')
+    cache-mode: write
     uses: ./.github/workflows/tests.yml
     with:
       source_sha: ${{ github.event.pull_request.merge_commit_sha }}
@@ -71,6 +72,7 @@ jobs:
     needs: tags
     if: needs.tags.outputs.server_tag != ''
     runs-on: ubuntu-24.04
+    cache-mode: write
     permissions:
       contents: read
       packages: write
