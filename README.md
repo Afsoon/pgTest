@@ -1,6 +1,7 @@
 # PgTest
 
 [![CI](https://github.com/Afsoon/pgTest/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Afsoon/pgTest/actions/workflows/tests.yml)
+[![CD](https://github.com/Afsoon/pgTest/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Afsoon/pgTest/actions/workflows/release.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust: nightly](https://img.shields.io/badge/rust-nightly-orange)](rust-toolchain.toml)
 
@@ -16,22 +17,37 @@ You can use the current version to see how it works with your test suite.
 
 ## Motivation
 
-I built PgTest because I was tired of mocking PostgreSQL clients in tests,
-especially for complex queries. I wanted to run those queries against real
-PostgreSQL databases without making test setup expensive or cumbersome.
-
 [IntegreSQL](https://github.com/allaboutapps/integresql) was an inspiration, but
-its latest listed [commit](https://github.com/allaboutapps/integresql/commits/master/)
-and [release](https://github.com/allaboutapps/integresql/releases/tag/v1.1.0)
-date to January 2024, as checked in September 2026. My biggest difficulty with
-it was managing test databases through a service outside the PostgreSQL
-connection lifecycle. In my experience, its timing assumptions and speculative
-recycling required too much tuning for my test suites. I wanted database
-assignment and explicit cleanup to happen through PostgreSQL connections.
+it was unmaintained when I started this project. Managing test databases through
+a separate API, along with its time-based recycling, required too much tuning
+for my test suites.
 
-I also wanted an IntegreSQL-like library for JavaScript that fit this workflow,
-beyond the options available in Go. PgTest's CLI provides a way to use it from
-different test runners until libraries that wrap it are available.
+I wanted to simplify that workflow, so I built PgTest as a PostgreSQL proxy.
+Database assignment and explicit cleanup happen through PostgreSQL connections,
+using the test suite's existing client instead of requiring a separate integration
+for each language.
+
+### Performance
+
+These timings compare IntegreSQL with PgTest using the test suite in
+[demo-post-node-integresql](https://github.com/Afsoon/demo-post-node-integresql).
+The suite contains **226 tests across 15 files**.
+This is the only repository used so far to measure performance improvements,
+so the results are indicative rather than a comprehensive benchmark.
+
+| Test environment | IntegreSQL (before) | PgTest (now) |
+| --- | --- | --- |
+| Local — M1 Pro, 32 GB RAM | ~7 s | ~5 s |
+| CI — shard 1 | 25.04 s | 14.47 s |
+| CI — shard 2 | 28.21 s | 13.37 s |
+| CI — shard 3 | 28.32 s | 13.80 s |
+| CI — without sharding | 41.99 s | 29.45 s |
+
+Pipeline results:
+
+- [IntegreSQL, sharded](https://github.com/Afsoon/demo-post-node-integresql/actions/runs/32628132498)
+- [PgTest](https://github.com/Afsoon/demo-post-node-integresql/actions/runs/35735560262/job/106771774389?pr=1)
+- [IntegreSQL, without sharding](https://github.com/Afsoon/demo-post-node-integresql/actions/runs/32278970555/job/96152946167)
 
 ## Goals
 
@@ -66,7 +82,28 @@ PostgreSQL instance.
 
 ## Install
 
-TBA after first release
+### Homebrew
+
+Install the CLI on Apple Silicon macOS or Linux (ARM64/x86_64):
+
+```sh
+brew install Afsoon/tap/pgtest
+pgtest version
+```
+
+### Docker image
+
+The image is available at `ghcr.io/afsoon/pgtest` for Linux ARM64 and x86_64.
+**Prefer the commit-hash tag over the version tag** to identify the exact source
+commit used to build the image. Replace `<12-character-commit>` with the first
+12 characters of the released server commit:
+
+```sh
+docker pull 'ghcr.io/afsoon/pgtest:sha-<12-character-commit>'
+```
+
+Version tags such as `ghcr.io/afsoon/pgtest:v0.1.0` are also available. Each release
+publishes both tags for the same image.
 
 ### macOS releases
 
@@ -93,26 +130,20 @@ Choose one launch method below. Both expose PgTest on `127.0.0.1:6432`.
 
 ### CLI
 
-From a checkout, build with Rust nightly and `just`. Linux GNU builds also require
-GCC and mold, as configured in this repository.
+After installing with Homebrew, start the CLI:
 
 ```sh
-just cli::build-release dev dev
-./target/release/pgtest serve \
+pgtest serve \
   --pg-host 127.0.0.1 --pg-port 5432 \
   --pg-user postgres --pg-database test_template \
   --listen-addr 127.0.0.1 --listen-port 6432
 ```
 
-The two build arguments are the version and commit SHA. `dev dev` is suitable for
-local development; see [build metadata](#build-metadata) for release builds.
-
 ### Docker
 
-Build the local image from a checkout with Docker and `just`:
+Run the published image using the commit-hash tag selected during installation:
 
 ```sh
-just docker-build
 docker run --rm --name pgtest \
   --add-host=host.docker.internal:host-gateway \
   -p 127.0.0.1:6432:6432 \
@@ -120,7 +151,7 @@ docker run --rm --name pgtest \
   -e PGTEST_PG_PORT=5432 \
   -e PGTEST_PG_USER=postgres \
   -e PGTEST_PG_DATABASE=test_template \
-  pgtest-server:latest
+  'ghcr.io/afsoon/pgtest:sha-<12-character-commit>'
 ```
 
 This example connects to PostgreSQL on the Docker host. PostgreSQL must listen on
@@ -175,8 +206,7 @@ native PgTest CLI automatically.
 ### Prefer Unix sockets
 
 Use Unix sockets whenever possible, both from the test suite to PgTest and from
-PgTest to PostgreSQL, when the processes run on the same host and can access the
-socket directories. Unix sockets avoid the TCP connection handshake and reduce
+PgTest to PostgreSQL. Unix sockets avoid the TCP connection handshake and reduce
 networking overhead. These savings can accumulate across long test suites that
 open many connections.
 
@@ -217,15 +247,6 @@ allows connections without a password, and the
 trade crash safety for reduced disk overhead. The example uses PostgreSQL 18 for
 `file_copy_method=clone`; its performance benefit depends on the underlying
 filesystem.
-
-### Prefer the CLI over Docker
-
-Run PgTest with the native [CLI](#cli) whenever possible. The Docker image is
-provided for environments where the CLI cannot be used. Using the CLI avoids
-starting a container for the proxy and simplifies using Unix sockets with your
-test suite. Build the binary once and reuse it across test runs. PostgreSQL can
-still run in Docker, as shown in the
-[Rust example](example/example-rust-cli/README.md).
 
 ### Size the initial database pool for test concurrency
 
@@ -303,24 +324,24 @@ The CLI requires all four upstream arguments and at least one of `--listen-addr`
 or `--unix-socket-dir`. The server supplies upstream defaults and always enables
 TCP; its Unix listener is optional.
 
-| CLI argument | Server environment variable | Default: CLI / server | Purpose |
-| --- | --- | --- | --- |
-| `--pg-host` | `PGTEST_PG_HOST` | Required / `127.0.0.1` | Upstream hostname, IP address, or absolute Unix socket directory. |
-| `--pg-port` | `PGTEST_PG_PORT` | Required / `5432` | Upstream TCP port or Unix socket filename port. |
-| `--pg-user` | `PGTEST_PG_USER` | Required / `postgres` | User for database management. |
-| `--pg-database` | `PGTEST_PG_DATABASE` | Required / `pgtest` | Existing template database to clone. |
-| `--listen-addr` | `PGTEST_LISTEN_ADDR` | Disabled / `127.0.0.1` | TCP bind IP, without a port. Docker defaults to `0.0.0.0`. |
-| `--listen-port` | `PGTEST_LISTEN_PORT` | `6432` | TCP listener port; `0` selects an available port. |
-| `--unix-socket-dir` | `PGTEST_UNIX_SOCKET_DIR` | Disabled | Existing directory for the frontend Unix socket. |
-| `--unix-socket-port` | `PGTEST_UNIX_SOCKET_PORT` | `6432` | Port used in the frontend socket filename. |
-| `--creation-pool-connection` | `PGTEST_CREATION_POOL_CONNECTION` | `10` | Maximum database-creation connections. |
-| `--cleanup-pool-connection` | `PGTEST_CLEANUP_POOL_CONNECTION` | `5` | Maximum database-cleanup connections. |
-| `--pool-initial-size` | `PGTEST_POOL_INITIAL_SIZE` | `16` | Initial ready databases. |
-| `--pool-starvation-threshold` | `PGTEST_POOL_STARVATION_THRESHOLD` | `8` | Ready-database threshold for replenishment. |
-| `--pool-grow-batch-size` | `PGTEST_POOL_GROW_BATCH_SIZE` | `16` | Databases created per growth batch; `0` disables growth. |
-| `--lease-claim-timeout-ms` | `PGTEST_LEASE_CLAIM_TIMEOUT_MS` | `30000` | Lease lifetime and pending-claim timeout, in milliseconds; `0` disables these timeouts. |
-| `--max-lease-records` | `PGTEST_MAX_LEASE_RECORDS` | `100000` | Maximum admitted lease IDs, including pending and closed leases. |
-| `--log-filter` | `RUST_LOG` | `info` | Tracing filter, such as `info` or `debug`. |
+| CLI argument                  | Server environment variable        | Default: CLI / server  | Purpose                                                                                 |
+| ----------------------------- | ---------------------------------- | ---------------------- | --------------------------------------------------------------------------------------- |
+| `--pg-host`                   | `PGTEST_PG_HOST`                   | Required / `127.0.0.1` | Upstream hostname, IP address, or absolute Unix socket directory.                       |
+| `--pg-port`                   | `PGTEST_PG_PORT`                   | Required / `5432`      | Upstream TCP port or Unix socket filename port.                                         |
+| `--pg-user`                   | `PGTEST_PG_USER`                   | Required / `postgres`  | User for database management.                                                           |
+| `--pg-database`               | `PGTEST_PG_DATABASE`               | Required / `pgtest`    | Existing template database to clone.                                                    |
+| `--listen-addr`               | `PGTEST_LISTEN_ADDR`               | Disabled / `127.0.0.1` | TCP bind IP, without a port. Docker defaults to `0.0.0.0`.                              |
+| `--listen-port`               | `PGTEST_LISTEN_PORT`               | `6432`                 | TCP listener port; `0` selects an available port.                                       |
+| `--unix-socket-dir`           | `PGTEST_UNIX_SOCKET_DIR`           | Disabled               | Existing directory for the frontend Unix socket.                                        |
+| `--unix-socket-port`          | `PGTEST_UNIX_SOCKET_PORT`          | `6432`                 | Port used in the frontend socket filename.                                              |
+| `--creation-pool-connection`  | `PGTEST_CREATION_POOL_CONNECTION`  | `10`                   | Maximum database-creation connections.                                                  |
+| `--cleanup-pool-connection`   | `PGTEST_CLEANUP_POOL_CONNECTION`   | `5`                    | Maximum database-cleanup connections.                                                   |
+| `--pool-initial-size`         | `PGTEST_POOL_INITIAL_SIZE`         | `16`                   | Initial ready databases.                                                                |
+| `--pool-starvation-threshold` | `PGTEST_POOL_STARVATION_THRESHOLD` | `8`                    | Ready-database threshold for replenishment.                                             |
+| `--pool-grow-batch-size`      | `PGTEST_POOL_GROW_BATCH_SIZE`      | `16`                   | Databases created per growth batch; `0` disables growth.                                |
+| `--lease-claim-timeout-ms`    | `PGTEST_LEASE_CLAIM_TIMEOUT_MS`    | `30000`                | Lease lifetime and pending-claim timeout, in milliseconds; `0` disables these timeouts. |
+| `--max-lease-records`         | `PGTEST_MAX_LEASE_RECORDS`         | `100000`               | Maximum admitted lease IDs, including pending and closed leases.                        |
+| `--log-filter`                | `RUST_LOG`                         | `info`                 | Tracing filter, such as `info` or `debug`.                                              |
 
 A single default in the table applies to both executables. For the CLI,
 `--listen-port` requires `--listen-addr`, and `--unix-socket-port` requires
@@ -332,25 +353,56 @@ be between `1` and `65535`. The directory must already exist and be writable by
 the process. With Docker, mount the directory and account for the container's
 UID/GID `65532:65532`.
 
-### Build metadata
+### Version information
 
-CLI build recipes require a nonempty version and commit SHA:
+Check the CLI version and the source commit used to build it:
 
 ```sh
-just cli::build-release 0.1.0 "$(git rev-parse HEAD)"
-./target/release/pgtest version
+pgtest version
 ```
 
-The recipe embeds `PGTEST_VERSION` and `PGTEST_COMMIT_SHA` at compilation. Direct
-Cargo builds default each value to `dev` when it is unset or empty. `version`,
-`--version`, and `-V` report these values; runtime variables cannot override them.
+`pgtest --version` and `pgtest -V` report the same information.
 
 See the [CLI documentation](apps/cli/README.md) for shell completion and profiling,
 and the [server documentation](apps/server/README.md) for listener details.
 
 ## Architecture
 
-WIP
+```mermaid
+flowchart LR
+    Tests["Test suite<br/>PostgreSQL client"]
+
+    subgraph PgTest["PgTest — CLI or Docker"]
+        Server["Server<br/>SQL proxy and admin commands"]
+        Manager["Manager worker<br/>Leases and ready database pool"]
+        Creation["Database creation worker<br/>Creation PostgreSQL client pool"]
+        Cleanup["Database cleanup worker<br/>Cleanup PostgreSQL client pool"]
+
+        Server <-->|Lease requests and replies| Manager
+        Manager <-->|Creation jobs and results| Creation
+        Manager <-->|Cleanup jobs and results| Cleanup
+    end
+
+    subgraph PostgreSQL["PostgreSQL upstream"]
+        Template[(Template database)]
+        Leased[(Databases for leases)]
+        Template -.->|Cloned into| Leased
+    end
+
+    Tests <-->|TCP or Unix socket| Server
+    Server <-->|Lease SQL over TCP or Unix socket| Leased
+    Creation -.->|Clone from| Template
+    Cleanup -.->|Drop released or expired databases| Leased
+```
+
+The manager, creation worker, and cleanup worker run as three asynchronous
+workers. The manager assigns ready databases to leases and coordinates creation
+and cleanup; the server forwards application SQL to the assigned database.
+Connections sharing a lease ID use the same database.
+
+Dashed arrows show database operations. Both worker connection pools connect to
+the upstream `postgres` maintenance database to execute creation and cleanup
+commands; they do not connect to the template or leased databases directly.
 
 ## Contributing
 
