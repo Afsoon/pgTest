@@ -1,8 +1,9 @@
 # Releases
 
 [Release-plz](https://release-plz.dev/docs/github/quickstart) prepares version and
-changelog PRs automatically on `main`. Publication starts manually with the
-**Publish** workflow. No push or tag automatically publishes artifacts.
+changelog PRs automatically on `main`. Reviewing and merging a release PR is the
+manual approval to publish: its merge starts the **Publish** workflow.
+Regular PRs, unmerged closed PRs, and tag pushes do not publish artifacts.
 
 The internal crates share the workspace version. The CLI and server keep their
 own versions. App-only changes bump that app; internal changes also bump the apps
@@ -12,8 +13,9 @@ that depend on them. Nothing is published to crates.io.
 
 1. Review and merge the release-plz PR. Use Conventional Commit titles for code
    changes so release-plz can determine the next versions.
-2. Run **Actions → Publish → Run workflow** on `main`. It automatically selects
-   the latest merged release PR and runs nextest and doctests.
+2. Merging the PR into `main` automatically starts **Publish**, which runs nextest
+   and doctests against that PR's merge commit. The PR must come from a
+   `release-plz-*` branch in this repository.
 3. Release-plz creates the pending `cli-v<version>`, `server-v<version>`, and
    `internals-v<version>` tags. The internal tag is a version baseline only.
 4. Changed apps are published: Docker builds both Linux architectures in one job;

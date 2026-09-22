@@ -1,7 +1,9 @@
 name: Publish
 
 on:
-  workflow_dispatch:
+  pull_request:
+    types: [closed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -11,39 +13,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  source:
-    if: github.ref == 'refs/heads/main' && github.repository == 'Afsoon/pgTest'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      sha: ${{ steps.source.outputs.sha }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Select the latest merged release PR
-        id: source
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          sha=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls?state=closed&base=main&per_page=100" \
-            --jq '[.[][] | select(.merged_at != null and (.head.ref | startswith("release-plz-")))] | max_by(.merged_at).merge_commit_sha')
-          test -n "$sha" && test "$sha" != null
-          git merge-base --is-ancestor "$sha" origin/main
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Release source: $sha" >> "$GITHUB_STEP_SUMMARY"
-
   tests:
-    needs: source
+    if: >-
+      github.repository == 'Afsoon/pgTest' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-')
     uses: ./.github/workflows/tests.yml
     with:
-      source_sha: ${{ needs.source.outputs.sha }}
+      source_sha: ${{ github.event.pull_request.merge_commit_sha }}
 
   tags:
-    needs: [source, tests]
+    needs: tests
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -54,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.source.outputs.sha }}
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: release-plz/action@v0.5
