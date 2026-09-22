@@ -24,8 +24,8 @@ jobs:
       - uses: actions/create-github-app-token@v3
         id: app
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.RELEASE_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
       - uses: rui314/setup-mold@v1
         with:
           make-default: false
