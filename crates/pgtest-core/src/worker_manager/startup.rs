@@ -11,7 +11,9 @@ use super::{
     database_creation_worker::DatabaseCreationWorker,
     worker_io::{DatabaseWorkerSenders, WorkerEngineIO, WorkerEngineInbox},
 };
-use crate::worker_engine::{core::WorkerEngineConfig, errors::PostgresDDLClientError};
+use crate::worker_engine::{
+    core::WorkerEngineConfig, errors::PostgresDDLClientError, lifecycle::DatabaseLifecycle,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
@@ -39,6 +41,7 @@ pub(super) async fn prepare_postgres(
 pub(super) async fn start_workers(
     postgres_client: Arc<PostgresManager>,
     worker_engine_config: WorkerEngineConfig,
+    lifecycle: Arc<dyn DatabaseLifecycle>,
 ) -> Result<WorkerEngineManager, StartError> {
     let (inbox_tx, inbox_rx) =
         hotpath::channel!(tokio::sync::mpsc::unbounded_channel(), label = "worker-inbox");
@@ -81,6 +84,7 @@ pub(super) async fn start_workers(
         postgres_client.clone(),
         worker_engine_io,
         worker_engine_inbox,
+        lifecycle,
     );
 
     // Preserve the stack bound when engine initialization is instrumented.

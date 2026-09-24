@@ -17,6 +17,7 @@ use crate::worker_engine::{
     database_inventory::DatabaseInventory,
     database_jobs::{CleanupDatabase, CreateDatabase, DatabaseWorkerMessages},
     errors::{IOError, PostgresDDLClientError},
+    lifecycle::NoopDatabaseLifecycle,
     messages::{ConsumerReply, EngineMessage},
     traits::{ConsumerIO, EngineIO, EngineInbox, PostgresClient},
 };
@@ -241,7 +242,13 @@ impl EngineSimulator {
             inbox.push_message(msg);
         }
 
-        let mut engine = WorkerEngine::new(worker_engine_config, manager, engine_io, inbox.clone());
+        let mut engine = WorkerEngine::new(
+            worker_engine_config,
+            manager,
+            engine_io,
+            inbox.clone(),
+            Arc::new(NoopDatabaseLifecycle),
+        );
 
         engine.try_init().await.unwrap();
 
@@ -276,7 +283,13 @@ impl EngineSimulator {
             inbox.push_message(msg);
         }
 
-        let mut engine = WorkerEngine::new(worker_engine_config, manager, engine_io, inbox.clone());
+        let mut engine = WorkerEngine::new(
+            worker_engine_config,
+            manager,
+            engine_io,
+            inbox.clone(),
+            Arc::new(NoopDatabaseLifecycle),
+        );
 
         engine.try_init().await.unwrap();
 
@@ -379,7 +392,8 @@ pub async fn run_grow_with(
     let inbox = WorkerInboxImpl::new(inbox_buffer.clone());
     let engine_io = ScriptedWorkerIO::new(script, inbox_buffer);
 
-    let mut worker = GrowWorker::new(config, manager, engine_io.clone(), inbox);
+    let mut worker =
+        GrowWorker::new(config, manager, engine_io.clone(), inbox, Arc::new(NoopDatabaseLifecycle));
 
     worker.try_init().await.unwrap();
     worker.grow();

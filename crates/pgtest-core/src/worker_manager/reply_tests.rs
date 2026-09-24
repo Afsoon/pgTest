@@ -1,7 +1,7 @@
 use pgtest_utils::read_string::ReadString;
 
 use super::*;
-use crate::worker_engine::traits::ConsumerIO;
+use crate::worker_engine::{database_jobs::DatabaseId, traits::ConsumerIO};
 
 #[tokio::test]
 async fn dropping_an_unread_attach_reply_detaches_the_registered_generation() {
@@ -18,6 +18,7 @@ async fn dropping_an_unread_attach_reply_detaches_the_registered_generation() {
                 database_name: ReadString::from("clone"),
                 generation: 42,
                 cancellation: CancellationToken::new(),
+                database_id: DatabaseId(0)
             })
             .is_ok()
     );
@@ -42,6 +43,7 @@ async fn failed_attach_delivery_leaves_rollback_to_the_engine() {
                 database_name: ReadString::from("clone"),
                 generation: 42,
                 cancellation: CancellationToken::new(),
+                database_id: DatabaseId(0)
             })
             .is_err()
     );

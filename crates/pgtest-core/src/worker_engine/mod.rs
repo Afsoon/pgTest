@@ -3,6 +3,7 @@ pub mod database_inventory;
 pub mod database_jobs;
 pub mod errors;
 mod lease_id;
+pub mod lifecycle;
 pub mod messages;
 pub mod traits;
 
@@ -230,6 +231,7 @@ mod worker_engine_test {
             database_name: old_name,
             generation: old_generation,
             cancellation: old_cancel,
+            database_id: _,
         } = &messages[0]
         else {
             panic!("expected original attachment");
@@ -238,6 +240,7 @@ mod worker_engine_test {
             database_name: new_name,
             generation: new_generation,
             cancellation: new_cancel,
+            database_id: _,
         } = &messages[1]
         else {
             panic!("expected fresh attachment");

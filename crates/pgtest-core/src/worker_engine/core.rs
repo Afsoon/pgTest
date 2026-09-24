@@ -9,6 +9,7 @@ use crate::worker_engine::{
     database_inventory::{Database, DatabaseInventory},
     database_jobs::DatabaseWorkerMessages,
     errors::{AttachError, PostgresDDLClientError, ReleaseError},
+    lifecycle::DatabaseLifecycle,
     messages::{ConsumerReply, EngineMessage},
     traits::{ConsumerIO, EngineIO, EngineInbox, PostgresClient},
 };
@@ -66,6 +67,7 @@ where
     consumer: PhantomData<Consumer>,
     root_cancellation_token: CancellationToken,
     pub inventory: DatabaseInventory,
+    lifecycle: Arc<dyn DatabaseLifecycle>,
 }
 
 #[derive(Default)]
@@ -91,6 +93,7 @@ where
         postgres_manager: Arc<Postgres>,
         engine_io: IO,
         inbox: Inbox,
+        lifecycle: Arc<dyn DatabaseLifecycle>,
     ) -> WorkerEngine<Consumer, IO, Inbox, Postgres> {
         let leases = FxHashMap::default();
         let root_cancellation_token = CancellationToken::new();
@@ -109,6 +112,7 @@ where
             consumer: PhantomData,
             root_cancellation_token,
             inventory: DatabaseInventory::default(),
+            lifecycle,
         }
     }
 
@@ -119,19 +123,26 @@ where
             let database_id = request.database_id;
 
             let result = self.pg_client.create_database().await;
+            let database_name = result.as_ref().ok().cloned();
 
-            if let Ok(database_name) = &result {
-                tracing::info!(?database_id, %database_name, "created initial database");
-            }
-            if let Err(error) = self
+            match self
                 .inventory
                 .complete_creation(database_id, result)
                 .expect("initial creation must have a pending reservation")
             {
-                tracing::error!(?database_id, %error, "initial database creation failed");
-                return Err(error);
+                Ok(()) => {
+                    let database_name =
+                        database_name.expect("accepted creation must have a database name");
+                    tracing::info!(?database_id, %database_name, "created initial database");
+                    self.lifecycle.database_ready(database_id, &database_name);
+                }
+                Err(error) => {
+                    tracing::error!(?database_id, %error, "initial database creation failed");
+                    return Err(error);
+                }
             }
         }
+
         Ok(())
     }
 
@@ -189,6 +200,8 @@ where
     fn handle_database_worker_message(&mut self, message: DatabaseWorkerMessages) {
         match message {
             DatabaseWorkerMessages::CreationFinished { database_id, result } => {
+                let database_name = result.as_ref().ok().cloned();
+
                 let Some(result) = self.inventory.complete_creation(database_id, result) else {
                     tracing::warn!(?database_id, "creation result without a pending reservation");
                     return;
@@ -197,6 +210,10 @@ where
                 if let Err(error) = result {
                     self.counters.template_create_failures += 1;
                     tracing::error!(?database_id, %error, "database creation failed");
+                } else {
+                    let database_name =
+                        database_name.expect("accepted creation must have a database name");
+                    self.lifecycle.database_ready(database_id, &database_name);
                 }
 
                 self.dispatch_waiters();
@@ -349,6 +366,7 @@ where
                 database_name,
                 generation: entry.generation,
                 cancellation: entry.cancellation.clone(),
+                database_id: entry.database.database_id,
             })
             .is_err()
         {
@@ -460,6 +478,7 @@ where
 
         let request = self.inventory.retire(entry.database);
         let database_id = request.database_id;
+        self.lifecycle.database_retired(database_id);
 
         if let Err(error) = self.engine_io.request_cleanup(request) {
             tracing::error!(?database_id, %lease, %error, "unable to enqueue cleanup; retaining retirement record")

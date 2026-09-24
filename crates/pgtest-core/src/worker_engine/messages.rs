@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::worker_engine::{
     core::LeaseId,
-    database_jobs::DatabaseWorkerMessages,
+    database_jobs::{DatabaseId, DatabaseWorkerMessages},
     errors::{AttachError, ReleaseError},
     traits::ConsumerIO,
 };
@@ -39,7 +39,12 @@ pub enum EngineMessage<C: ConsumerIO> {
 
 #[cfg_attr(test, derive(Clone, Debug))]
 pub enum ConsumerReply {
-    Attached { database_name: ReadString, generation: u64, cancellation: CancellationToken },
+    Attached {
+        database_name: ReadString,
+        generation: u64,
+        cancellation: CancellationToken,
+        database_id: DatabaseId,
+    },
     FailedToAttach,
     AttachRejected(AttachError),
     ReleaseResult(Result<(), ReleaseError>),

@@ -5,8 +5,17 @@ use std::{
 };
 
 use pgtest::worker_engine::database_jobs::DatabaseId;
+use tokio::{
+    sync::{Notify, Semaphore},
+    time::Instant,
+};
+use tokio_retry2::strategy::ExponentialFactorBackoff;
+use tokio_util::sync::CancellationToken;
 
 use crate::postgres_upstream::{self, UpstreamSession};
+
+mod attempt;
+pub(crate) use attempt::WarmAttemptError;
 
 /// Configuration for preparing fresh, single-use upstream connections.
 ///
@@ -129,10 +138,14 @@ pub(crate) struct ConnectionWarmPool {
     config: ConnectionWarmConfig,
     profile: WarmStartupProfile,
     state: Mutex<WarmPoolState>,
+    attempt_permits: Semaphore,
+    cancellation: CancellationToken,
+    changed: Notify,
 }
 
 #[derive(Default)]
 struct WarmPoolState {
+    schedule_order: VecDeque<DatabaseId>,
     databases: HashMap<DatabaseId, DatabaseWarmState>,
     capacity_used: usize,
 }
@@ -141,12 +154,31 @@ struct DatabaseWarmState {
     database_name: String,
     idle: VecDeque<UpstreamSession>,
     in_flight: usize,
+    retry_at: Option<Instant>,
+    retry_strategy: ExponentialFactorBackoff,
+    retiring: bool,
+    cancellation: CancellationToken,
+}
+
+fn warm_retry_strategy() -> ExponentialFactorBackoff {
+    ExponentialFactorBackoff::from_millis(1_000, 2.0).max_delay(Duration::from_secs(30))
 }
 
 impl ConnectionWarmPool {
     pub(crate) fn new(config: ConnectionWarmConfig, default_user: &str) -> Self {
         let profile = config.resolve_profile(default_user);
-        Self { config, profile, state: Mutex::new(WarmPoolState::default()) }
+        // Attempts cannot exceed reserved capacity. Capping at Tokio's limit
+        // also keeps very large, otherwise valid settings from panicking.
+        let attempt_permits =
+            Semaphore::new(config.concurrency.min(config.max_total).min(Semaphore::MAX_PERMITS));
+        Self {
+            config,
+            profile,
+            state: Mutex::new(WarmPoolState::default()),
+            attempt_permits,
+            cancellation: CancellationToken::new(),
+            changed: Notify::new(),
+        }
     }
 
     pub(crate) fn register_database(&self, database_id: DatabaseId, database_name: String) -> bool {
@@ -159,17 +191,105 @@ impl ConnectionWarmPool {
             return false;
         };
 
-        match state_lock.databases.entry(database_id) {
+        if self.cancellation.is_cancelled() {
+            return false;
+        }
+
+        let registered = match state_lock.databases.entry(database_id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(vacant_entry) => {
                 vacant_entry.insert(DatabaseWarmState {
                     database_name,
                     idle: VecDeque::default(),
                     in_flight: 0,
+                    retry_at: None,
+                    retry_strategy: warm_retry_strategy(),
+                    retiring: false,
+                    cancellation: self.cancellation.child_token(),
                 });
+                state_lock.schedule_order.push_back(database_id);
                 true
             }
+        };
+        drop(state_lock);
+        if registered {
+            self.changed.notify_one();
         }
+        registered
+    }
+
+    /// Disable this database and cancel its warm work. This is a notification
+    /// of logical retirement, not an acknowledgement that attempts have
+    /// drained.
+    pub(crate) fn retire_database(&self, database_id: DatabaseId) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            tracing::error!("lock poisoned during database retirement");
+            return false;
+        };
+        let current_capacity = state.capacity_used;
+        let Some(entry) = state.databases.get_mut(&database_id) else {
+            return false;
+        };
+        if entry.retiring {
+            return false;
+        }
+
+        let remaining_capacity = current_capacity
+            .checked_sub(entry.idle.len())
+            .expect("idle sessions must occupy capacity");
+        entry.retiring = true;
+        entry.retry_at = None;
+        let cancellation = entry.cancellation.clone();
+        let idle = std::mem::take(&mut entry.idle);
+        state.capacity_used = remaining_capacity;
+        state.schedule_order.retain(|id| *id != database_id);
+        // Retain the entry so outstanding reservations can settle and duplicate
+        // registration cannot reactivate the same physical identity. Removal
+        // will be coordinated with the later drain-before-delete barrier.
+        drop(state);
+        cancellation.cancel();
+        drop(idle);
+        self.changed.notify_one();
+        true
+    }
+
+    fn reserve_locked(
+        self: &Arc<Self>,
+        state: &mut WarmPoolState,
+        database_id: DatabaseId,
+    ) -> Option<WarmReservation> {
+        if self.cancellation.is_cancelled() || state.capacity_used >= self.config.max_total {
+            return None;
+        }
+
+        let Some(entry) = state.databases.get_mut(&database_id) else {
+            return None;
+        };
+
+        if entry.retiring || entry.cancellation.is_cancelled() {
+            return None;
+        }
+
+        if entry.retry_at.is_some_and(|deadline| Instant::now() < deadline) {
+            return None;
+        }
+
+        if entry.idle.len() + entry.in_flight >= usize::from(self.config.per_database) {
+            return None;
+        }
+
+        entry.in_flight = entry.in_flight.saturating_add(1);
+        let database_name = entry.database_name.clone();
+        let cancellation = entry.cancellation.clone();
+        state.capacity_used = state.capacity_used.saturating_add(1);
+
+        Some(WarmReservation {
+            pool: self.clone(),
+            database_id,
+            database_name,
+            cancellation,
+            active: true,
+        })
     }
 
     pub(crate) fn try_reserve(
@@ -185,23 +305,40 @@ impl ConnectionWarmPool {
             return None;
         };
 
+        self.reserve_locked(&mut state_lock, database_id)
+    }
+
+    /// Reserve one slot in round-robin registration order, scanning at most
+    /// one pass and skipping databases whose spare target is already covered.
+    pub(crate) fn reserve_next(self: &Arc<Self>) -> Option<WarmReservation> {
+        if !self.config.is_enabled() {
+            return None;
+        }
+
+        let Ok(mut state_lock) = self.state.lock() else {
+            tracing::error!("lock poisoned during reserve next");
+            return None;
+        };
+
         if state_lock.capacity_used >= self.config.max_total {
             return None;
         }
 
-        let Some(entry) = state_lock.databases.get_mut(&database_id) else {
-            return None;
-        };
+        let current_queue_size = state_lock.schedule_order.len();
 
-        if entry.idle.len() + entry.in_flight >= usize::from(self.config.per_database) {
-            return None;
+        for _ in 0..current_queue_size {
+            let database_id = state_lock.schedule_order.pop_front()?;
+            if !state_lock.databases.contains_key(&database_id) {
+                continue;
+            }
+
+            state_lock.schedule_order.push_back(database_id);
+            if let Some(reservation) = self.reserve_locked(&mut state_lock, database_id) {
+                return Some(reservation);
+            }
         }
 
-        entry.in_flight = entry.in_flight.saturating_add(1);
-        let database_name = entry.database_name.clone();
-        state_lock.capacity_used = state_lock.capacity_used.saturating_add(1);
-
-        Some(WarmReservation { pool: self.clone(), database_id, database_name, active: true })
+        None
     }
 
     pub(crate) fn try_checkout(
@@ -224,11 +361,15 @@ impl ConnectionWarmPool {
 
         let current_capacity = state_lock.capacity_used;
 
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+
         let Some(entry) = state_lock.databases.get_mut(&database_id) else {
             return None;
         };
 
-        if entry.idle.is_empty() {
+        if entry.retiring || entry.cancellation.is_cancelled() || entry.idle.is_empty() {
             return None;
         }
 
@@ -237,6 +378,8 @@ impl ConnectionWarmPool {
 
         let warmed_session = entry.idle.pop_front().expect("expected to obtain a session ready");
         state_lock.capacity_used = remaining_capacity;
+        drop(state_lock);
+        self.changed.notify_one();
 
         Some(warmed_session)
     }
@@ -247,12 +390,84 @@ pub(crate) struct WarmReservation {
     pool: Arc<ConnectionWarmPool>,
     database_id: DatabaseId,
     database_name: String,
+    cancellation: CancellationToken,
     active: bool,
 }
 
 impl WarmReservation {
     pub(crate) fn database_name(&self) -> &str {
         &self.database_name
+    }
+
+    /// Establish and publish one fresh session, consuming this reservation.
+    ///
+    /// The reservation captures database/pool cancellation; the caller may
+    /// additionally cancel this attempt. Dropping this future releases its
+    /// permit, reservation, and partially connected socket. Failures update
+    /// retry eligibility before releasing capacity; scheduling the next
+    /// attempt belongs to the caller.
+    pub(crate) async fn establish(
+        self,
+        upstream_host: &str,
+        upstream_port: u16,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, WarmAttemptError> {
+        // Keep the pool alive independently of self so publication can consume
+        // the reservation while the borrowed permit remains held.
+        let pool = self.pool.clone();
+        let _permit = tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => return Err(WarmAttemptError::Cancelled),
+            _ = cancellation.cancelled() => return Err(WarmAttemptError::Cancelled),
+            permit = pool.attempt_permits.acquire() => {
+                permit.map_err(|_| WarmAttemptError::ConcurrencyClosed)?
+            }
+        };
+
+        let session = tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => return Err(WarmAttemptError::Cancelled),
+            result = attempt::connect_warm_session(
+                self.database_name(),
+                &pool.profile,
+                upstream_host,
+                upstream_port,
+                cancellation,
+            ) => result,
+        }
+        .inspect_err(|error| {
+            if matches!(error, WarmAttemptError::TimedOut | WarmAttemptError::Upstream(_)) {
+                self.record_failure();
+            }
+        })?;
+
+        // Publication also checks retirement under the state lock, covering
+        // cancellation that races with a successful connection attempt.
+        if cancellation.is_cancelled() || self.cancellation.is_cancelled() {
+            return Err(WarmAttemptError::Cancelled);
+        }
+        Ok(self.publish(session))
+    }
+
+    fn record_failure(&self) {
+        let Ok(mut state) = self.pool.state.lock() else {
+            tracing::error!("lock poisoned while recording warm attempt failure");
+            return;
+        };
+        let entry = state
+            .databases
+            .get_mut(&self.database_id)
+            .expect("reserved database must remain registered");
+        if self.pool.cancellation.is_cancelled()
+            || entry.retiring
+            || entry.cancellation.is_cancelled()
+        {
+            return;
+        }
+        let delay = entry.retry_strategy.next().expect("exponential backoff is unbounded");
+        entry.retry_at = Some(Instant::now() + delay);
+        drop(state);
+        self.pool.changed.notify_one();
     }
 
     pub(crate) fn publish(mut self, session: UpstreamSession) -> bool {
@@ -275,9 +490,23 @@ impl WarmReservation {
         let update_in_flight =
             entry.in_flight.checked_sub(1).expect("reservation must be in flight");
 
+        if self.pool.cancellation.is_cancelled()
+            || entry.retiring
+            || entry.cancellation.is_cancelled()
+        {
+            // Release the mutex before the rejected session and the active
+            // reservation are dropped. Reservation Drop settles its slot once.
+            drop(state_lock);
+            return false;
+        }
+
         entry.idle.push_back(session);
         entry.in_flight = update_in_flight;
+        entry.retry_at = None;
+        entry.retry_strategy = warm_retry_strategy();
         self.active = false;
+        drop(state_lock);
+        self.pool.changed.notify_one();
 
         true
     }
@@ -305,11 +534,16 @@ impl Drop for WarmReservation {
         let in_flight = entry.in_flight.checked_sub(1).expect("reservation must be in flight");
         entry.in_flight = in_flight;
         state_lock.capacity_used = capacity_used;
+        drop(state_lock);
+        self.pool.changed.notify_one();
     }
 }
 
 #[cfg(test)]
 mod publication_tests;
+
+#[cfg(test)]
+mod attempt_tests;
 
 #[cfg(test)]
 mod checkout_tests;

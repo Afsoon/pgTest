@@ -17,6 +17,7 @@ use super::{
     test_support::{ConsumerWorker, PostgresConnection, WorkerInboxImpl, past_instant},
     traits::EngineIO,
 };
+use crate::worker_engine::lifecycle::NoopDatabaseLifecycle;
 
 type Inbox = Arc<Mutex<VecDeque<EngineMessage<ConsumerWorker>>>>;
 type Engine = WorkerEngine<ConsumerWorker, DeferredIO, WorkerInboxImpl, PostgresConnection>;
@@ -90,7 +91,13 @@ impl Fixture {
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let io = DeferredIO { inbox: inbox.clone(), operations: Arc::default() };
         let pg = Arc::new(PostgresConnection::start(PostgresConfig::default()));
-        let mut engine = Engine::new(config, pg, io.clone(), WorkerInboxImpl::new(inbox));
+        let mut engine = Engine::new(
+            config,
+            pg,
+            io.clone(),
+            WorkerInboxImpl::new(inbox),
+            Arc::new(NoopDatabaseLifecycle),
+        );
         engine.try_init().await.unwrap();
         Self { engine, io, consumer: ConsumerWorker::new(Arc::default()) }
     }

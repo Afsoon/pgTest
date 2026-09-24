@@ -2,7 +2,12 @@
 
 Status: design agreed; baseline test added; external Vitest suite selected for
 remaining performance measurements. Pool registration, reservations, publication,
-and checkout are complete. Core lifecycle integration is next; runtime warming
+and checkout are complete. Physical identity and lifecycle hook injection are
+complete, including creation and retirement notifications. Reserved warm
+attempts now establish and publish sessions with shared concurrency limits,
+timeouts, and cancellation. Round-robin reservation selection and per-database
+retry backoff are complete. Retirement eligibility, cancellation ownership,
+and scheduler wakeups are implemented. The scheduler is next; runtime warming
 is not wired yet.
 
 ## Working agreement
@@ -31,6 +36,32 @@ The step 7b.3 publication tests were also delegated before implementation.
 The user delegated the step 7c checkout tests and implementation guide too;
 the checkout method remains user-written, with a temporary test-compilation
 failure expected until it is added.
+
+After implementing 11a, the user requested implementation of step 11. The
+assistant completed 11b and added socket-path tests covering the connected
+reservation, startup, and publication behavior. This exception applies to step
+11; subsequent steps retain the guided implementation agreement.
+
+The user subsequently delegated completion of 12a. The assistant finished the
+registration queue updates and bounded selector, preserving the user's shared
+reservation helper. New fairness coverage remains deferred to the connected
+scheduler as agreed; this exception does not authorize the remaining step 12
+implementation.
+
+The user then delegated only 12b and specified `tokio-retry2` for backoff. The
+assistant implemented that retry state and extended the socket-path coverage.
+Steps 12c and 12d remain pending and outside this implementation request.
+
+The user subsequently requested 12c. The assistant implemented retirement
+eligibility, database/pool cancellation ownership, wakeups, and connected socket
+regressions. The scheduler in 12d remains outside this request.
+
+For step 8 onward, the user prefers integration coverage over isolated unit
+tests. Split the implementation into small parts and defer new lifecycle tests
+until the structure supports testing the connected behavior. Maintain existing
+tests as APIs change; do not add tests that only exercise a mock hook or an
+isolated forwarding method. Use the existing manager/PostgreSQL harness and
+external Vitest suite when the relevant paths are wired.
 
 Each instruction should identify the purpose, relevant code, expected behavior,
 and verification. Each intermediate change must compile and preserve behavior
@@ -63,10 +94,13 @@ with uninstrumented timing runs.
   ErrorResponse and requires an exactly sized, idle ReadyForQuery frame.
 - `crates/pgtest-wire/src/session_relay.rs` forwards the startup response bytes
   and relays traffic until completion or lease cancellation.
-- Core creates initial databases during engine initialization and additional
-  databases through creation workers. Both paths need lifecycle notifications.
-- `LeaseSession` currently carries the database name and lease cancellation;
-  warming also needs the physical `DatabaseId`.
+- Core notifies the injectable lifecycle hook after accepted initial/runtime
+  database creation and before retirement cleanup submission.
+- `LeaseSession` carries the physical `DatabaseId`, database name, and lease
+  cancellation token.
+- `WarmReservation::establish` connects using the registered name and resolved
+  profile under the pool's semaphore, then publishes the completed session.
+  It is not yet called by the runtime scheduler or lifecycle callbacks.
 
 ## Agreed behavior
 
@@ -169,11 +203,19 @@ assistant to write the implementation. Add focused tests alongside each behavior
     - [x] 7b.2. Add owned capacity reservations and cleanup.
     - [x] 7b.3. Publish ready sessions from owned reservations.
   - [x] 7c. Add atomic single-use checkout.
-- [ ] 8. Add the no-op core lifecycle interface and DatabaseId in LeaseSession.
-- [ ] 9. Notify successful initial and runtime database creation.
-- [ ] 10. Notify retirement before cleanup is submitted.
-- [ ] 11. Establish warm sessions with timeouts, concurrency limits, and cancellation.
+- [x] 8. Add the no-op core lifecycle interface and DatabaseId in LeaseSession.
+  - [x] 8a. Carry physical database identity through the attach reply and session.
+  - [x] 8b. Add the optional lifecycle interface and install it before initialization.
+- [x] 9. Notify successful initial and runtime database creation.
+- [x] 10. Notify retirement before cleanup is submitted.
+- [x] 11. Establish warm sessions with timeouts, concurrency limits, and cancellation.
+  - [x] 11a. Add a cancellable, five-second warm connection attempt.
+  - [x] 11b. Run reserved attempts under the pool's shared concurrency limit.
 - [ ] 12. Add bounded, fair replenishment and failure backoff.
+  - [x] 12a. Reserve replenishment work in round-robin database order.
+  - [x] 12b. Track per-database retry deadlines and capped exponential backoff.
+  - [x] 12c. Add retirement eligibility, cancellation ownership, and scheduler wakeups.
+  - [ ] 12d. Drive attempts with one bounded asynchronous scheduler.
 - [ ] 13. Integrate checkout and cold fallback with client connection handling.
 - [ ] 14. Monitor unused-socket health and replace dead spares.
 - [ ] 15. Drain unused sockets and warm attempts before database deletion.
@@ -1213,3 +1255,811 @@ Follow-up: the checkout poison log now correctly says "during checkout".
 Checkout behavior is unchanged, so the prior fifty-five passing tests remain
 the latest behavioral verification; tests were not rerun for this log-only
 correction. Whitespace checks pass. Step 7 has no outstanding review findings.
+
+### Next user step: 8a — carry the physical database identity
+
+Purpose: wire checkout needs the physical DatabaseId selected by the engine.
+The client lease ID, lease generation, and database name are different values;
+none should be used to reconstruct the physical ID. This step carries the
+existing inventory identity through the successful attach path.
+
+Make these changes in order:
+
+1. In crates/pgtest-core/src/worker_engine/messages.rs, import DatabaseId and add
+   database_id: DatabaseId to ConsumerReply::Attached. Keep the name, generation,
+   and cancellation fields.
+2. In WorkerEngine::reply_attached in worker_engine/core.rs, fill that field from
+   entry.database.database_id. The common reply function handles both a new
+   assignment and joining an existing lease, including queued attachments.
+   Copy the existing ID; do not allocate one here or use entry.generation.
+3. In worker_manager/worker_io.rs, import DatabaseId and add
+   pub database_id: DatabaseId to LeaseSession. Add database_id as the first
+   argument of its private new constructor and store it directly.
+4. In ConsumerWorker::reply, bind database_id from ConsumerReply::Attached and
+   pass *database_id as the first argument of LeaseSession::new. Preserve the
+   existing failed-delivery handling, detach_on_drop flag, and cancellation
+   token behavior. Drop must still send Detach using lease ID and generation,
+   not the physical database ID.
+5. Update existing Attached test literals with a DatabaseId. In reply_tests.rs,
+   use an ID distinct from generation 42, for example DatabaseId(77). Existing
+   exhaustive destructuring that does not inspect the new field can add `..`.
+   Search all call sites rather than changing production semantics to satisfy
+   a compile error:
+
+   ```sh
+   rg -n 'ConsumerReply::Attached|LeaseSession::new|LeaseSession\s*\{' crates apps
+   ```
+
+The existing fields remain available to callers, so wire connection handling
+should not need behavioral changes. Stop after this propagation for review.
+Do not add the lifecycle trait or wire checkout into connection handling yet;
+those are separate steps. DatabaseId is unique within one engine, so later the
+pool must remain scoped to that engine.
+
+Run the existing fake-engine and reply regression tests; these do not require
+PostgreSQL or Docker:
+
+```sh
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo test --locked --offline -p pgtest-core --lib worker_engine::
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo test --locked --offline -p pgtest-core --lib worker_manager::reply_tests::
+```
+
+Per the user's revised testing preference, no new tests were added for step 8.
+Once the connected lifecycle path is available, add integration coverage in the
+existing manager/PostgreSQL harness: created database identity reaches attached
+sessions, joining a lease preserves it, replacement after expiry gets a new ID,
+and retirement disables that same pool entry before cleanup. Retain the existing
+drop/failed-delivery regression coverage and use the external Vitest suite for
+the full client workflow. This deferred coverage is not a completed validation
+claim; step 8a and lifecycle integration remain pending.
+
+Step 8a review: the engine copies entry.database.database_id into Attached,
+ConsumerWorker forwards it into LeaseSession, and the session exposes it
+publicly. Cancellation, failed-delivery rollback, and detach's lease/generation
+identity remain unchanged. All forty-nine existing engine tests and both reply
+tests pass, along with formatting and whitespace checks. Step 8a is complete.
+New identity/lifecycle integration coverage remains deferred per the user's
+preference; these existing tests do not directly assert the new session field.
+No production code or tests were changed during review. Step 8b, the optional
+core lifecycle interface and installation before initialization, is next.
+
+### Next user step: 8b — install an optional lifecycle hook
+
+Purpose: allow pgtest-wire to observe physical database availability and
+retirement without introducing a dependency from core to wire. Install the
+hook when constructing the engine, before try_init creates initial databases.
+This step introduces the interface and passes the same hook through startup;
+steps 9 and 10 will call it at the correct creation and retirement transitions.
+
+1. Create crates/pgtest-core/src/worker_engine/lifecycle.rs and export it with
+   pub mod lifecycle in worker_engine/mod.rs. Define this object-safe interface:
+
+   ```rust
+   pub trait DatabaseLifecycle: Send + Sync + 'static {
+       fn database_ready(&self, database_id: DatabaseId, database_name: &str);
+       fn database_retired(&self, database_id: DatabaseId);
+   }
+
+   #[derive(Default)]
+   pub struct NoopDatabaseLifecycle;
+   ```
+
+   Import DatabaseId from database_jobs. Implement both methods for
+   NoopDatabaseLifecycle with empty bodies. Document that database_ready will
+   report a successfully accepted physical database, and database_retired will
+   report logical retirement before cleanup is submitted. Methods are
+   synchronous notifications: implementations must finish promptly, without
+   socket I/O, DDL, or waiting for background work. Clone the borrowed name if
+   retaining it after the callback. Background warming failures are handled
+   by the implementation; they do not become engine startup/DDL errors.
+   Drain coordination will be added separately in the later cleanup steps;
+   database_retired is not an acknowledgement that all sockets have closed.
+
+2. In worker_engine/core.rs, add a private
+   lifecycle: Arc<dyn DatabaseLifecycle> field to WorkerEngine. Keep the current
+   new constructor signature for existing callers. Add:
+
+   ```rust
+   pub fn new_with_lifecycle(
+       pool_worker_config: WorkerEngineConfig,
+       postgres_manager: Arc<Postgres>,
+       engine_io: IO,
+       inbox: Inbox,
+       lifecycle: Arc<dyn DatabaseLifecycle>,
+   ) -> Self;
+   ```
+
+   Move the existing constructor body into new_with_lifecycle and store the
+   supplied Arc. Make new delegate to it with Arc::new(NoopDatabaseLifecycle).
+   Keep initialization in one place. Retain the existing four generic type
+   parameters; no additional lifecycle generic, global hook, or setter is
+   needed. No callback is invoked during construction.
+
+3. In worker_manager.rs, add a public startup method:
+
+   ```rust
+   pub async fn start_with_lifecycle(
+       postgres_config: PostgresConfig,
+       worker_engine_config: WorkerEngineConfig,
+       lifecycle: Arc<dyn DatabaseLifecycle>,
+   ) -> Result<Self, StartError>;
+   ```
+
+   Move start's current validation/preparation/startup body into this method.
+   Preserve validation of max_lease_records before preparing PostgreSQL.
+   Pass the supplied Arc to startup::start_workers. Keep start's original
+   signature and make it delegate with Arc::new(NoopDatabaseLifecycle). Existing
+   CLI, server, and test callers continue using start. The later wire setup
+   will opt in by passing its pool as the hook.
+
+4. In worker_manager/startup.rs, add lifecycle: Arc<dyn DatabaseLifecycle> as
+   the final parameter of the existing private start_workers function. Use
+   WorkerEngineType::new_with_lifecycle with this Arc instead of new. The hook
+   must already be stored when Box::pin(worker_engine.try_init()).await runs.
+   Preserve that Box::pin, existing error propagation, task tracking,
+   cancellation, and the order of spawning workers. No extra Arc field is
+   needed in WorkerEngineManager: the engine owns it for its lifetime.
+
+5. Update the existing test that calls startup::start_workers directly to pass
+   Arc::new(NoopDatabaseLifecycle). All ordinary WorkerEngine::new and
+   WorkerEngineManager::start callers should still compile unchanged. Find the
+   internal startup call sites with:
+
+   ```sh
+   rg -n 'start_workers\(' crates/pgtest-core
+   ```
+
+The resulting startup path is start_with_lifecycle -> start_workers ->
+new_with_lifecycle -> try_init. The original start and new entry points supply
+the no-op implementation. Preserve the caller's supplied hook throughout this
+path; do not replace it with a no-op in an intermediate function.
+
+Stop after the hook is stored before initialization. Do not yet call the hook,
+implement it for ConnectionWarmPool, or change database creation/retirement.
+The unused lifecycle field is expected temporarily. New integration tests remain
+deferred until notifications and their consumers can be exercised together.
+
+Verification uses the existing engine/reply tests from step 8a, plus the startup
+stack-size and validation regressions. These exact tests require no PostgreSQL
+or Docker:
+
+```sh
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo test --locked --offline -p pgtest-core --lib worker_manager::worker_engine_manager_test::startup_future_fits_stack_budget -- --exact
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo test --locked --offline -p pgtest-core --lib worker_manager::cleanup_tests::zero_lease_record_limit_is_rejected_before_connecting -- --exact
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo test --locked --offline -p pgtest-core --lib worker_manager::cleanup_tests::startup_preserves_postgres_configuration_errors -- --exact
+```
+
+This guide adds no implementation or tests. Step 8b remains pending the user's
+changes and review; notification ordering and hook integration are not yet
+validated by the existing tests.
+
+Step 8b review: the injected hook is stored in the engine before try_init, and
+the trait is public, object-safe, Send + Sync + 'static with a no-op
+implementation. All fifty-four existing checks pass (forty-nine engine, two
+reply, startup stack size, and two startup-validation regressions). Formatting
+and whitespace checks pass. These tests still exercise the original startup
+entry point; injected-hook integration remains deferred.
+
+Before completing 8b, consolidate the duplicated implementations: WorkerEngine::new
+should delegate to new_with_lifecycle with a no-op; WorkerEngineManager::start
+should delegate to start_with_lifecycle with a no-op; and start_workers should
+delegate to start_workers_with_lifecycle with a no-op if keeping both private
+functions. Keeping that private compatibility wrapper is fine and avoids
+changing its existing test caller. Keep each full construction/startup body only
+in the corresponding with_lifecycle function. This lets the existing regression
+tests exercise the same setup path that injected hooks will use and prevents
+the two paths from diverging as lifecycle integration grows.
+
+Remove the unused lifecycle::self import, use the NoopDatabaseLifecycle import
+in the delegating wrapper, and prefix unused no-op implementation parameters
+with underscores. The unread engine lifecycle field remains expected until
+step 9. Add the callback contract as trait documentation: notifications must
+finish promptly without I/O/waits; retirement precedes cleanup submission and
+does not mean draining is complete. No production code or tests were changed
+during review. Step 8b remains pending consolidation.
+
+Follow-up 8b review: the build now fails with seven compile errors. The engine's
+five-argument constructor was renamed to new, but its four-argument callers
+remain and startup still calls new_with_lifecycle. Rename the full constructor
+back to new_with_lifecycle and restore new as a four-argument delegating wrapper.
+Delegation keeps both entry points while sharing one full implementation.
+
+The public start_with_lifecycle was also removed; restore it so callers can
+supply a real hook. Move validation/preparation into it and make the existing
+two-argument start delegate with the no-op. The private three-argument
+start_workers is fine: keep it and update its direct startup-failure test call
+to pass Arc::new(NoopDatabaseLifecycle). Its engine construction should call
+new_with_lifecycle with the supplied hook. Formatting and whitespace checks
+pass, but no tests ran because compilation failed. No production code or tests
+were edited during review; step 8b remains pending.
+
+Next 8b review: compilation is fixed and all fifty-four existing checks pass;
+formatting and whitespace checks pass too. The user retained a single
+five-argument WorkerEngine::new and updated its internal callers. That structure
+is acceptable: it retains one constructor implementation and installs the hook
+before initialization. A separate internal new_with_lifecycle wrapper is no
+longer required for this chosen structure.
+
+The remaining functional gap is the public startup API. WorkerEngineManager::start
+still always creates NoopDatabaseLifecycle, and start_with_lifecycle is absent,
+so wire cannot supply its real pool. Add public start_with_lifecycle with the
+two existing configuration arguments plus Arc<dyn DatabaseLifecycle>. Move
+start's current body into it and pass the supplied hook to start_workers. Make
+the existing start delegate with the no-op. Keep the current internal new and
+start_workers signatures unchanged. The no-op parameter/import warnings and
+trait contract documentation remain small cleanups; the unread engine field
+is expected until step 9. No production code or tests were changed during
+review. Step 8b remains pending public hook injection.
+
+Final 8b review: public start_with_lifecycle now owns validation and startup,
+passes the supplied Arc through start_workers into WorkerEngine::new, and
+installs it before try_init. The original start delegates with the no-op hook.
+There is one full startup path and one internal engine constructor. All
+fifty-four existing checks pass, including startup stack size and validation,
+as do formatting and whitespace checks. Steps 8b and 8 are complete.
+
+The unused lifecycle::self import and no-op method arguments remain nonblocking
+compiler warnings; the unread engine lifecycle field is expected until step 9.
+The callback contract is documented in this guide but still needs rustdoc on
+the public trait. No production code or tests were changed during review.
+Creation/retirement callbacks and their integration coverage remain future work;
+the next step is 9, notifying successful initial and runtime database creation.
+
+### Next user step: 9 — notify accepted database creation
+
+Purpose: announce each newly available physical database to the installed
+lifecycle hook, including unused initial databases and runtime growth. Change
+only the two engine creation-completion paths in worker_engine/core.rs.
+DatabaseInventory::complete_creation remains the authority on whether a
+completion is accepted; keep its API and identity bookkeeping unchanged.
+
+Use this ordering for each creation result:
+
+1. Before moving result into complete_creation, retain its successful name:
+
+   ```rust
+   let database_name = result.as_ref().ok().cloned();
+   ```
+
+   This clones only the Arc-backed ReadString, not a database or connection.
+   Saving a successful name does not itself authorize notification: a duplicate
+   or unknown completion may contain Ok(name) but still be rejected by inventory.
+2. Call inventory.complete_creation(database_id, result) exactly once.
+3. Only for an accepted Ok(()) outcome, retrieve the saved name with
+   expect("accepted creation must have a database name") and call:
+
+   ```rust
+   self.lifecycle.database_ready(database_id, database_name.as_ref());
+   ```
+
+   Here database_name refers to the unwrapped ReadString. Pass the physical
+   DatabaseId from the creation reservation/message and the exact created name.
+   Do not use a lease ID, generation, or the template name.
+
+In try_init:
+
+- Save the name after create_database().await and before complete_creation.
+- Keep the existing expect for a missing initial reservation.
+- Handle the accepted result with a match: Ok(()) notifies; Err(error) preserves
+  the existing error log and returns Err(error).
+- Notify once inside the loop for each successful database, before continuing
+  to the next creation and before try_init returns. Notify even when no lease
+  is waiting. If a later creation fails, do not synthesize notifications for it
+  or replay earlier notifications; leave existing startup-error behavior intact.
+
+In handle_database_worker_message's CreationFinished arm:
+
+- Save the successful name before moving result into complete_creation.
+- Preserve the existing None branch: warn and return for an unknown or repeated
+  completion. Neither successful nor failed ignored messages notify the hook.
+- Match the accepted result. Ok(()) notifies; Err(error) retains the existing
+  template_create_failures increment and error log without notifying.
+- Keep dispatch_waiters() and grow() after this match. They must still run after
+  accepted failures as they do today. Successful notification must occur before
+  dispatch_waiters can hand that database to a waiting lease.
+
+The outcome rules are:
+
+| Completion | Notify | Existing follow-up |
+| --- | --- | --- |
+| Initial accepted success | Once | Continue initialization |
+| Initial accepted failure | Never | Return startup error |
+| Runtime accepted success | Once, before dispatch | Dispatch waiters, then grow |
+| Runtime accepted failure | Never | Count/log failure, dispatch waiters, then grow |
+| Runtime duplicate or unknown | Never | Warn and return |
+
+Notifications belong at accepted creation, not in the DDL worker, inventory
+type, attach/join, or return_ready. Reusing an unclaimed ready database does not
+create another physical database and must not announce it again. Do not scan
+the ready queue to recover the name or call complete_creation twice.
+
+These synchronous notifications do not wait for warm sockets and do not change
+DDL/startup error types. The no-op implementation preserves current runtime
+behavior. Retirement callbacks, the pool's lifecycle implementation, and actual
+warming remain later steps. Stop after these two notification sites for review.
+
+Run the existing engine regressions (including failed, duplicate, unknown, and
+queued creation cases):
+
+```sh
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo test --locked --offline -p pgtest-core --lib worker_engine::
+```
+
+Those tests protect existing behavior but do not prove notification delivery
+while using the no-op hook. Integration coverage remains planned: inject a
+recording hook through the real manager startup path, verify initial events
+exist when startup returns, then verify runtime creation is announced with the
+same ID/name before its waiting attachment completes. Include failure and
+duplicate handling through the existing deferred-worker harness as the structure
+becomes ready. No new tests or production changes were added with this guide;
+step 9 remains pending implementation and review.
+
+Step 9 review: both creation paths notify only after inventory accepts a
+successful result. Initial failures still return their error. Runtime failures
+still count/log and continue to dispatch/grow, while ignored completions return
+without notification. Runtime success notifies before dispatch_waiters. All
+forty-nine existing engine tests pass, along with formatting and whitespace
+checks. Step 9 is complete by code review and existing behavior regressions;
+notification delivery integration coverage remains deferred as agreed.
+
+Nonblocking cleanup: replace the temporary name_to_be_revemove_this_duplication
+binding with a shadowed database_name, and prefer
+database_name.expect("accepted creation must have a database name") in both
+success paths for a useful invariant message. The current unwrap calls are
+guarded by accepted success, so this does not change behavior. No production
+code or tests were edited during review. Step 10 is next: notify retirement
+before submitting cleanup.
+
+Follow-up: runtime creation now shadows database_name and uses the explanatory
+expect. Initial creation in try_init still has the temporary binding and unwrap;
+apply the same cleanup there, including its log and callback references.
+Formatting and whitespace checks pass. No behavioral tests were rerun for this
+cleanup; the prior forty-nine passing engine tests remain the latest run.
+Step 9 remains complete, with this nonblocking naming cleanup outstanding.
+
+Final cleanup review: both creation paths now shadow database_name and use the
+explanatory expect. Initial logging and notification reference that binding.
+Formatting and whitespace checks pass; behavior is unchanged, so tests were
+not rerun. Step 9 has no outstanding review findings. The latest behavioral
+verification remains forty-nine passing engine tests, with notification
+integration coverage still deferred as agreed.
+
+### Next user step: 10 — notify retirement before cleanup
+
+In `crates/pgtest-core/src/worker_engine/core.rs`, update `retire_lease` with
+one callback after inventory records retirement and before cleanup is submitted:
+
+```rust
+let request = self.inventory.retire(entry.database);
+let database_id = request.database_id;
+self.lifecycle.database_retired(database_id);
+
+if let Err(error) = self.engine_io.request_cleanup(request) {
+    tracing::error!(?database_id, %lease, %error, "unable to enqueue cleanup; retaining retirement record")
+}
+```
+
+Keep the existing lease removal guard, cancellation, and final `self.grow()`.
+The order is: remove the assigned lease, cancel its token, mark the physical
+database retiring, notify its ID, then submit cleanup.
+
+Notify even if cleanup submission subsequently fails: the database is already
+retired and its retirement record remains. Do not move the callback into the
+successful cleanup branch or repeat it on cleanup completion. The existing
+removal guard prevents a second notification for a lease with no assigned entry;
+the expiry handler already checks generation before calling this method.
+
+Do not notify on ordinary disconnect or when restoring an unclaimed database
+to ready inventory. Those paths do not retire the physical database.
+
+This synchronous callback must stay fast. It announces retirement; it does not
+prove warm connections have drained. Wiring pool retirement and coordinating
+drain before physical deletion belong to the later lifecycle integration,
+including step 15. No new arguments or async hook are needed here.
+
+After implementation, run the existing engine regressions:
+
+```sh
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo test --locked --offline -p pgtest-core --lib worker_engine::
+```
+
+These tests exercise existing retirement behavior; their no-op hook does not
+assert callback delivery or ordering. Keep that integration coverage deferred
+as agreed, until the pool lifecycle is connected. Stop here for review before
+step 11. This guide adds no production implementation or tests; step 10 remains
+pending implementation and review.
+
+Step 10 review: `retire_lease` now notifies the lifecycle hook with the physical
+database ID after inventory records retirement and before submitting cleanup.
+The removal guard and lease cancellation remain intact; cleanup submission
+failure retains both the retirement record and the already-issued notification.
+No review findings. All forty-nine existing engine tests pass, along with
+formatting and whitespace checks. These tests use the no-op hook, so callback
+delivery/order integration coverage remains deferred as agreed. Step 10 is
+complete; step 11 will establish warm sessions with bounded concurrency,
+timeouts, and cancellation. No production code or tests were edited in review.
+
+### Next user step: 11a — one bounded warm connection attempt
+
+Start with the network operation alone. `postgres_upstream::connect` already
+returns an `UpstreamSession` only after authentication and a valid, idle
+ReadyForQuery. Reuse it so the socket and its startup response bytes stay
+together and TCP/Unix endpoint handling stays consistent.
+
+Create `crates/pgtest-wire/src/connection_warm/attempt.rs` and declare
+`mod attempt;` in `connection_warm.rs`. Add these types and function there:
+
+```rust
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
+
+use super::WarmStartupProfile;
+use crate::postgres_upstream::{self, UpstreamError, UpstreamSession};
+
+const WARM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum WarmAttemptError {
+    #[error("warm connection attempt cancelled")]
+    Cancelled,
+    #[error("warm connection attempt timed out")]
+    TimedOut,
+    #[error(transparent)]
+    Upstream(#[from] UpstreamError),
+}
+
+pub(super) async fn connect_warm_session(
+    database_name: &str,
+    profile: &WarmStartupProfile,
+    upstream_host: &str,
+    upstream_port: u16,
+    cancellation: &CancellationToken,
+) -> Result<UpstreamSession, WarmAttemptError> {
+    // Implement the behavior below.
+}
+```
+
+Implementation order:
+
+1. Use `tokio::select!` with `biased;` and cancellation as the first branch.
+   `cancellation.cancelled()` returns `Err(WarmAttemptError::Cancelled)`.
+   This also prevents polling the connection attempt when the token is already
+   cancelled.
+2. The other branch awaits `tokio::time::timeout(WARM_ATTEMPT_TIMEOUT, ...)`
+   around the entire `postgres_upstream::connect(database_name,
+   profile.parameters(), upstream_host, upstream_port)` call. The deadline
+   covers socket connection, authentication, and the wait for ReadyForQuery.
+   Do not reset it between stages or use `config.startup_wait`: that setting
+   controls the separate initial pool warm-up budget.
+3. Match the nested timeout result: `Err(_)` becomes `TimedOut`,
+   `Ok(Err(error))` becomes `Upstream(error)`, and `Ok(Ok(session))` returns
+   the session. Preserve the existing upstream error as the source.
+
+Keep the connection future directly inside the timeout/select. Do not spawn
+it: cancellation or timeout must drop the future and its partially established
+socket. Return the complete session without consuming, replacing, or replaying
+its startup bytes. This helper performs one attempt, with no retry, publication,
+lease attachment, or background task creation.
+
+The caller will supply the registered physical database name and resolved pool
+profile. The token will belong to the database's warm work, linked to pool
+shutdown, rather than an individual client connection. Wiring that ownership
+comes later. A cancellation check in select is not an atomic retirement guard:
+the pool must still reject publication/checkout for retired databases under its
+state lock when lifecycle integration is added.
+
+Step 11b will add a semaphore shared by the pool, acquire its permit before
+starting this helper, and hold an owned reservation through publication or
+failure. Waiting for a permit must also be cancellable. The five-second network
+deadline starts after permit acquisition. Reservation capacity and semaphore
+permits have different purposes: capacity counts idle plus reserved sessions;
+the semaphore limits simultaneous connection attempts. Scheduling/backoff is
+step 12. Keep the helper disconnected from listeners and lifecycle callbacks
+until the required lifecycle guards are ready.
+
+Verification after implementing 11a:
+
+```sh
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo check --locked --offline -p pgtest-wire
+rustup run nightly-2026-09-10 rustfmt --check --edition 2024 --config skip_children=true crates/pgtest-wire/src/connection_warm.rs crates/pgtest-wire/src/connection_warm/attempt.rs
+git diff --check
+```
+
+As agreed, defer new tests until they can exercise the connected attempt path.
+That coverage must verify successful startup, upstream failure, timeout during
+startup, cancellation while queued and connecting, and permit/reservation
+recovery. Existing tests alone will not establish those new guarantees.
+Stop after 11a for review. This guide adds no implementation or tests; both
+substeps remain pending.
+
+Step 11a review: the attempt correctly prioritizes cancellation, wraps the whole
+upstream connection in one five-second timeout, preserves upstream errors, and
+returns the intact session. Cargo check, formatting, and whitespace checks pass.
+One integration prerequisite remains: change the private
+`async fn connect_warm_ssesion` to `pub(super) async fn connect_warm_session`
+so the parent pool module can call it in 11b. Also correct the constant's typo
+from `WARMT_ATTEMPT_TIMEOUT` to `WARM_ATTEMPT_TIMEOUT` at its declaration and use.
+The naming correction is nonbehavioral. No production files or tests were
+edited during review; new attempt integration coverage remains deferred as
+agreed. Resolve the helper visibility before advancing to 11b.
+
+Step 11a follow-up: the helper is now `pub(super) connect_warm_session` and
+both timeout constant references use `WARM_ATTEMPT_TIMEOUT`. No review findings
+remain. Formatting and whitespace checks pass. These visibility/naming changes
+do not alter behavior; the prior successful cargo check remains the latest
+compilation check, and no behavioral tests were rerun. Step 11a is complete,
+with new integration coverage still deferred as agreed. Step 11b is next.
+
+### Completed step: 11b — establish and publish reserved sessions
+
+`ConnectionWarmPool` now owns one semaphore shared across all its database
+reservations. The effective permit count is the minimum of configured
+concurrency, global capacity, and Tokio's semaphore limit. This preserves both
+configured upper bounds without allowing unusually large valid settings to
+panic in semaphore construction. Construction starts no background work.
+
+`WarmReservation::establish(self, host, port, cancellation)` owns the reservation
+through the entire operation. It waits cancellably for a permit, calls the 11a
+helper with the registered physical name and resolved profile, checks for
+observed cancellation, and publishes the complete session. The permit remains
+held through publication. The five-second deadline begins after acquisition;
+the initial `startup_wait` budget is independent.
+
+The result is `Ok(true)` for publication, `Ok(false)` if publication rejects the
+session, or a typed cancellation, timeout, upstream, or closed-semaphore error.
+The existing reservation Drop releases capacity on failure or future abandonment;
+permit and socket ownership provide the corresponding cleanup. Pool mutexes
+are not held across asynchronous waits. There is no detached network task or
+inline retry.
+
+Six new local TCP scenarios cover the connected reservation/startup/publication
+path: successful startup and socket handoff; a shared concurrency limit across
+databases, queued/running cancellation and subsequent reuse; one timeout across
+startup stages; upstream rejection; dropped queued/running futures; and
+cancellation before opening a socket. Socket closure accepts EOF or TCP reset,
+since dropping an unfinished connection with unread bytes can produce either.
+These use a scripted wire peer, not a real PostgreSQL server or a mock lifecycle
+hook. Full lifecycle/PostgreSQL/Vitest integration remains pending.
+
+Verification: all sixty-one `connection_warm::` tests pass, including the six
+new scenarios. Rust formatting and whitespace checks pass. Local TCP binding
+was blocked by the sandbox, so socket verification ran with approved execution
+outside it.
+
+Step 11 is complete. Step 12 adds bounded fair scheduling and failure backoff.
+Runtime integration must also provide database/pool cancellation ownership and
+atomic retirement eligibility checks before enabling these attempts. The final
+cancellation check in `establish` does not by itself serialize publication with
+retirement. Draining before physical deletion and shutdown remain later steps.
+
+### Next user step: 12a — fair selection of replenishment work
+
+Step 12 turns one-shot attempts into background replenishment. Implement it in
+four reviewable parts. Start with 12a below; it changes reservation selection
+without opening connections or starting a scheduler.
+
+In `crates/pgtest-wire/src/connection_warm.rs`, add a registration-order queue
+to `WarmPoolState`:
+
+```rust
+schedule_order: VecDeque<DatabaseId>,
+```
+
+`Default` can still be derived. In `register_database`, append the ID only when
+the vacant entry is inserted successfully. Duplicate registration, disabled
+warming, and lock failure must leave the queue unchanged. Keep one queue entry
+per registered database; checkout and completion must not append duplicates.
+
+Extract the reservation transition currently inside `try_reserve` into a private
+helper with this shape:
+
+```rust
+fn reserve_locked(
+    self: &Arc<Self>,
+    state: &mut WarmPoolState,
+    database_id: DatabaseId,
+) -> Option<WarmReservation>
+```
+
+The helper must use the supplied state and never lock `self.state` itself. Keep
+the existing capacity limits, database lookup, in-flight increment, capacity
+increment, and owned reservation construction. Keep the disabled guard in both
+public reservation entry points. `try_reserve` still takes the mutex once and
+delegates to this helper, preserving existing callers and tests.
+
+Add the fair entry point:
+
+```rust
+pub(crate) fn reserve_next(self: &Arc<Self>) -> Option<WarmReservation>
+```
+
+Its algorithm is:
+
+1. Return `None` if warming is disabled or the state lock is poisoned.
+2. Take the state lock once. If global capacity is full, return `None` without
+   rotating the queue.
+3. Capture the queue's current length as the maximum number of candidates to
+   inspect during this call.
+4. Pop the front ID. If its database no longer exists, discard the stale queue
+   entry and continue. Otherwise push it to the back before trying to reserve.
+5. Call `reserve_locked` for that ID. Return the first successful reservation;
+   otherwise continue scanning, at most the captured number of candidates.
+6. Return `None` if that pass finds no capacity to fill.
+
+Selection and reservation must occur under the same lock. Do not call the public
+`try_reserve` while holding the mutex: it would try to lock it again. Do not
+hold a reservation and then drop it while the mutex is held, because its Drop
+also locks the pool. Returning a successful reservation transfers it out safely.
+
+For registration order A, B, C with target two and enough global capacity,
+successive calls should reserve A, B, C, A, B, C. If A already meets its target,
+skip it and serve B/C. A full pass with no eligible work must terminate. The
+cursor survives across calls so a newly freed slot does not always favor the
+same first database. This is fairness when allocating available capacity; it
+does not evict already-warm sessions to redistribute a full pool.
+
+If any test constructs `WarmPoolState` directly, initialize its new field.
+Preserve all existing reservation/publication/checkout behavior. There are no
+retry fields, timer tasks, lifecycle callbacks, or network calls in 12a.
+
+Verification after implementing 12a:
+
+```sh
+RUSTC=/Users/said/.rustup/toolchains/nightly-2026-09-10-aarch64-apple-darwin/bin/rustc rustup run nightly-2026-09-10 cargo test --locked --offline -p pgtest-wire --lib connection_warm::
+rustup run nightly-2026-09-10 rustfmt --check --edition 2024 --config skip_children=true crates/pgtest-wire/src/connection_warm.rs
+git diff --check
+```
+
+The existing sixty-one tests protect current behavior but do not establish
+round-robin fairness. Following the integration preference, cover that behavior
+through the connected scheduler once 12d is ready. Stop after 12a for review.
+
+### Remaining step 12 sequence
+
+**12b — retry state (implemented).** Each database stores
+`retry_at: Option<tokio::time::Instant>` and a `tokio-retry2`
+`ExponentialFactorBackoff` iterator, initially with no deadline and a one-second
+first delay. Shared reservation eligibility skips a database before its retry
+deadline in both direct and round-robin reservation. An upstream error or
+timeout records the next deadline before its reservation releases capacity.
+The iterator supplies delays of 1, 2, 4, 8, 16, 30, 30 seconds. Successful
+publication clears the deadline and resets the iterator under the state lock.
+Already-running attempts can still finish; their outcomes update retry state
+in the order they acquire that lock. The future scheduler must not apply the
+same outcome a second time. Cancellation and rejected publication are not
+upstream failures. A closed semaphore is a scheduler stop condition, not a
+reason to retry repeatedly. Sleeping must hold neither reservation nor permit.
+
+**12c — lifecycle eligibility and wakeups (implemented).** Add a pool cancellation token,
+per-database child tokens, and an explicit retiring state. Retirement must mark
+the database ineligible under the same mutex used by reservation, checkout,
+and publication. Retain its inventory entry until all reservations settle;
+the current reservation Drop requires it to exist. Drain idle sessions from
+state with correct capacity accounting and dispose of them outside the lock.
+Reject late publication without pushing a session, while releasing its reserved
+capacity exactly once. Capture the database token with scheduled work so
+retirement cancels waiting and active attempts. Add one `Notify` for the single
+scheduler; registration, checkout, released capacity, and retirement wake it
+to recheck state. Signal after releasing the state mutex. Wakeups request a
+state recheck, rather than enqueueing one job per event. Logical retirement and
+this notification mechanism do not replace the step 15 drain-before-drop barrier.
+
+**12d — one bounded coordinator.** Own an endpoint, the shared pool, and a
+`FuturesUnordered` of attempts in one scheduler future. Reserve work using
+`reserve_next` only while the active-future count is below the effective attempt
+limit. Each future owns its reservation and database token, calls `establish`,
+and returns its database ID with the result. Keep the step 11 semaphore as the
+shared connection limit. This bounds queued futures as well as sockets; do not
+spawn one task per registered database or retry.
+
+After processing completions and filling available slots, wait for completion,
+notification, the earliest useful future retry deadline, or pool cancellation.
+Do not busy-loop when all databases are full, cooling down, or retired. A retry
+timer is useful only when global capacity and an attempt slot can be used;
+ignore already-expired deadlines for entries blocked by other limits. With no
+useful deadline, wait for a state change. On stop, drop/drain owned attempt
+futures so their reservations, sockets, and permits settle. Start no scheduler
+when warming is disabled; construction itself must remain free of spawned work.
+Lifecycle/listener installation and full shutdown ownership remain separate
+integration work. Do not enable runtime warming before retirement and physical
+deletion coordination are connected.
+
+Connected scheduler coverage should verify fair ordering and skipping,
+replenishment after checkout, bounded work under many databases, retry delays
+and success reset, progress for healthy databases while another backs off,
+cancellation during retry/warm-up, and rejection of late retirement results.
+Use controllable socket peers for timing/failure paths and the existing
+PostgreSQL/Vitest harness for full lifecycle behavior. This update contains
+instructions only; no step 12 implementation or tests have been added.
+
+Step 12a completion: successful registration now appends its physical ID once.
+`reserve_next` scans at most one queue rotation under the state mutex, discards
+stale IDs, skips databases whose targets are covered, and uses the shared
+`reserve_locked` transition. Global capacity exhaustion leaves the cursor
+unchanged. Existing direct reservations retain their behavior. No network work,
+retry policy, or scheduler was added.
+
+All sixty-one existing warm-pool tests pass, along with formatting and whitespace
+checks. Socket tests ran outside the sandbox with approval. These tests protect
+existing behavior; round-robin selection itself was reviewed, and connected
+fairness coverage remains deferred to 12d. Step 12a is complete. Step 12b is next:
+per-database retry deadlines and capped exponential backoff.
+
+### Completed step: 12b — tokio-retry2 backoff
+
+Used the existing wire dependency on `tokio-retry2` 0.9.1. Its
+[`ExponentialFactorBackoff`](https://docs.rs/tokio-retry2/0.9.1/tokio_retry2/strategy/struct.ExponentialFactorBackoff.html)
+is configured with `from_millis(1_000, 2.0).max_delay(Duration::from_secs(30))`.
+There is no jitter, preserving the agreed delay sequence, and no `Retry` task:
+this step stores deadlines rather than sleeping with reserved resources.
+
+Both reservation paths consult the same deadline check. Actual upstream errors
+and timeouts advance the database's iterator before failure releases its slot.
+Successful publication resets retry state atomically with making the session
+available. Cancellation, dropped futures, closed-semaphore errors, and rejected
+publication do not change backoff. Duplicate registration preserves retry state.
+Other databases remain eligible during one database's cooldown.
+
+This places outcome accounting in `establish`/`publish`, refining the earlier
+plan to have the scheduler account for results: it closes the window between
+capacity release and recording cooldown, and does not require scheduler code.
+Future scheduler work must use the stored deadline and avoid counting results
+again. Attempts already reserved before another failure are allowed to finish.
+
+Added a socket-path regression that performs repeated rejected PostgreSQL
+startups and verifies the complete delay sequence/cap, exact deadline
+eligibility in direct and round-robin selection, progress for another database,
+cancellation preserving an uncapped sequence, duplicate registration, and
+success resetting the next failure to one second. Existing timeout and
+cancellation scenarios now also check their effect on retry state.
+
+All sixty-two warm-pool tests pass. The final strengthened cancellation scenario
+also passes in a focused rerun. Formatting and whitespace checks pass. Only
+12b was implemented; 12c lifecycle/wakeup work and the 12d scheduler remain
+pending. Full PostgreSQL/Vitest lifecycle integration remains deferred.
+
+### Completed step: 12c — retirement eligibility and wakeups
+
+The pool owns a cancellation token and one `Notify`. Every registered database
+gets a child cancellation token and an explicit `retiring` flag. Reservations
+capture that database token when capacity is reserved. `establish` now observes
+database/pool cancellation both while waiting for the semaphore and during
+network startup; its existing caller token remains an additional cancellation
+source and is never cancelled by the pool.
+
+`retire_database(id)` atomically marks the physical database retiring, clears
+its retry deadline, removes it from scheduling order, and extracts its idle
+sessions while subtracting only their occupied capacity. After releasing the
+mutex, it cancels the database token, closes the extracted sockets, and signals
+the state change. Unknown or already-retired IDs are no-ops. Retired entries
+remain present, including after their reservations settle, so duplicate
+registration cannot reactivate that identity; removal will be coordinated with
+the later cleanup/drain barrier.
+
+Reservation, checkout, publication, and retry accounting now reject retired
+databases under the same state mutex. A late publication closes its session
+and lets reservation Drop release the remaining slot exactly once, outside the
+original lock scope. Previously checked-out sessions stay with their clients;
+existing core lease cancellation remains responsible for them. Pool cancellation
+also prevents new admission and reaches the child attempt tokens, but complete
+idle-pool shutdown/drain ownership remains step 16.
+
+Successful registration, checkout, publication, recorded failure, reservation
+release, and retirement call `notify_one` after unlocking state. Notifications
+coalesce into a state recheck for the future single scheduler rather than
+allocating a job per event. No-op registration/retirement does not signal.
+
+Four new socket scenarios verify retirement of queued/running attempts without
+cancelling another database, parent cancellation propagation, idle socket
+closure and late-publication rejection while handed-off traffic still works,
+wakeups/capacity recovery/idempotence, and retirement during retry backoff.
+The existing virtual-time timeout test now allows a ten-millisecond timer
+scheduling margin rather than assuming ten yields finish the task; it still
+rejects a seconds-long timeout restart after authentication.
+
+All sixty-six warm-pool tests pass, with local TCP access approved outside the
+sandbox. Formatting and whitespace checks pass. Step 12c is complete. No
+scheduler, core lifecycle adapter installation, or physical database deletion
+barrier was added. Step 12d is next; end-to-end PostgreSQL/Vitest lifecycle
+coverage and the drain-before-delete barrier remain later work.

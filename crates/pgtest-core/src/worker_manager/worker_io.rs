@@ -6,7 +6,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::worker_engine::{
     core::LeaseId,
-    database_jobs::{CleanupDatabase, CreateDatabase},
+    database_jobs::{CleanupDatabase, CreateDatabase, DatabaseId},
     errors::IOError,
     messages::{ConsumerReply, EngineMessage},
     traits::{ConsumerIO, EngineIO, EngineInbox},
@@ -14,6 +14,7 @@ use crate::worker_engine::{
 
 pub struct LeaseSession {
     pub database_name: ReadString,
+    pub database_id: DatabaseId,
     pub lease_id: LeaseId,
     generation: u64,
     pub cancellation: CancellationToken,
@@ -28,8 +29,17 @@ impl LeaseSession {
         generation: u64,
         cancellation: CancellationToken,
         engine_tx: UnboundedSender<EngineMessage<ConsumerWorker>>,
+        database_id: DatabaseId,
     ) -> Self {
-        Self { database_name, lease_id, generation, cancellation, detach_on_drop: true, engine_tx }
+        Self {
+            database_name,
+            lease_id,
+            generation,
+            cancellation,
+            detach_on_drop: true,
+            engine_tx,
+            database_id,
+        }
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -68,7 +78,7 @@ impl ConsumerIO for ConsumerWorker {
     fn reply(self, msg: ConsumerReply) -> Result<(), ConsumerReply> {
         if let (
             Some((lease, engine_tx)),
-            ConsumerReply::Attached { database_name, generation, cancellation },
+            ConsumerReply::Attached { database_name, generation, cancellation, database_id },
         ) = (&self.attachment, &msg)
         {
             // Transfer the guard through the channel. Dropping an unread
@@ -80,6 +90,7 @@ impl ConsumerIO for ConsumerWorker {
                 *generation,
                 cancellation.clone(),
                 engine_tx.clone(),
+                database_id.clone(),
             );
             self.oneshot_channel.send(ManagerReply::Attached(session)).map_err(|reply| {
                 if let ManagerReply::Attached(mut session) = reply {

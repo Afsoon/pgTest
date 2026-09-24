@@ -12,6 +12,7 @@ use crate::{
     worker_engine::{
         core::{LeaseId, WorkerEngine, WorkerEngineConfig},
         errors::{AttachError, ReleaseError},
+        lifecycle::{self, DatabaseLifecycle, NoopDatabaseLifecycle},
         messages::{ConsumerReply, EngineMessage},
     },
     worker_manager::worker_io::{
@@ -56,12 +57,25 @@ impl WorkerEngineManager {
         postgres_config: PostgresConfig,
         worker_engine_config: WorkerEngineConfig,
     ) -> Result<Self, StartError> {
+        WorkerEngineManager::start_with_lifecycle(
+            postgres_config,
+            worker_engine_config,
+            Arc::new(NoopDatabaseLifecycle),
+        )
+        .await
+    }
+
+    pub async fn start_with_lifecycle(
+        postgres_config: PostgresConfig,
+        worker_engine_config: WorkerEngineConfig,
+        lifecycle: Arc<dyn DatabaseLifecycle>,
+    ) -> Result<Self, StartError> {
         if worker_engine_config.max_lease_records == 0 {
             return Err(StartError::InvalidLeaseRecordLimit);
         }
 
         let postgres_client = startup::prepare_postgres(postgres_config).await?;
-        startup::start_workers(postgres_client, worker_engine_config).await
+        startup::start_workers(postgres_client, worker_engine_config, lifecycle).await
     }
 
     #[hotpath::measure]
@@ -189,7 +203,7 @@ impl WorkerEngineManager {
 
 #[cfg(test)]
 mod worker_engine_manager_test {
-    use std::{future::poll_fn, pin::Pin, task::Poll, time::Duration};
+    use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
     use hotpath::wrap::tokio::sync::mpsc::UnboundedReceiver;
     use pgtest_database_operations::{
@@ -203,6 +217,7 @@ mod worker_engine_manager_test {
         worker_engine::{
             core::{LeaseId, WorkerEngineConfig},
             database_jobs::{CleanupDatabase, CreateDatabase},
+            lifecycle::NoopDatabaseLifecycle,
             messages::EngineMessage,
             traits::{EngineIO, PostgresClient},
         },
@@ -294,6 +309,7 @@ mod worker_engine_manager_test {
             pg_client.clone(),
             io,
             super::WorkerEngineInbox::new(engine_rx),
+            Arc::new(NoopDatabaseLifecycle),
         );
         engine.try_init().await.unwrap();
         let engine_handle = tokio::spawn(async move {
@@ -335,7 +351,12 @@ mod worker_engine_manager_test {
             .unwrap(),
         );
         client.drop_ddl_database(client.template_database_name.template_name()).await.unwrap();
-        let result = super::startup::start_workers(client, no_growth_config(1)).await;
+        let result = super::startup::start_workers(
+            client,
+            no_growth_config(1),
+            Arc::new(NoopDatabaseLifecycle),
+        )
+        .await;
         assert!(matches!(result, Err(super::StartError::InitialDatabaseCreation(_))));
     }
 
