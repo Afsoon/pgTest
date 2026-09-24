@@ -8,7 +8,8 @@ attempts now establish and publish sessions with shared concurrency limits,
 timeouts, and cancellation. Round-robin reservation selection and per-database
 retry backoff are complete. Retirement eligibility, cancellation ownership,
 and scheduler wakeups are implemented. The bounded asynchronous scheduler is
-complete; runtime warming is not wired yet.
+complete. Client handling now supports warm checkout and immediate cold
+fallback; runtime warming is not wired yet.
 
 ## Working agreement
 
@@ -60,6 +61,10 @@ The user then requested 12d. The assistant implemented the bounded scheduler
 and connected socket tests. Runtime installation and the later lifecycle
 integration steps remain outside this request.
 
+The user subsequently delegated step 13. The assistant integrated optional
+pool checkout into client handling and added PostgreSQL integration tests.
+Enabling the pool in CLI/server startup remains later integration work.
+
 For step 8 onward, the user prefers integration coverage over isolated unit
 tests. Split the implementation into small parts and defer new lifecycle tests
 until the structure supports testing the connected behavior. Maintain existing
@@ -91,8 +96,9 @@ with uninstrumented timing runs.
 
 ## Current implementation
 
-- `crates/pgtest-wire/src/connection.rs` assigns a lease, then opens an upstream
-  connection with the client's startup parameters.
+- `crates/pgtest-wire/src/connection.rs` assigns a lease, then checks an optional
+  shared warm pool using the physical database identity and exact startup
+  profile. A miss opens an upstream connection with the client's parameters.
 - `crates/pgtest-wire/src/postgres_upstream.rs` produces an `UpstreamSession`
   containing a socket and startup response bytes. Startup now rejects
   ErrorResponse and requires an exactly sized, idle ReadyForQuery frame.
@@ -104,7 +110,8 @@ with uninstrumented timing runs.
   cancellation token.
 - `WarmReservation::establish` connects using the registered name and resolved
   profile under the pool's semaphore, then publishes the completed session.
-  It is not yet called by the runtime scheduler or lifecycle callbacks.
+  The scheduler drives these attempts, but runtime startup and lifecycle
+  callbacks do not install or run it yet.
 
 ## Agreed behavior
 
@@ -220,7 +227,7 @@ assistant to write the implementation. Add focused tests alongside each behavior
   - [x] 12b. Track per-database retry deadlines and capped exponential backoff.
   - [x] 12c. Add retirement eligibility, cancellation ownership, and scheduler wakeups.
   - [x] 12d. Drive attempts with one bounded asynchronous scheduler.
-- [ ] 13. Integrate checkout and cold fallback with client connection handling.
+- [x] 13. Integrate checkout and cold fallback with client connection handling.
 - [ ] 14. Monitor unused-socket health and replace dead spares.
 - [ ] 15. Drain unused sockets and warm attempts before database deletion.
 - [ ] 16. Drain pool resources and background work during shutdown.
@@ -2105,3 +2112,51 @@ starts no work, and no listener or core lifecycle adapter invokes the scheduler
 yet. Step 13 is next; runtime installation must retain the planned retirement,
 drain-before-delete, and shutdown ownership requirements before enabling
 warming end to end.
+
+### Completed step: 13 — client checkout and cold fallback
+
+`handle_connection` accepts an optional shared `Arc<ConnectionWarmPool>`.
+Replication rejection, the `pgtest` control connection, protocol negotiation,
+route validation, and successful lease attachment all precede checkout. The
+handler uses the attached session's physical `DatabaseId` and the client's
+original startup parameters to consume at most one matching spare.
+
+Checkout executes inside the existing cancellation-first startup select. An
+already-cancelled lease cannot consume a spare there. If no session is returned,
+the handler immediately calls the existing cold connection path with the
+assigned physical name and unchanged client parameters. It never waits for a
+warm reservation, scheduler permit, or retry deadline. Upstream failure and
+lease cancellation retain their existing client error codes.
+
+Both paths transfer their `UpstreamSession` to the existing relay, preserving
+its startup response bytes, socket, buffered client bytes, and lease guard.
+The relay still sends startup once and observes lease cancellation. Consumed
+sessions are never returned to the pool, and relay errors do not reconnect or
+replay client traffic. Idle health detection remains step 14.
+
+Five PostgreSQL integration tests in `connection/warm_tests.rs` exercise the
+real manager, handler, pool, and relay. They verify:
+
+- TCP and Unix clients receive the exact prepared backend PID and physical
+  database, including the configured application name and search path.
+- A later client uses a fresh backend, even while a replacement reservation is
+  unfinished; session mutations do not carry over.
+- Profile mismatch, a different physical database, and no configured pool take
+  the cold path without consuming the matching spare. Cold startup preserves
+  the requested application name and options.
+- Invalid routes, replication, control traffic, and closed leases do not consume
+  warm inventory.
+- A query pipelined with Startup survives handoff, executes on the prepared
+  backend, and receives its matching BackendKeyData with one AuthenticationOk.
+  Lease release closes both warm and cold handed-off sessions.
+
+Tests seed real upstream sessions explicitly to make hits deterministic. They
+do not install the background scheduler or a lifecycle adapter. Existing TCP
+and Unix listener entry points pass `None`; their public APIs and default cold
+behavior remain unchanged. Runtime ownership and installation must be connected
+with the later retirement/deletion and shutdown work before enabling warming.
+
+Validation: all six connection tests (including the five new integration tests)
+and all five existing TCP/Unix listener tests pass against the Docker PostgreSQL
+harness. Formatting and whitespace checks pass. Step 13 is complete. Step 14
+adds unused-socket health monitoring.

@@ -91,7 +91,7 @@ pub async fn run_with_handle(
                         }
                     };
 
-                    pg_connection_sessions.spawn(handle_connection(ClientStream::Tcp(stream), manager.clone()));
+                    pg_connection_sessions.spawn(handle_connection(ClientStream::Tcp(stream), manager.clone(), None));
                 }
                 Some(_finished) = pg_connection_sessions.join_next(), if !pg_connection_sessions.is_empty() => {}
             }
@@ -132,7 +132,7 @@ pub async fn run_unix_on_port(
                 accepted = listener.accept() => {
                     match accepted {
                         Ok(stream) => {
-                            sessions.spawn(handle_connection(ClientStream::Unix(stream), manager.clone()));
+                            sessions.spawn(handle_connection(ClientStream::Unix(stream), manager.clone(), None));
                         }
                         Err(error) => tracing::warn!(%error, "failed to accept Unix connection"),
                     }

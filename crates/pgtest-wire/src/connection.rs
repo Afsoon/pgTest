@@ -18,6 +18,7 @@ use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use crate::{
+    connection_warm::ConnectionWarmPool,
     control_panel::{self, PgTestQueryTypeControlStatement},
     postgres_upstream, session_relay,
 };
@@ -57,7 +58,11 @@ impl ClientStream {
 }
 
 #[hotpath::measure]
-pub(crate) async fn handle_connection(stream: ClientStream, manager: Arc<WorkerEngineManager>) {
+pub(crate) async fn handle_connection(
+    stream: ClientStream,
+    manager: Arc<WorkerEngineManager>,
+    warm_pool: Option<Arc<ConnectionWarmPool>>,
+) {
     let Ok(Some((mut framed, startup))) =
         tokio::time::timeout(Duration::from_secs(60), stream.startup()).await
     else {
@@ -133,12 +138,21 @@ pub(crate) async fn handle_connection(stream: ClientStream, manager: Arc<WorkerE
             reject_connection(&mut framed, "55000", "lease was closed during connection startup").await;
             return;
         }
-        result = postgres_upstream::connect(
-            &lease_session.database_name,
-            params,
-            &manager.pg_client.host,
-            manager.pg_client.port,
-        ) => match result {
+        result = async {
+            // Checkout belongs inside the cancellation race: a closed lease
+            // must not consume a spare. A miss never waits for replenishment.
+            if let Some(session) = warm_pool.as_ref().and_then(|pool| {
+                pool.try_checkout(lease_session.database_id, params)
+            }) {
+                return Ok(session);
+            }
+            postgres_upstream::connect(
+                &lease_session.database_name,
+                params,
+                &manager.pg_client.host,
+                manager.pg_client.port,
+            ).await
+        } => match result {
             Ok(session) => session,
             Err(error) => {
                 tracing::warn!(%error, host = %manager.pg_client.host, port = manager.pg_client.port, "upstream connection failed");
@@ -154,6 +168,9 @@ pub(crate) async fn handle_connection(stream: ClientStream, manager: Arc<WorkerE
         tracing::debug!(%error, "session relay ended with an I/O error");
     }
 }
+
+#[cfg(test)]
+mod warm_tests;
 
 #[hotpath::measure]
 async fn reject_connection(framed: &mut ClientConnection, code: &str, message: &str) {
