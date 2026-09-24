@@ -357,3 +357,35 @@ async fn armed_monitor_never_consumes_handed_off_traffic_or_closes_client_socket
     drop(client);
     closed(peer).await;
 }
+
+#[tokio::test]
+async fn pool_shutdown_cancels_retry_deadlines_and_closes_idle_inventory() {
+    let pool = pool(1, 2, 1);
+    register(&pool, [1, 2]);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut scheduler = scheduler(&pool, &listener);
+    let (_, mut failed) = drive(&mut scheduler, accept_startup(&listener)).await;
+    reply(&mut failed, false).await;
+    let (_, mut healthy) = drive(&mut scheduler, accept_startup(&listener)).await;
+    reply(&mut healthy, true).await;
+    drive(&mut scheduler, until(|| idle_count(&pool) == 1)).await;
+    assert!(pool.state.lock().unwrap().databases[&DatabaseId(1)].retry_at.is_some());
+    let (scheduler, shutdown) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(scheduler.as_mut(), pool.shutdown())
+    })
+    .await
+    .unwrap();
+    scheduler.unwrap();
+    shutdown.unwrap();
+    closed(failed).await;
+    closed(healthy).await;
+    {
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.capacity_used, 0);
+        assert!(state.databases.values().all(|entry| entry.retiring && entry.retry_at.is_none()));
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
+}

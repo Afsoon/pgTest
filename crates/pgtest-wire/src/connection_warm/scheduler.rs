@@ -17,11 +17,14 @@ pub(crate) enum WarmSchedulerError {
     ConcurrencyClosed,
 }
 
-struct SchedulerGuard<'a>(&'a ConnectionWarmPool);
+struct SchedulerGuard<'a> {
+    pool: &'a ConnectionWarmPool,
+    _drain: TaskTrackerToken,
+}
 
 impl Drop for SchedulerGuard<'_> {
     fn drop(&mut self) {
-        self.0.scheduler_running.store(false, Ordering::Release);
+        self.pool.scheduler_running.store(false, Ordering::Release);
     }
 }
 
@@ -39,10 +42,18 @@ impl ConnectionWarmPool {
         if !self.config.is_enabled() || self.cancellation.is_cancelled() {
             return Ok(());
         }
-        self.scheduler_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| WarmSchedulerError::AlreadyRunning)?;
-        let _guard = SchedulerGuard(&self);
+        let _guard = {
+            // Serialize scheduler admission with shutdown's tracker closure.
+            // No token may appear after shutdown has observed an empty tracker.
+            let _state = self.state.lock().map_err(|_| WarmSchedulerError::StatePoisoned)?;
+            if self.cancellation.is_cancelled() {
+                return Ok(());
+            }
+            self.scheduler_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| WarmSchedulerError::AlreadyRunning)?;
+            SchedulerGuard { pool: &self, _drain: self.scheduler_drain.token() }
+        };
         // Drop attempts before releasing the single-scheduler guard, including
         // when this future is aborted by its caller.
         let mut attempts = FuturesUnordered::new();

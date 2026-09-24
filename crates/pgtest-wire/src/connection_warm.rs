@@ -20,7 +20,9 @@ use crate::postgres_upstream::{self, UpstreamSession};
 mod attempt;
 mod health;
 mod lifecycle;
+mod shutdown;
 pub(crate) use attempt::WarmAttemptError;
+pub(crate) use shutdown::WarmShutdownError;
 mod scheduler;
 
 /// Configuration for preparing fresh, single-use upstream connections.
@@ -152,6 +154,7 @@ pub(crate) struct ConnectionWarmPool {
     cancellation: CancellationToken,
     changed: Notify,
     scheduler_running: AtomicBool,
+    scheduler_drain: TaskTracker,
 }
 
 #[derive(Default)]
@@ -196,6 +199,7 @@ impl ConnectionWarmPool {
             cancellation: CancellationToken::new(),
             changed: Notify::new(),
             scheduler_running: AtomicBool::new(false),
+            scheduler_drain: TaskTracker::new(),
         }
     }
 
@@ -264,8 +268,8 @@ impl ConnectionWarmPool {
         state.capacity_used = remaining_capacity;
         state.schedule_order.retain(|id| *id != database_id);
         // Retain the entry so outstanding reservations can settle and duplicate
-        // registration cannot reactivate the same physical identity. Removal
-        // will be coordinated with the later drain-before-delete barrier.
+        // registration cannot reactivate the same physical identity, including
+        // after draining finishes.
         drop(state);
         cancellation.cancel();
         drop(idle);
@@ -590,6 +594,9 @@ mod health_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod checkout_tests;

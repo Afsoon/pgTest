@@ -10,7 +10,9 @@ retry backoff are complete. Retirement eligibility, cancellation ownership,
 and scheduler wakeups are implemented. The bounded asynchronous scheduler is
 complete. Client handling supports warm checkout and immediate cold fallback.
 Idle health monitoring and checkout probes discard unhealthy spares. Cleanup
-now waits for warm resources to drain before physical database deletion.
+now waits for warm resources to drain before physical database deletion. Pool-wide
+shutdown cancels admission and drains warm resources and scheduler ownership,
+including databases that never received a lease.
 CLI/server runtime warming is not wired yet.
 
 ## Working agreement
@@ -74,6 +76,10 @@ The user subsequently delegated step 15. The assistant added the asynchronous
 cleanup barrier, the pool lifecycle implementation, resource lifetime tracking,
 and connected cleanup regressions. Full pool shutdown and CLI/server startup
 installation remain later work.
+
+The user then delegated step 16. The assistant implemented pool-wide shutdown,
+scheduler lifetime tracking, and connected shutdown regressions. CLI/server
+runtime installation remains part of the later startup integration.
 
 For step 8 onward, the user prefers integration coverage over isolated unit
 tests. Split the implementation into small parts and defer new lifecycle tests
@@ -245,7 +251,7 @@ assistant to write the implementation. Add focused tests alongside each behavior
 - [x] 13. Integrate checkout and cold fallback with client connection handling.
 - [x] 14. Monitor unused-socket health and replace dead spares.
 - [x] 15. Drain unused sockets and warm attempts before database deletion.
-- [ ] 16. Drain pool resources and background work during shutdown.
+- [x] 16. Drain pool resources and background work during shutdown.
 - [ ] 17. Add bounded initial warm-up and background-only startup mode.
 - [ ] 18. Validate integration, isolation, races, failures, and both listener types.
 - [ ] 19. Compare disabled, bounded-wait, and background-only performance.
@@ -2278,3 +2284,44 @@ Validation: all 75 core and 120 wire library tests pass, including local socket
 and Docker PostgreSQL coverage. Formatting and whitespace checks pass. Step 15
 is complete. Step 16 adds full pool/background-work shutdown, including unused
 ready databases; CLI/server runtime installation remains pending.
+
+### Completed step: 16 — drain the entire pool during shutdown
+
+`ConnectionWarmPool::shutdown()` cancels the root token, retires every registered
+database, clears retry deadlines and scheduling order, and removes all idle
+inventory. This includes ready databases that were never assigned to a lease.
+Socket disposal happens outside the state mutex; per-database tracking remains
+live until disposal completes. Queued and running attempts receive cancellation
+and release their reservations, sockets, and concurrency permits.
+
+The scheduler now holds its own `TaskTracker` token. Admission and tracker closure
+use the pool state lock so shutdown cannot finish before a concurrently admitted
+scheduler is accounted for. Its guard releases the token after its attempt
+futures have dropped. Shutdown waits for scheduler exit and every database's
+resource tracker before returning success. A scheduler future first polled after
+shutdown returns without admitting new work.
+
+The operation supports repeated calls, concurrent shutdown waiters, and concurrent
+database drains. Cancelling a shutdown wait leaves admission closed and retirement
+in effect; another call can resume waiting. The caller must keep polling its
+scheduler and attempt futures, or drop them, while awaiting shutdown. The pool
+does not detach tasks or forcibly abort caller-owned futures.
+
+Shutdown closes warm resources without issuing database DDL. Sessions already
+handed to clients remain owned by their leases and relays. A poisoned state lock
+still triggers root cancellation and waits for scheduler exit, then returns
+`WarmShutdownError::StatePoisoned` without claiming that inventory was drained.
+Remaining owned sockets are disposed when the pool is dropped.
+
+Six new regressions cover idle sockets plus queued/running attempts, simultaneous
+waiters, cancellation of a shutdown wait, late publication and scheduler admission,
+scheduler ownership without database resources, disabled pools, poisoned state,
+and pending retry deadlines. A real PostgreSQL integration test installs the pool
+before manager initialization, warms two databases without leasing either, then
+verifies that shutdown closes both backends while preserving the databases.
+Client handoff and release of background references are also checked.
+
+Validation: all 126 wire library tests pass, including local socket and Docker
+PostgreSQL coverage. Formatting and whitespace checks pass. Step 16 is complete.
+Step 17 adds bounded initial warm-up and background-only startup; CLI/server
+runtime installation remains pending.
