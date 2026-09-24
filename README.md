@@ -341,11 +341,26 @@ TCP; its Unix listener is optional.
 | `--pool-grow-batch-size`      | `PGTEST_POOL_GROW_BATCH_SIZE`      | `16`                   | Databases created per growth batch; `0` disables growth.                                |
 | `--lease-claim-timeout-ms`    | `PGTEST_LEASE_CLAIM_TIMEOUT_MS`    | `30000`                | Lease lifetime and pending-claim timeout, in milliseconds; `0` disables these timeouts. |
 | `--max-lease-records`         | `PGTEST_MAX_LEASE_RECORDS`         | `100000`               | Maximum admitted lease IDs, including pending and closed leases.                        |
+| `--connection-warm-count` | `PGTEST_CONNECTION_WARM_COUNT` | `0` | Target spare connections per database; `0` disables warming. |
+| `--connection-warm-max-total` | `PGTEST_CONNECTION_WARM_MAX_TOTAL` | `32` | Global cap on idle connections plus in-flight warm attempts. |
+| `--connection-warm-concurrency` | `PGTEST_CONNECTION_WARM_CONCURRENCY` | `4` | Maximum simultaneous warm attempts. |
+| `--connection-warm-startup-wait-ms` | `PGTEST_CONNECTION_WARM_STARTUP_WAIT_MS` | `5000` | Initial warm-up wait in milliseconds; `0` selects background-only warming. |
+| `--connection-warm-params` | `PGTEST_CONNECTION_WARM_PARAMS` | `{}` | Warm startup profile as a JSON object with string values. |
 | `--log-filter`                | `RUST_LOG`                         | `info`                 | Tracing filter, such as `info` or `debug`.                                              |
 
 A single default in the table applies to both executables. For the CLI,
 `--listen-port` requires `--listen-addr`, and `--unix-socket-port` requires
 `--unix-socket-dir`.
+
+Connection warming currently has configuration parsing and validation only; pool
+integration is pending, so these settings do not yet open spare connections.
+Warm capacity and concurrency must be positive, even when the count is zero.
+The startup profile accepts, for example,
+`--connection-warm-params '{"application_name":"vitest"}'` or
+`PGTEST_CONNECTION_WARM_PARAMS='{"application_name":"vitest"}'`.
+The `database` and `replication` keys are rejected. An explicit `user` is preserved;
+a missing user will be resolved from the configured PostgreSQL user when the pool
+is integrated. See the [implementation plan](docs/connection-warming.md).
 
 Unix sockets are supported on Linux and macOS. The frontend socket is created at
 `<directory>/.s.PGSQL.<port>`; its port is independent of both TCP ports and must

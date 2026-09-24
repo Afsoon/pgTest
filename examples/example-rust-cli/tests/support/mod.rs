@@ -92,6 +92,8 @@ impl PgTest {
                 "--lease-claim-timeout-ms",
                 "120000",
             ])
+            .env("HOTPATH_LIMIT", "0")
+            .env("HOTPATH_OUTPUT_FORMAT", "json")
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stderr(Stdio::piped())

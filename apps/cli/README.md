@@ -71,11 +71,23 @@ the owned Unix socket; startup never overwrites an existing file or socket.
 | `--pool-grow-batch-size` | `16` |
 | `--lease-claim-timeout-ms` | `30000` |
 | `--max-lease-records` | `100000` |
+| `--connection-warm-count` | `0` (disabled) |
+| `--connection-warm-max-total` | `32` |
+| `--connection-warm-concurrency` | `4` |
+| `--connection-warm-startup-wait-ms` | `5000` |
+| `--connection-warm-params` | `{}` |
 | `--log-filter` | `info` |
 
 For example, append `--pool-initial-size 32 --creation-pool-connection 8
 --log-filter debug` to a `serve` command. Zero growth batch size disables growth.
 Pool connection counts and maximum lease records must be greater than zero.
+
+Connection warming currently parses and validates configuration only; opening
+spare connections awaits pool integration. Warm capacity and concurrency must
+be positive even when warming is disabled. A zero startup wait selects
+background-only warming. Startup parameters must be a JSON object with string
+values, such as `--connection-warm-params '{"application_name":"vitest"}'`;
+`database` and `replication` keys are rejected.
 
 Profiling is off by default. Build with `--features hotpath` to enable it;
 `hotpath-alloc` and `hotpath-prometheus` are also available alongside `hotpath`.

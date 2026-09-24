@@ -48,5 +48,7 @@
 !release-plz.toml
 !CHANGELOG.md
 !RELEASING.md
+!docs/
+!docs/connection-warming.md
 !.github/dist/
 !.github/dist/*.yml

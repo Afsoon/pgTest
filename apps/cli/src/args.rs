@@ -1,12 +1,14 @@
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    time::Duration,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use bpaf::{Bpaf, Parser, ShellComp};
 use pgtest::worker_engine::core::WorkerEngineConfig;
 use pgtest_database_operations::manager::config::PostgresConfig;
+use pgtest_pg_wire::connection_warm::ConnectionWarmConfig;
 
 /// Run pgtest against an existing PostgreSQL instance.
 #[derive(Clone, Debug, Bpaf)]
@@ -88,6 +90,24 @@ pub struct ServeOptions {
         fallback(100000)
     )]
     pub max_lease_records: usize,
+    /// Target spare connections per database; zero disables warming.
+    #[bpaf(long, argument("COUNT"), fallback(0))]
+    pub connection_warm_count: u16,
+    /// Global cap on idle connections plus in-flight warm attempts; must be
+    /// positive.
+    #[bpaf(long, argument("COUNT"), fallback(32))]
+    pub connection_warm_max_total: usize,
+    /// Maximum concurrent warm attempts; must be positive.
+    #[bpaf(long, argument("COUNT"), fallback(4))]
+    pub connection_warm_concurrency: usize,
+    /// Initial warm-up wait in milliseconds; zero selects background-only
+    /// warming.
+    #[bpaf(long, argument("MS"), fallback(5000))]
+    pub connection_warm_startup_wait_ms: u64,
+    /// Warm startup parameters as a JSON string-to-string object; excludes
+    /// database and replication.
+    #[bpaf(long, argument("JSON"), fallback(String::from("{}")))]
+    pub connection_warm_params: String,
     /// Tracing filter; defaults to info. Does not read RUST_LOG.
     #[bpaf(long, argument("FILTER"), fallback(String::from("info")))]
     pub log_filter: String,
@@ -127,11 +147,27 @@ impl ServeOptions {
     }
 
     pub fn validate(&self) -> Result<()> {
+        // Validate now, before database work. Pool integration will consume
+        // this config.
+        self.connection_warm_config()?;
         if let Some(directory) = &self.unix_socket_dir {
             ensure!(cfg!(unix), "Unix sockets are unsupported on this platform");
             ensure!(directory.is_dir(), "--unix-socket-dir must be an existing directory");
         }
         Ok(())
+    }
+
+    pub fn connection_warm_config(&self) -> Result<ConnectionWarmConfig> {
+        let params = serde_json::from_str(&self.connection_warm_params)
+            .context("--connection-warm-params must be a JSON object with string values")?;
+        ConnectionWarmConfig::try_new(
+            self.connection_warm_count,
+            self.connection_warm_max_total,
+            self.connection_warm_concurrency,
+            Duration::from_millis(self.connection_warm_startup_wait_ms),
+            params,
+        )
+        .context("invalid --connection-warm-* configuration")
     }
 
     pub fn postgres_config(&self) -> PostgresConfig {
@@ -225,6 +261,102 @@ mod tests {
         assert_eq!(engine.max_lease_records, 100000);
         assert_eq!(options.unix_socket_port.unwrap_or(6432), 6432);
         assert_eq!(options.log_filter, "info");
+        assert_eq!(options.connection_warm_config().unwrap(), ConnectionWarmConfig::default());
+    }
+
+    #[test]
+    fn warm_overrides_reach_the_validated_config() {
+        let options = parse(&[
+            "--listen-addr",
+            "127.0.0.1",
+            "--connection-warm-count",
+            "8",
+            "--connection-warm-max-total",
+            "2",
+            "--connection-warm-concurrency",
+            "1",
+            "--connection-warm-startup-wait-ms",
+            "250",
+            "--connection-warm-params",
+            r#"{"user":"test_user","application_name":"vitest","options":"-c search_path=public"}"#,
+        ])
+        .unwrap();
+        options.validate().unwrap();
+        let expected = ConnectionWarmConfig::try_new(
+            8,
+            2,
+            1,
+            Duration::from_millis(250),
+            std::collections::BTreeMap::from([
+                ("user".into(), "test_user".into()),
+                ("application_name".into(), "vitest".into()),
+                ("options".into(), "-c search_path=public".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(options.connection_warm_config().unwrap(), expected);
+    }
+
+    #[test]
+    fn warm_configuration_accepts_zero_target_and_startup_wait() {
+        let options = parse(&[
+            "--listen-addr",
+            "127.0.0.1",
+            "--connection-warm-count",
+            "0",
+            "--connection-warm-startup-wait-ms",
+            "0",
+        ])
+        .unwrap();
+        options.validate().unwrap();
+        assert_eq!(
+            options.connection_warm_config().unwrap(),
+            ConnectionWarmConfig::try_new(0, 32, 4, Duration::ZERO, Default::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_warm_configuration_is_rejected_before_startup() {
+        for count in ["0", "1"] {
+            for (flag, value) in [
+                ("--connection-warm-max-total", "0"),
+                ("--connection-warm-concurrency", "0"),
+                ("--connection-warm-params", r#"{"database":""}"#),
+                ("--connection-warm-params", r#"{"replication":"false"}"#),
+                ("--connection-warm-params", r#"{"user":42}"#),
+                ("--connection-warm-params", r#"{"user":null}"#),
+                ("--connection-warm-params", r#"{"options":{}}"#),
+                ("--connection-warm-params", "[]"),
+                ("--connection-warm-params", "null"),
+                ("--connection-warm-params", "invalid"),
+                ("--connection-warm-params", ""),
+            ] {
+                let options = parse(&[
+                    "--listen-addr",
+                    "127.0.0.1",
+                    "--connection-warm-count",
+                    count,
+                    flag,
+                    value,
+                ])
+                .unwrap();
+                assert!(options.validate().is_err(), "accepted {flag}={value} with count={count}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_warm_numbers_fail_argument_parsing() {
+        for (flag, value) in [
+            ("--connection-warm-count", "65536"),
+            ("--connection-warm-count", "-1"),
+            ("--connection-warm-max-total", "-1"),
+            ("--connection-warm-concurrency", "invalid"),
+            ("--connection-warm-startup-wait-ms", "-1"),
+            ("--connection-warm-startup-wait-ms", "18446744073709551616"),
+        ] {
+            assert!(parse(&["--listen-addr", "127.0.0.1", flag, value]).is_err(), "{flag}={value}");
+        }
     }
 
     #[test]

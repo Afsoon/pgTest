@@ -3,7 +3,7 @@ help:
 
 # Run the example against PostgreSQL in Docker and the native PgTest CLI
 test:
-    rustup run nightly cargo nextest run --locked
+    rustup run nightly cargo nextest run --locked --success-output immediate
 
 check:
     rustup run nightly cargo check --locked --all-targets

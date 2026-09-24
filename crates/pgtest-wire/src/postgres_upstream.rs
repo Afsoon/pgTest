@@ -13,7 +13,9 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::postgres_upstream::upstream_stream::UpstreamStream;
+use crate::postgres_upstream::{
+    UpstreamError::InvalidFrameLength, upstream_stream::UpstreamStream,
+};
 
 pub(crate) mod upstream_stream;
 
@@ -31,6 +33,8 @@ pub(crate) enum UpstreamError {
     UnexpectedMessage(u8),
     #[error("invalid upstream message length {0}")]
     InvalidFrameLength(i32),
+    #[error("unexpected status byte; expected I (idle) found ${0:#x} ")]
+    InvalidReadyForQueryStatus(u8),
 }
 
 pub struct RawBytes(BytesMut);
@@ -157,7 +161,7 @@ async fn send_startup(
 }
 
 #[hotpath::measure]
-fn forwardable(client_params: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+pub(crate) fn forwardable(client_params: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     const OWNED: [&str; 2] = ["database", "replication"];
     client_params
         .iter()
@@ -174,10 +178,24 @@ async fn wait_for_ready_for_query(
     let mut cursor = 0;
     loop {
         let (tag, frame_end) = read_frame(stream, buf, cursor, i32::MAX as usize).await?;
-        cursor = frame_end;
-        if matches!(tag, b'Z' | b'E') {
-            return Ok(RawBytes::from(buf.split_to(cursor)));
+        match tag {
+            b'Z' => {
+                let cursor_framed = &buf[cursor..frame_end];
+
+                if cursor_framed.len() != 6 {
+                    return Err(InvalidFrameLength((cursor_framed.len() - 1) as i32));
+                }
+
+                if buf.get(cursor + 5).is_none_or(|&byte_tag| byte_tag != b'I') {
+                    return Err(UpstreamError::InvalidReadyForQueryStatus(buf[cursor + 5]));
+                }
+
+                return Ok(RawBytes::from(buf.split_to(frame_end)));
+            }
+            b'E' => return Err(UpstreamError::StartupRejected),
+            _ => {}
         }
+        cursor = frame_end;
     }
 }
 
@@ -323,12 +341,65 @@ mod tests {
 
     #[tokio::test]
     async fn startup_preserves_the_opaque_burst_after_authentication() {
-        for burst in [b"S\0\0\0\x08a\0b\0Z\0\0\0\x05I".as_slice(), b"E\0\0\0\x04".as_slice()] {
+        for burst in [b"S\0\0\0\x08a\0b\0Z\0\0\0\x05I".as_slice()] {
             let mut reply = b"R\0\0\0\x08\0\0\0\0".to_vec();
             reply.extend_from_slice(burst);
             let session = connect_with_reply(reply).await.unwrap();
             assert_eq!(session.session_burst.bytes(), burst);
         }
+    }
+
+    #[tokio::test]
+    async fn startup_rejected_return_error() {
+        for burst in [b"E\0\0\0\x04".as_slice()] {
+            let mut reply = b"R\0\0\0\x08\0\0\0\0".to_vec();
+            reply.extend_from_slice(burst);
+            let session = connect_with_reply(reply).await;
+            assert!(matches!(session, Err(UpstreamError::StartupRejected)));
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_for_query_without_status_returns_invalid_length() {
+        let reply = b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x04".to_vec();
+        let error = connect_with_reply(reply).await.err();
+        assert!(matches!(error, Some(UpstreamError::InvalidFrameLength(4))), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn ready_for_query_with_extra_payload_returns_invalid_length() {
+        let reply = b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x06I?".to_vec();
+        let error = connect_with_reply(reply).await.err();
+        assert!(matches!(error, Some(UpstreamError::InvalidFrameLength(6))), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn ready_for_query_rejects_non_idle_and_unknown_statuses() {
+        // Check both the first buffered frame and a frame after
+        // ParameterStatus.
+        for prefix in [b"".as_slice(), b"S\0\0\0\x08a\0b\0".as_slice()] {
+            for status in [b'T', b'E', b'?'] {
+                let mut reply = b"R\0\0\0\x08\0\0\0\0".to_vec();
+                reply.extend_from_slice(prefix);
+                reply.extend_from_slice(b"Z\0\0\0\x05");
+                reply.push(status);
+                let error = connect_with_reply(reply).await.err();
+                assert!(
+                    matches!(error, Some(UpstreamError::InvalidReadyForQueryStatus(actual)) if actual == status),
+                    "status {status:#x}, prefix length {}: {error:?}",
+                    prefix.len(),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_ready_for_query_without_parameter_status() {
+        let burst = b"Z\0\0\0\x05I";
+        let mut reply = b"R\0\0\0\x08\0\0\0\0".to_vec();
+        reply.extend_from_slice(burst);
+        let session = connect_with_reply(reply).await.unwrap();
+        assert_eq!(session.session_burst.bytes(), burst);
     }
 
     #[tokio::test]

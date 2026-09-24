@@ -7,13 +7,14 @@ use std::{
     num::NonZeroU16,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 use envconfig::Envconfig;
 use pgtest::{worker_engine::core::WorkerEngineConfig, worker_manager::WorkerEngineManager};
 use pgtest_database_operations::manager::config::PostgresConfig;
-use pgtest_pg_wire::wire_listener;
+use pgtest_pg_wire::{connection_warm::ConnectionWarmConfig, wire_listener};
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 #[derive(Envconfig)]
@@ -26,6 +27,31 @@ struct ServerConfig {
     unix_socket_dir: Option<PathBuf>,
     #[envconfig(from = "PGTEST_UNIX_SOCKET_PORT", default = "6432")]
     unix_socket_port: NonZeroU16,
+    #[envconfig(from = "PGTEST_CONNECTION_WARM_COUNT", default = "0")]
+    connection_warm_count: u16,
+    #[envconfig(from = "PGTEST_CONNECTION_WARM_MAX_TOTAL", default = "32")]
+    connection_warm_max_total: usize,
+    #[envconfig(from = "PGTEST_CONNECTION_WARM_CONCURRENCY", default = "4")]
+    connection_warm_concurrency: usize,
+    #[envconfig(from = "PGTEST_CONNECTION_WARM_STARTUP_WAIT_MS", default = "5000")]
+    connection_warm_startup_wait_ms: u64,
+    #[envconfig(from = "PGTEST_CONNECTION_WARM_PARAMS", default = "{}")]
+    connection_warm_params: String,
+}
+
+impl ServerConfig {
+    fn connection_warm_config(&self) -> Result<ConnectionWarmConfig> {
+        let params = serde_json::from_str(&self.connection_warm_params)
+            .context("PGTEST_CONNECTION_WARM_PARAMS must be a JSON object with string values")?;
+        ConnectionWarmConfig::try_new(
+            self.connection_warm_count,
+            self.connection_warm_max_total,
+            self.connection_warm_concurrency,
+            Duration::from_millis(self.connection_warm_startup_wait_ms),
+            params,
+        )
+        .context("invalid PGTEST_CONNECTION_WARM_* configuration")
+    }
 }
 
 #[tokio::main]
@@ -43,6 +69,8 @@ async fn main() -> Result<()> {
     hotpath::tokio_runtime!();
 
     let server_config = ServerConfig::init_from_env().context("invalid server configuration")?;
+    // Validate before database work; pool integration will consume this config.
+    let _connection_warm_config = server_config.connection_warm_config()?;
     ensure!(
         cfg!(unix) || server_config.unix_socket_dir.is_none(),
         "Unix sockets are unsupported on this platform"
@@ -102,6 +130,90 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1".parse::<IpAddr>().unwrap());
         assert_eq!(config.listen_port, 6432);
         assert_eq!(config.unix_socket_port.get(), 6432);
+        assert_eq!(config.connection_warm_config().unwrap(), ConnectionWarmConfig::default());
+    }
+
+    #[test]
+    fn warm_environment_overrides_reach_the_validated_config() {
+        let vars = HashMap::from([
+            ("PGTEST_CONNECTION_WARM_COUNT".into(), "8".into()),
+            ("PGTEST_CONNECTION_WARM_MAX_TOTAL".into(), "2".into()),
+            ("PGTEST_CONNECTION_WARM_CONCURRENCY".into(), "1".into()),
+            ("PGTEST_CONNECTION_WARM_STARTUP_WAIT_MS".into(), "250".into()),
+            ("PGTEST_CONNECTION_WARM_PARAMS".into(),
+                r#"{"user":"test_user","application_name":"vitest","options":"-c search_path=public"}"#.into()),
+        ]);
+        let config = ServerConfig::init_from_hashmap(&vars).unwrap();
+        let expected = ConnectionWarmConfig::try_new(
+            8,
+            2,
+            1,
+            Duration::from_millis(250),
+            std::collections::BTreeMap::from([
+                ("user".into(), "test_user".into()),
+                ("application_name".into(), "vitest".into()),
+                ("options".into(), "-c search_path=public".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(config.connection_warm_config().unwrap(), expected);
+    }
+
+    #[test]
+    fn warm_environment_accepts_zero_target_and_startup_wait() {
+        let vars = HashMap::from([
+            ("PGTEST_CONNECTION_WARM_COUNT".into(), "0".into()),
+            ("PGTEST_CONNECTION_WARM_STARTUP_WAIT_MS".into(), "0".into()),
+        ]);
+        let config = ServerConfig::init_from_hashmap(&vars).unwrap();
+        assert_eq!(
+            config.connection_warm_config().unwrap(),
+            ConnectionWarmConfig::try_new(0, 32, 4, Duration::ZERO, Default::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_warm_environment_is_rejected_before_startup() {
+        for count in ["0", "1"] {
+            for (key, value) in [
+                ("PGTEST_CONNECTION_WARM_MAX_TOTAL", "0"),
+                ("PGTEST_CONNECTION_WARM_CONCURRENCY", "0"),
+                ("PGTEST_CONNECTION_WARM_PARAMS", r#"{"database":""}"#),
+                ("PGTEST_CONNECTION_WARM_PARAMS", r#"{"replication":"false"}"#),
+                ("PGTEST_CONNECTION_WARM_PARAMS", r#"{"user":42}"#),
+                ("PGTEST_CONNECTION_WARM_PARAMS", r#"{"user":null}"#),
+                ("PGTEST_CONNECTION_WARM_PARAMS", r#"{"options":{}}"#),
+                ("PGTEST_CONNECTION_WARM_PARAMS", "[]"),
+                ("PGTEST_CONNECTION_WARM_PARAMS", "null"),
+                ("PGTEST_CONNECTION_WARM_PARAMS", "invalid"),
+                ("PGTEST_CONNECTION_WARM_PARAMS", ""),
+            ] {
+                let vars = HashMap::from([
+                    ("PGTEST_CONNECTION_WARM_COUNT".into(), count.into()),
+                    (key.into(), value.into()),
+                ]);
+                let config = ServerConfig::init_from_hashmap(&vars).unwrap();
+                assert!(
+                    config.connection_warm_config().is_err(),
+                    "accepted {key}={value} with count={count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_warm_numbers_fail_environment_parsing() {
+        for (key, value) in [
+            ("PGTEST_CONNECTION_WARM_COUNT", "65536"),
+            ("PGTEST_CONNECTION_WARM_COUNT", "-1"),
+            ("PGTEST_CONNECTION_WARM_MAX_TOTAL", "-1"),
+            ("PGTEST_CONNECTION_WARM_CONCURRENCY", "invalid"),
+            ("PGTEST_CONNECTION_WARM_STARTUP_WAIT_MS", "-1"),
+            ("PGTEST_CONNECTION_WARM_STARTUP_WAIT_MS", "18446744073709551616"),
+        ] {
+            let vars = HashMap::from([(key.into(), value.into())]);
+            assert!(ServerConfig::init_from_hashmap(&vars).is_err(), "{key}={value}");
+        }
     }
 
     #[test]
