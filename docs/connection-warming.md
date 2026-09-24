@@ -7,8 +7,8 @@ complete, including creation and retirement notifications. Reserved warm
 attempts now establish and publish sessions with shared concurrency limits,
 timeouts, and cancellation. Round-robin reservation selection and per-database
 retry backoff are complete. Retirement eligibility, cancellation ownership,
-and scheduler wakeups are implemented. The scheduler is next; runtime warming
-is not wired yet.
+and scheduler wakeups are implemented. The bounded asynchronous scheduler is
+complete; runtime warming is not wired yet.
 
 ## Working agreement
 
@@ -55,6 +55,10 @@ Steps 12c and 12d remain pending and outside this implementation request.
 The user subsequently requested 12c. The assistant implemented retirement
 eligibility, database/pool cancellation ownership, wakeups, and connected socket
 regressions. The scheduler in 12d remains outside this request.
+
+The user then requested 12d. The assistant implemented the bounded scheduler
+and connected socket tests. Runtime installation and the later lifecycle
+integration steps remain outside this request.
 
 For step 8 onward, the user prefers integration coverage over isolated unit
 tests. Split the implementation into small parts and defer new lifecycle tests
@@ -211,11 +215,11 @@ assistant to write the implementation. Add focused tests alongside each behavior
 - [x] 11. Establish warm sessions with timeouts, concurrency limits, and cancellation.
   - [x] 11a. Add a cancellable, five-second warm connection attempt.
   - [x] 11b. Run reserved attempts under the pool's shared concurrency limit.
-- [ ] 12. Add bounded, fair replenishment and failure backoff.
+- [x] 12. Add bounded, fair replenishment and failure backoff.
   - [x] 12a. Reserve replenishment work in round-robin database order.
   - [x] 12b. Track per-database retry deadlines and capped exponential backoff.
   - [x] 12c. Add retirement eligibility, cancellation ownership, and scheduler wakeups.
-  - [ ] 12d. Drive attempts with one bounded asynchronous scheduler.
+  - [x] 12d. Drive attempts with one bounded asynchronous scheduler.
 - [ ] 13. Integrate checkout and cold fallback with client connection handling.
 - [ ] 14. Monitor unused-socket health and replace dead spares.
 - [ ] 15. Drain unused sockets and warm attempts before database deletion.
@@ -1945,7 +1949,7 @@ to recheck state. Signal after releasing the state mutex. Wakeups request a
 state recheck, rather than enqueueing one job per event. Logical retirement and
 this notification mechanism do not replace the step 15 drain-before-drop barrier.
 
-**12d — one bounded coordinator.** Own an endpoint, the shared pool, and a
+**12d — one bounded coordinator (implemented).** Own an endpoint, the shared pool, and a
 `FuturesUnordered` of attempts in one scheduler future. Reserve work using
 `reserve_next` only while the active-future count is below the effective attempt
 limit. Each future owns its reservation and database token, calls `establish`,
@@ -2063,3 +2067,41 @@ sandbox. Formatting and whitespace checks pass. Step 12c is complete. No
 scheduler, core lifecycle adapter installation, or physical database deletion
 barrier was added. Step 12d is next; end-to-end PostgreSQL/Vitest lifecycle
 coverage and the drain-before-delete barrier remain later work.
+
+### Completed step: 12d — bounded asynchronous scheduler
+
+`Arc<ConnectionWarmPool>::run_scheduler(host, port)` returns a caller-owned
+future. It owns a `FuturesUnordered` of attempts and uses `reserve_next` to
+fill available slots in round-robin order. Both its future count and the shared
+semaphore use the effective limit: the minimum of configured concurrency,
+global capacity, and Tokio's maximum semaphore permits. There is no task or
+reservation backlog proportional to the number of databases.
+
+The loop consumes completed results, fills available slots, and waits for an
+attempt completion, a pool notification, a useful retry deadline, or pool
+cancellation. Retry timers are considered only when an attempt slot, global
+capacity, and the database's target permit more work. An overdue retry blocked
+by capacity therefore parks until a state change. `establish` remains the sole
+owner of failure accounting; the scheduler reports upstream failures without
+advancing the backoff again.
+
+An atomic guard rejects a second scheduler for the same pool. Returning or
+dropping the future drops its attempts before releasing that guard, settling
+reservations, sockets, and semaphore permits without detached tasks. Pool
+cancellation stops the coordinator; a closed concurrency limiter or poisoned
+state returns a terminal error. Disabled or already-cancelled pools return
+without opening connections. Published idle sessions remain owned by the pool
+until checkout, retirement, or the later shutdown drain.
+
+Six connected socket tests cover round-robin order, registration and checkout
+replenishment, bounded reservations across twenty databases, retirement and
+stop cleanup, timer-driven retry and healthy-database progress, an overdue
+retry waiting for global capacity, single-scheduler ownership and restart after
+drop, and disabled/closed operation. Existing attempt tests retain coverage of
+backoff reset, startup timeout, and late publication after retirement.
+
+All seventy-two warm-pool tests pass. Step 12 is complete. Construction still
+starts no work, and no listener or core lifecycle adapter invokes the scheduler
+yet. Step 13 is next; runtime installation must retain the planned retirement,
+drain-before-delete, and shutdown ownership requirements before enabling
+warming end to end.

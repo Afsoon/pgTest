@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -16,6 +16,7 @@ use crate::postgres_upstream::{self, UpstreamSession};
 
 mod attempt;
 pub(crate) use attempt::WarmAttemptError;
+mod scheduler;
 
 /// Configuration for preparing fresh, single-use upstream connections.
 ///
@@ -113,6 +114,10 @@ impl ConnectionWarmConfig {
     pub(crate) fn is_enabled(&self) -> bool {
         self.per_database != 0
     }
+
+    fn attempt_limit(&self) -> usize {
+        self.concurrency.min(self.max_total).min(Semaphore::MAX_PERMITS)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +146,7 @@ pub(crate) struct ConnectionWarmPool {
     attempt_permits: Semaphore,
     cancellation: CancellationToken,
     changed: Notify,
+    scheduler_running: AtomicBool,
 }
 
 #[derive(Default)]
@@ -169,8 +175,7 @@ impl ConnectionWarmPool {
         let profile = config.resolve_profile(default_user);
         // Attempts cannot exceed reserved capacity. Capping at Tokio's limit
         // also keeps very large, otherwise valid settings from panicking.
-        let attempt_permits =
-            Semaphore::new(config.concurrency.min(config.max_total).min(Semaphore::MAX_PERMITS));
+        let attempt_permits = Semaphore::new(config.attempt_limit());
         Self {
             config,
             profile,
@@ -178,6 +183,7 @@ impl ConnectionWarmPool {
             attempt_permits,
             cancellation: CancellationToken::new(),
             changed: Notify::new(),
+            scheduler_running: AtomicBool::new(false),
         }
     }
 
@@ -544,6 +550,9 @@ mod publication_tests;
 
 #[cfg(test)]
 mod attempt_tests;
+
+#[cfg(test)]
+mod scheduler_tests;
 
 #[cfg(test)]
 mod checkout_tests;
