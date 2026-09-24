@@ -27,7 +27,7 @@ impl ConnectionWarmPool {
                 // discards this unused backend instead of replaying it later.
                 let mut byte = [0];
                 let mut buffer = ReadBuf::new(&mut byte);
-                Pin::new(&mut session.stream).poll_read(cx, &mut buffer).is_ready()
+                Pin::new(&mut session.session.stream).poll_read(cx, &mut buffer).is_ready()
             });
             if let Some(index) = unhealthy {
                 let remaining_capacity =

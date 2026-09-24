@@ -60,12 +60,13 @@ async fn disabled_checkout_preserves_even_a_seeded_idle_session() {
             DatabaseId(1),
             DatabaseWarmState {
                 database_name: "physical".to_owned(),
-                idle: VecDeque::from([session]),
+                idle: VecDeque::from([IdleSession { session, _drain: TaskTracker::new().token() }]),
                 in_flight: 0,
                 retry_at: None,
                 retry_strategy: warm_retry_strategy(),
                 retiring: false,
                 cancellation: pool.cancellation.child_token(),
+                drain: TaskTracker::new(),
             },
         );
         state.capacity_used = 1;

@@ -50,6 +50,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_lifecycle(Arc::new(NoopDatabaseLifecycle))
+    }
+
+    fn with_lifecycle(lifecycle: Arc<dyn DatabaseLifecycle>) -> Self {
         let tracker = TaskTracker::new();
         let shutdown = CancellationToken::new();
         let (creates_tx, creates) = mpsc::unbounded_channel();
@@ -71,6 +75,7 @@ impl Fixture {
             shutdown.clone(),
             client,
             cleanup_rx,
+            lifecycle,
         );
         tracker.spawn(creation.run());
         tracker.spawn(cleanup.run());
@@ -133,6 +138,82 @@ impl Fixture {
             .expect("worker loops and DDL tasks should finish");
         assert!(self.tracker.is_empty());
     }
+}
+
+struct ControlledDrain(mpsc::UnboundedSender<(DatabaseId, oneshot::Sender<DropResult>)>);
+
+impl DatabaseLifecycle for ControlledDrain {
+    fn database_ready(&self, _: DatabaseId, _: &str) {}
+
+    fn database_retired(&self, _: DatabaseId) {}
+
+    fn drain_database(&self, id: DatabaseId) -> crate::worker_engine::lifecycle::DatabaseDrain<'_> {
+        Box::pin(async move {
+            let (finish, done) = oneshot::channel();
+            self.0.send((id, finish)).unwrap();
+            done.await.unwrap()
+        })
+    }
+}
+
+#[tokio::test]
+async fn cleanup_waits_for_drain_and_drain_failure_skips_ddl() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut fixture = Fixture::with_lifecycle(Arc::new(ControlledDrain(tx)));
+        fixture.cleanup(1, "blocked");
+        let (id, blocked) = rx.recv().await.unwrap();
+        assert_eq!(id, DatabaseId(1));
+        assert!(fixture.drops.try_recv().is_err());
+
+        // Another cleanup and creation proceed while this database drains.
+        fixture.cleanup(2, "ready");
+        let (id, ready) = rx.recv().await.unwrap();
+        assert_eq!(id, DatabaseId(2));
+        ready.send(Ok(())).unwrap();
+        let request = fixture.next_drop().await;
+        assert_eq!(request.database_name, "ready");
+        request.finish.send(Ok(())).unwrap();
+        assert!(matches!(
+            fixture.next_result().await,
+            DatabaseWorkerMessages::CleanupFinished { database_id: DatabaseId(2), result: Ok(()) }
+        ));
+        fixture.create(3);
+        fixture.next_creation().await.send(Ok(ReadString::from("new"))).unwrap();
+        assert!(matches!(
+            fixture.next_result().await,
+            DatabaseWorkerMessages::CreationFinished { database_id: DatabaseId(3), result: Ok(_) }
+        ));
+
+        blocked
+            .send(Err(PostgresDDLClientError::DatabaseDrainFailed("unverified resources".into())))
+            .unwrap();
+        assert!(matches!(
+            fixture.next_result().await,
+            DatabaseWorkerMessages::CleanupFinished {
+                database_id: DatabaseId(1),
+                result: Err(PostgresDDLClientError::DatabaseDrainFailed(_))
+            }
+        ));
+        assert!(fixture.drops.try_recv().is_err(), "failed drain must never execute DROP DATABASE");
+        fixture.finish().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_cancels_waiting_drain_without_starting_ddl() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut fixture = Fixture::with_lifecycle(Arc::new(ControlledDrain(tx)));
+    fixture.cleanup(1, "blocked");
+    let (_, completion) =
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    fixture.shutdown.cancel();
+    fixture.finish().await;
+    assert!(completion.is_closed(), "drain wait must be dropped on shutdown");
+    assert!(fixture.drops.try_recv().is_err());
+    assert!(fixture.results.recv().await.is_none(), "cancellation must not report cleanup success");
 }
 
 #[tokio::test]

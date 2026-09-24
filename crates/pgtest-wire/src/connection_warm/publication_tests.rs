@@ -40,9 +40,9 @@ async fn publication_at_full_capacity_preserves_the_session_and_its_slot() {
     tokio::time::timeout(Duration::from_secs(5), async {
         peer.write_all(b"request").await.unwrap();
         let mut request = [0; 7];
-        stored.stream.read_exact(&mut request).await.unwrap();
+        stored.session.stream.read_exact(&mut request).await.unwrap();
         assert_eq!(&request, b"request");
-        stored.stream.write_all(b"reply").await.unwrap();
+        stored.session.stream.write_all(b"reply").await.unwrap();
         let mut reply = [0; 5];
         peer.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply, b"reply");

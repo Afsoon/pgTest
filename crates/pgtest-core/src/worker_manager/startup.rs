@@ -68,6 +68,7 @@ pub(super) async fn start_workers(
         shutdown_token.clone(),
         postgres_client.clone(),
         cleanup_rx,
+        lifecycle.clone(),
     );
 
     let worker_engine_inbox = WorkerEngineInbox::new(inbox_rx);

@@ -166,7 +166,7 @@ async fn terminated_postgres_spare_falls_back_cold_through_the_handler() {
         // the monitor: the client checkout itself must reject the dead spare.
         poll_fn(|cx| {
             let state = pool.state.lock().unwrap();
-            let stream = &state.databases[&lease.database_id].idle[0].stream;
+            let stream = &state.databases[&lease.database_id].idle[0].session.stream;
             match stream {
                 UpstreamStream::Tcp(stream) => stream.poll_read_ready(cx),
                 #[cfg(unix)]

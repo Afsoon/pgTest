@@ -10,12 +10,16 @@ use tokio::{
     time::Instant,
 };
 use tokio_retry2::strategy::ExponentialFactorBackoff;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{
+    sync::CancellationToken,
+    task::{TaskTracker, task_tracker::TaskTrackerToken},
+};
 
 use crate::postgres_upstream::{self, UpstreamSession};
 
 mod attempt;
 mod health;
+mod lifecycle;
 pub(crate) use attempt::WarmAttemptError;
 mod scheduler;
 
@@ -159,12 +163,19 @@ struct WarmPoolState {
 
 struct DatabaseWarmState {
     database_name: String,
-    idle: VecDeque<UpstreamSession>,
+    idle: VecDeque<IdleSession>,
     in_flight: usize,
     retry_at: Option<Instant>,
     retry_strategy: ExponentialFactorBackoff,
     retiring: bool,
     cancellation: CancellationToken,
+    drain: TaskTracker,
+}
+
+// Field order matters: close the socket before releasing its drain token.
+struct IdleSession {
+    session: UpstreamSession,
+    _drain: TaskTrackerToken,
 }
 
 fn warm_retry_strategy() -> ExponentialFactorBackoff {
@@ -213,6 +224,7 @@ impl ConnectionWarmPool {
                     retry_strategy: warm_retry_strategy(),
                     retiring: false,
                     cancellation: self.cancellation.child_token(),
+                    drain: TaskTracker::new(),
                 });
                 state_lock.schedule_order.push_back(database_id);
                 true
@@ -245,6 +257,7 @@ impl ConnectionWarmPool {
             .checked_sub(entry.idle.len())
             .expect("idle sessions must occupy capacity");
         entry.retiring = true;
+        entry.drain.close();
         entry.retry_at = None;
         let cancellation = entry.cancellation.clone();
         let idle = std::mem::take(&mut entry.idle);
@@ -296,6 +309,7 @@ impl ConnectionWarmPool {
             database_name,
             cancellation,
             active: true,
+            drain: entry.drain.token(),
         })
     }
 
@@ -393,8 +407,10 @@ impl ConnectionWarmPool {
             // The session is exclusively owned now. Close rejected sockets
             // outside the state lock and try the next spare without
             // waiting for warm-up.
-            if warmed_session.stream.is_idle() {
-                return Some(warmed_session);
+            if warmed_session.session.stream.is_idle() {
+                // Handoff ends warm ownership; the lease/relay owns the
+                // connection from here. The drain token drops outside the lock.
+                return Some(warmed_session.session);
             }
             drop(warmed_session);
         }
@@ -409,6 +425,7 @@ pub(crate) struct WarmReservation {
     database_name: String,
     cancellation: CancellationToken,
     active: bool,
+    drain: TaskTrackerToken,
 }
 
 impl WarmReservation {
@@ -429,6 +446,9 @@ impl WarmReservation {
         upstream_port: u16,
         cancellation: &CancellationToken,
     ) -> Result<bool, WarmAttemptError> {
+        // Retain tracking until the permit and nested connection future have
+        // dropped, including after publication consumes the reservation.
+        let _attempt_drain = self.drain.clone();
         // Keep the pool alive independently of self so publication can consume
         // the reservation while the borrowed permit remains held.
         let pool = self.pool.clone();
@@ -517,7 +537,7 @@ impl WarmReservation {
             return false;
         }
 
-        entry.idle.push_back(session);
+        entry.idle.push_back(IdleSession { session, _drain: entry.drain.token() });
         entry.in_flight = update_in_flight;
         entry.retry_at = None;
         entry.retry_strategy = warm_retry_strategy();
@@ -567,6 +587,9 @@ mod scheduler_tests;
 
 #[cfg(test)]
 mod health_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod checkout_tests;

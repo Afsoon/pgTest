@@ -9,8 +9,9 @@ timeouts, and cancellation. Round-robin reservation selection and per-database
 retry backoff are complete. Retirement eligibility, cancellation ownership,
 and scheduler wakeups are implemented. The bounded asynchronous scheduler is
 complete. Client handling supports warm checkout and immediate cold fallback.
-Idle health monitoring and checkout probes discard unhealthy spares; runtime
-warming is not wired yet.
+Idle health monitoring and checkout probes discard unhealthy spares. Cleanup
+now waits for warm resources to drain before physical database deletion.
+CLI/server runtime warming is not wired yet.
 
 ## Working agreement
 
@@ -69,6 +70,11 @@ Enabling the pool in CLI/server startup remains later integration work.
 The user then delegated step 14. The assistant added idle socket monitoring,
 nonblocking checkout probes, and connected health/fallback regressions.
 
+The user subsequently delegated step 15. The assistant added the asynchronous
+cleanup barrier, the pool lifecycle implementation, resource lifetime tracking,
+and connected cleanup regressions. Full pool shutdown and CLI/server startup
+installation remain later work.
+
 For step 8 onward, the user prefers integration coverage over isolated unit
 tests. Split the implementation into small parts and defer new lifecycle tests
 until the structure supports testing the connected behavior. Maintain existing
@@ -110,6 +116,9 @@ with uninstrumented timing runs.
   and relays traffic until completion or lease cancellation.
 - Core notifies the injectable lifecycle hook after accepted initial/runtime
   database creation and before retirement cleanup submission.
+- Each cleanup worker job awaits that same hook's drain barrier before issuing
+  PostgreSQL deletion. The warm pool implements registration, retirement, and
+  draining; CLI/server startup still uses the default no-op hook.
 - `LeaseSession` carries the physical `DatabaseId`, database name, and lease
   cancellation token.
 - `WarmReservation::establish` connects using the registered name and resolved
@@ -235,7 +244,7 @@ assistant to write the implementation. Add focused tests alongside each behavior
   - [x] 12d. Drive attempts with one bounded asynchronous scheduler.
 - [x] 13. Integrate checkout and cold fallback with client connection handling.
 - [x] 14. Monitor unused-socket health and replace dead spares.
-- [ ] 15. Drain unused sockets and warm attempts before database deletion.
+- [x] 15. Drain unused sockets and warm attempts before database deletion.
 - [ ] 16. Drain pool resources and background work during shutdown.
 - [ ] 17. Add bounded initial warm-up and background-only startup mode.
 - [ ] 18. Validate integration, isolation, races, failures, and both listener types.
@@ -2214,3 +2223,58 @@ backend that physical cleanup may already have terminated.
 All 116 wire library tests pass against local sockets and Docker PostgreSQL.
 Formatting and whitespace checks pass. Step 14 is complete; step 15 adds the
 drain-before-delete barrier. CLI/server runtime installation remains pending.
+
+### Completed step: 15 — drain before physical deletion
+
+Core's `DatabaseLifecycle` now exposes `drain_database(DatabaseId)`, returning
+an object-safe boxed, sendable future. Its default implementation succeeds
+immediately, preserving behavior for the no-op hook and existing implementations.
+The same lifecycle instance supplied before engine initialization is also
+passed to `DatabaseCleanupWorker`.
+
+Each cleanup job awaits the barrier before invoking `drop_database`. Waiting
+happens in that job, outside the engine message loop and worker receiver loop,
+so other leases, creation jobs, and cleanup jobs continue. A drain error is
+reported through `CleanupFinished` without issuing DDL; core retains its
+retirement record. Shutdown can cancel a pending wait without deleting the
+database or reporting successful cleanup.
+
+`ConnectionWarmPool` implements the lifecycle trait directly. Ready callbacks
+register the physical identity, retirement callbacks disable further admission
+and cancel attempts, and the async barrier idempotently enforces retirement
+before waiting. A poisoned state lock returns `DatabaseDrainFailed` rather than
+confirming a drain. Unregistered identities have no pool-owned resources and
+complete immediately.
+
+Each registered database owns a `TaskTracker`. Reservations acquire tokens under
+the state lock; running attempts retain an additional token until their nested
+connection future and concurrency permit have been dropped. Published idle
+sessions carry their own tokens. The idle wrapper declares the session before
+the token so socket disposal completes before the token is released. This also
+covers sockets removed by health eviction or retirement but not yet disposed
+outside the mutex. Rejected late publication closes its socket before releasing
+the reservation's tracking.
+
+Retirement closes the tracker under the admission lock. Draining then waits for
+that closed tracker to become empty without holding the lock or competing for
+the scheduler's notification. Multiple waiters are supported; cancelling one
+wait does not reopen the database or cancel other waits. A successful checkout
+ends warm ownership and releases its token outside the lock. Handed-off sessions
+remain governed by lease cancellation and the relay, not the warm drain.
+
+Retired entries remain as identity tombstones after draining. They retain no
+warm sockets or attempts and prevent a duplicate ready callback from reopening
+the same physical identity.
+
+Six new regressions cover worker drain gating, drain failure skipping DDL,
+shutdown during a wait, late publication, client handoff, the disposal window
+after inventory removal, and poisoned state. The PostgreSQL integration scenario
+installs the real pool hook before startup, warms a real backend, and holds both
+a running and queued attempt during lease release. It verifies that the idle
+backend closes while deletion waits, another lease can attach and be deleted,
+and the original database is deleted only after both held attempts settle.
+
+Validation: all 75 core and 120 wire library tests pass, including local socket
+and Docker PostgreSQL coverage. Formatting and whitespace checks pass. Step 15
+is complete. Step 16 adds full pool/background-work shutdown, including unused
+ready databases; CLI/server runtime installation remains pending.

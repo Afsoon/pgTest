@@ -7,6 +7,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     worker_engine::{
         database_jobs::{CleanupDatabase, DatabaseWorkerMessages},
+        lifecycle::DatabaseLifecycle,
         messages::EngineMessage,
         traits::PostgresClient,
     },
@@ -19,6 +20,7 @@ pub(super) struct DatabaseCleanupWorker<P = PostgresManager> {
     tracker: TaskTracker,
     shutdown: CancellationToken,
     postgres_manager: Arc<P>,
+    lifecycle: Arc<dyn DatabaseLifecycle>,
 }
 
 impl<P: PostgresClient + Send + Sync + 'static> DatabaseCleanupWorker<P> {
@@ -28,8 +30,9 @@ impl<P: PostgresClient + Send + Sync + 'static> DatabaseCleanupWorker<P> {
         cancel_token: CancellationToken,
         postgres_manager: Arc<P>,
         inbox_rx: UnboundedReceiver<CleanupDatabase>,
+        lifecycle: Arc<dyn DatabaseLifecycle>,
     ) -> Self {
-        Self { engine_tx, tracker, shutdown: cancel_token, postgres_manager, inbox_rx }
+        Self { engine_tx, tracker, shutdown: cancel_token, postgres_manager, inbox_rx, lifecycle }
     }
 
     pub(super) async fn run(mut self) {
@@ -50,6 +53,7 @@ impl<P: PostgresClient + Send + Sync + 'static> DatabaseCleanupWorker<P> {
             let postgres_manager = self.postgres_manager.clone();
             let engine_tx = self.engine_tx.clone();
             let shutdown = self.shutdown.clone();
+            let lifecycle = self.lifecycle.clone();
 
             self.tracker.spawn(async move {
                 let CleanupDatabase { database_id, database_name } = request;
@@ -59,7 +63,10 @@ impl<P: PostgresClient + Send + Sync + 'static> DatabaseCleanupWorker<P> {
 
                     _ = shutdown.cancelled() => return,
 
-                    result = postgres_manager.drop_database(&database_name) => result,
+                    result = async {
+                        lifecycle.drain_database(database_id).await?;
+                        postgres_manager.drop_database(&database_name).await
+                    } => result,
                 };
 
                 let message =

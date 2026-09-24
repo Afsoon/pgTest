@@ -50,6 +50,8 @@ pub enum ConsumerIOError {
 
 #[derive(Error, Debug)]
 pub enum PostgresDDLClientError {
+    #[error("unable to drain database before deletion: {0}")]
+    DatabaseDrainFailed(String),
     #[error("an unexpected error happened trying to {0}")]
     NonRecoverableError(String),
     #[error("unable to {operation} after {retries}")]

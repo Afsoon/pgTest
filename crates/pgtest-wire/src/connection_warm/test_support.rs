@@ -71,7 +71,7 @@ pub(super) fn snapshot(pool: &ConnectionWarmPool) -> PoolSnapshot {
                         bursts: entry
                             .idle
                             .iter()
-                            .map(|session| session.session_burst.bytes().to_vec())
+                            .map(|idle| idle.session.session_burst.bytes().to_vec())
                             .collect(),
                     },
                 )
