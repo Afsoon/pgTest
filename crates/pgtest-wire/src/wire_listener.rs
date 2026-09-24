@@ -5,9 +5,12 @@ use thiserror::Error;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{ClientStream, handle_connection};
 #[cfg(unix)]
 pub use crate::unix_listener::UnixWireListener;
+use crate::{
+    connection::{ClientStream, handle_connection},
+    connection_warm::ConnectionWarmPool,
+};
 pub use crate::{
     connection::{ConnectionFieldError, parse_connection_field},
     postgres_upstream::RawBytes,
@@ -69,6 +72,14 @@ pub async fn run_with_handle(
     manager: Arc<WorkerEngineManager>,
     address: SocketAddr,
 ) -> Result<TcpWireListener, WireError> {
+    run_with_pool(manager, address, None).await
+}
+
+pub(crate) async fn run_with_pool(
+    manager: Arc<WorkerEngineManager>,
+    address: SocketAddr,
+    pool: Option<Arc<ConnectionWarmPool>>,
+) -> Result<TcpWireListener, WireError> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let local_address = listener.local_addr()?;
 
@@ -91,7 +102,7 @@ pub async fn run_with_handle(
                         }
                     };
 
-                    pg_connection_sessions.spawn(handle_connection(ClientStream::Tcp(stream), manager.clone(), None));
+                    pg_connection_sessions.spawn(handle_connection(ClientStream::Tcp(stream), manager.clone(), pool.clone()));
                 }
                 Some(_finished) = pg_connection_sessions.join_next(), if !pg_connection_sessions.is_empty() => {}
             }
@@ -119,6 +130,16 @@ pub async fn run_unix_on_port(
     directory: &std::path::Path,
     port: u16,
 ) -> Result<UnixWireListener, WireError> {
+    run_unix_with_pool(manager, directory, port, None).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn run_unix_with_pool(
+    manager: Arc<WorkerEngineManager>,
+    directory: &std::path::Path,
+    port: u16,
+    pool: Option<Arc<ConnectionWarmPool>>,
+) -> Result<UnixWireListener, WireError> {
     let listener = crate::unix_listener::BoundUnixListener::bind(directory, port)?;
     let path = listener.path().to_owned();
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
@@ -132,7 +153,7 @@ pub async fn run_unix_on_port(
                 accepted = listener.accept() => {
                     match accepted {
                         Ok(stream) => {
-                            sessions.spawn(handle_connection(ClientStream::Unix(stream), manager.clone(), None));
+                            sessions.spawn(handle_connection(ClientStream::Unix(stream), manager.clone(), pool.clone()));
                         }
                         Err(error) => tracing::warn!(%error, "failed to accept Unix connection"),
                     }

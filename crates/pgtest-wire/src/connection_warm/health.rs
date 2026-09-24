@@ -36,7 +36,7 @@ impl ConnectionWarmPool {
                 state.capacity_used = remaining_capacity;
                 drop(state);
                 drop(session);
-                self.changed.notify_one();
+                self.notify_changed();
                 return Poll::Ready(Ok(()));
             }
         }

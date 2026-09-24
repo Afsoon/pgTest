@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WarmShutdownError {
+pub enum WarmShutdownError {
     #[error("cannot confirm warm pool shutdown: state lock poisoned")]
     StatePoisoned,
 }
@@ -23,7 +23,7 @@ impl ConnectionWarmPool {
         Ok(())
     }
 
-    fn begin_shutdown(&self) -> Result<Vec<TaskTracker>, WarmShutdownError> {
+    pub(super) fn begin_shutdown(&self) -> Result<Vec<TaskTracker>, WarmShutdownError> {
         // Also cancel on the poisoned-state path. Admission checks this token
         // under the same mutex used for the snapshot below.
         self.cancellation.cancel();
@@ -56,7 +56,7 @@ impl ConnectionWarmPool {
         // Socket tokens remain live until these sockets actually close. Other
         // shutdown/drain callers cannot mistake inventory removal for disposal.
         drop(idle);
-        self.changed.notify_one();
+        self.notify_changed();
         Ok(drains)
     }
 }

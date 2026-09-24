@@ -82,12 +82,21 @@ For example, append `--pool-initial-size 32 --creation-pool-connection 8
 --log-filter debug` to a `serve` command. Zero growth batch size disables growth.
 Pool connection counts and maximum lease records must be greater than zero.
 
-Connection warming currently parses and validates configuration only; opening
-spare connections awaits pool integration. Warm capacity and concurrency must
-be positive even when warming is disabled. A zero startup wait selects
-background-only warming. Startup parameters must be a JSON object with string
-values, such as `--connection-warm-params '{"application_name":"vitest"}'`;
-`database` and `replication` keys are rejected.
+Set `--connection-warm-count 1` to prepare fresh, single-use upstream sessions.
+TCP and Unix listeners share the pool. Startup waits for the initial target,
+limited by the global cap, or the configured deadline. On timeout, it logs
+incomplete warm-up and serves clients with cold fallback while warming continues.
+`--connection-warm-startup-wait-ms 0` selects background-only warming. Runtime
+database creation always warms in the background.
+
+Warm capacity and concurrency must be positive even when warming is disabled.
+Startup parameters must exactly match the client's forwarded parameters. For
+example, a client sending UTF8 encoding and the application name `vitest` needs
+`--connection-warm-params '{"client_encoding":"UTF8","application_name":"vitest"}'`.
+The JSON accepts only string values; `database` and `replication` keys are rejected.
+A missing `user` uses `--pg-user`; other missing or extra parameters cause cold
+fallback. Warm connections consume additional PostgreSQL backend slots alongside
+management pools and client sessions, and are drained during shutdown.
 
 Profiling is off by default. Build with `--features hotpath` to enable it;
 `hotpath-alloc` and `hotpath-prometheus` are also available alongside `hotpath`.

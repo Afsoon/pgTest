@@ -142,11 +142,21 @@ mod unix {
         (address, logs)
     }
 
-    async fn lifecycle(tcp: bool, unix: bool, signal: &str) {
+    async fn lifecycle(tcp: bool, unix: bool, signal: &str, warm: bool) {
         let upstream = pg_container_config().await;
         // Short paths also fit macOS sockaddr_un's smaller path limit.
         let directory = tempfile::Builder::new().prefix("pgcli-").tempdir_in("/tmp").unwrap();
         let mut command = server_command(&upstream);
+        if warm {
+            command.args([
+                "--connection-warm-count",
+                "1",
+                "--connection-warm-max-total",
+                "2",
+                "--connection-warm-params",
+                r#"{"client_encoding":"UTF8","application_name":"cli-warm"}"#,
+            ]);
+        }
         if tcp {
             command.args(["--listen-addr", "127.0.0.1", "--listen-port", "0"]);
         }
@@ -158,20 +168,52 @@ mod unix {
         }
         let mut child = command.spawn().unwrap();
         let (address, logs) = ready(&mut child, tcp, unix).await;
+        let initial_pids: Vec<i32> = if warm {
+            let (admin, task) = connect(
+                Config::new()
+                    .host(&upstream.pgtest_pg_host)
+                    .port(upstream.pgtest_pg_port)
+                    .user("postgres")
+                    .dbname("postgres"),
+            )
+            .await;
+            let pids = admin
+                .query("SELECT pid FROM pg_stat_activity WHERE application_name = 'cli-warm'", &[])
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect::<Vec<i32>>();
+            assert_eq!(pids.len(), 2, "CLI must warm before announcing listeners");
+            drop(admin);
+            task.await.unwrap().unwrap();
+            pids
+        } else {
+            Vec::new()
+        };
         let socket = directory.path().join(".s.PGSQL.7432");
         assert_eq!(socket.exists(), unix);
         let mut frontend = Config::new();
         frontend.user("postgres").dbname(&format!("{}/lease-1", upstream.pgtest_pg_database));
+        if warm {
+            frontend.application_name("cli-warm");
+        }
         if let Some(address) = address {
             frontend.host("127.0.0.1").port(address.port());
         } else {
             frontend.host_path(directory.path()).port(7432);
         }
         let (application, application_task) = connect(&frontend).await;
-        let row = application.query_one("SELECT current_database(), 42::int4", &[]).await.unwrap();
+        let row = application
+            .query_one("SELECT current_database(), 42::int4, pg_backend_pid()", &[])
+            .await
+            .unwrap();
         let database: String = row.get(0);
         assert!(database.starts_with(&format!("{}_", upstream.pgtest_pg_database)));
         assert_eq!(row.get::<_, i32>(1), 42);
+        if warm {
+            assert!(initial_pids.contains(&row.get::<_, i32>(2)));
+        }
         if tcp && unix {
             let mut unix_frontend = Config::new();
             unix_frontend
@@ -179,6 +221,9 @@ mod unix {
                 .port(7432)
                 .user("postgres")
                 .dbname(&format!("{}/lease-1", upstream.pgtest_pg_database));
+            if warm {
+                unix_frontend.application_name("cli-warm");
+            }
             let (second, task) = connect(&unix_frontend).await;
             assert_eq!(
                 second
@@ -272,17 +317,17 @@ mod unix {
 
     #[tokio::test]
     async fn tcp_only_serves_and_shuts_down_on_sigterm() {
-        timeout(Duration::from_secs(45), lifecycle(true, false, "-TERM")).await.unwrap();
+        timeout(Duration::from_secs(45), lifecycle(true, false, "-TERM", false)).await.unwrap();
     }
 
     #[tokio::test]
     async fn unix_only_serves_and_removes_socket_on_sigint() {
-        timeout(Duration::from_secs(45), lifecycle(false, true, "-INT")).await.unwrap();
+        timeout(Duration::from_secs(45), lifecycle(false, true, "-INT", false)).await.unwrap();
     }
 
     #[tokio::test]
     async fn combined_listeners_share_leases_and_shut_down_together() {
-        timeout(Duration::from_secs(45), lifecycle(true, true, "-TERM")).await.unwrap();
+        timeout(Duration::from_secs(45), lifecycle(true, true, "-TERM", true)).await.unwrap();
     }
 
     #[tokio::test]
@@ -293,6 +338,7 @@ mod unix {
             let socket = directory.path().join(".s.PGSQL.6432");
             std::fs::write(&socket, "keep").unwrap();
             let output = server_command(&upstream)
+                .args(["--connection-warm-count", "1"])
                 .args(["--listen-addr", "127.0.0.1", "--listen-port", "0", "--unix-socket-dir"])
                 .arg(directory.path())
                 .output()

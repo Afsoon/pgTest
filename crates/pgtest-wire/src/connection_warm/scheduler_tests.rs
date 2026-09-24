@@ -389,3 +389,59 @@ async fn pool_shutdown_cancels_retry_deadlines_and_closes_idle_inventory() {
     tokio::time::resume();
     assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
 }
+
+#[tokio::test]
+async fn initial_deadline_counts_ready_sockets_and_leaves_pending_work_running() {
+    let mut pool = pool(1, 2, 2);
+    Arc::get_mut(&mut pool).unwrap().config.startup_wait = Duration::from_millis(250);
+    register(&pool, [1, 2]);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut scheduler = scheduler(&pool, &listener);
+    let (_, mut first) = drive(&mut scheduler, accept_startup(&listener)).await;
+    let (_, mut second) = drive(&mut scheduler, accept_startup(&listener)).await;
+    reply(&mut first, true).await;
+    drive(&mut scheduler, until(|| idle_count(&pool) == 1)).await;
+    tokio::time::pause();
+    let mut startup = Box::pin(pool.wait_initial());
+    assert!(futures::poll!(startup.as_mut()).is_pending(), "in-flight is not ready inventory");
+    tokio::time::advance(Duration::from_millis(250)).await;
+    assert_eq!(startup.await, WarmStartupOutcome::TimedOut { ready: 1, target: 2 });
+    tokio::time::resume();
+    assert!(!pool.cancellation.is_cancelled());
+    reply(&mut second, true).await;
+    drive(&mut scheduler, until(|| idle_count(&pool) == 2)).await;
+    assert_eq!(pool.wait_initial().await, WarmStartupOutcome::Ready { connections: 2 });
+    let (scheduler_result, shutdown) = tokio::join!(scheduler.as_mut(), pool.shutdown());
+    scheduler_result.unwrap();
+    shutdown.unwrap();
+    closed(first).await;
+    closed(second).await;
+}
+
+#[tokio::test]
+async fn initial_waiters_wake_on_publication_without_waiting_for_later_databases() {
+    let mut pool = pool(1, 2, 1);
+    Arc::get_mut(&mut pool).unwrap().config.startup_wait = Duration::from_secs(5);
+    register(&pool, [1]);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut scheduler = scheduler(&pool, &listener);
+    let mut first_wait = Box::pin(pool.wait_initial());
+    let mut second_wait = Box::pin(pool.wait_initial());
+    assert!(futures::poll!(first_wait.as_mut()).is_pending());
+    assert!(futures::poll!(second_wait.as_mut()).is_pending());
+    register(&pool, [2]);
+    let (_, mut first) = drive(&mut scheduler, accept_startup(&listener)).await;
+    reply(&mut first, true).await;
+    let outcomes = drive(&mut scheduler, async { tokio::join!(first_wait, second_wait) }).await;
+    assert_eq!(
+        outcomes,
+        (
+            WarmStartupOutcome::Ready { connections: 1 },
+            WarmStartupOutcome::Ready { connections: 1 }
+        )
+    );
+    let (scheduler_result, shutdown) = tokio::join!(scheduler.as_mut(), pool.shutdown());
+    scheduler_result.unwrap();
+    shutdown.unwrap();
+    closed(first).await;
+}

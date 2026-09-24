@@ -352,15 +352,25 @@ A single default in the table applies to both executables. For the CLI,
 `--listen-port` requires `--listen-addr`, and `--unix-socket-port` requires
 `--unix-socket-dir`.
 
-Connection warming currently has configuration parsing and validation only; pool
-integration is pending, so these settings do not yet open spare connections.
+Connection warming is optional and disabled by default. A positive count prepares
+fresh, single-use PostgreSQL sessions in one pool shared by TCP and Unix listeners.
+Listeners start when the initial target is ready (limited by the global cap) or
+the startup wait expires. Incomplete warm-up is logged; clients can connect cold
+while warming continues. A zero startup wait starts listeners without waiting
+for warm connections. Databases created later warm in the background.
+
 Warm capacity and concurrency must be positive, even when the count is zero.
-The startup profile accepts, for example,
-`--connection-warm-params '{"application_name":"vitest"}'` or
-`PGTEST_CONNECTION_WARM_PARAMS='{"application_name":"vitest"}'`.
+The startup profile must exactly match the client's forwarded parameters to use
+a spare. For example, a client sending `client_encoding=UTF8` and
+`application_name=vitest` needs
+`--connection-warm-params '{"client_encoding":"UTF8","application_name":"vitest"}'`
+or the same JSON in `PGTEST_CONNECTION_WARM_PARAMS`. Extra or missing parameters
+use cold fallback.
 The `database` and `replication` keys are rejected. An explicit `user` is preserved;
-a missing user will be resolved from the configured PostgreSQL user when the pool
-is integrated. See the [implementation plan](docs/connection-warming.md).
+a missing user resolves from the configured PostgreSQL user. Warm idle connections
+and in-flight attempts consume backend slots in addition to management pools and
+active client sessions. Shutdown drains warm resources, including unused ready
+databases. See the [implementation plan](docs/connection-warming.md).
 
 Unix sockets are supported on Linux and macOS. The frontend socket is created at
 `<directory>/.s.PGSQL.<port>`; its port is independent of both TCP ports and must

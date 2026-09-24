@@ -20,9 +20,13 @@ use crate::postgres_upstream::{self, UpstreamSession};
 mod attempt;
 mod health;
 mod lifecycle;
+mod runtime;
 mod shutdown;
+mod startup;
 pub(crate) use attempt::WarmAttemptError;
-pub(crate) use shutdown::WarmShutdownError;
+pub use runtime::ConnectionWarmer;
+pub use shutdown::WarmShutdownError;
+pub use startup::WarmStartupOutcome;
 mod scheduler;
 
 /// Configuration for preparing fresh, single-use upstream connections.
@@ -153,6 +157,7 @@ pub(crate) struct ConnectionWarmPool {
     attempt_permits: Semaphore,
     cancellation: CancellationToken,
     changed: Notify,
+    startup_changed: Notify,
     scheduler_running: AtomicBool,
     scheduler_drain: TaskTracker,
 }
@@ -186,6 +191,12 @@ fn warm_retry_strategy() -> ExponentialFactorBackoff {
 }
 
 impl ConnectionWarmPool {
+    fn notify_changed(&self) {
+        self.changed.notify_one();
+        // Startup observers must not consume the scheduler's wakeup permit.
+        self.startup_changed.notify_waiters();
+    }
+
     pub(crate) fn new(config: ConnectionWarmConfig, default_user: &str) -> Self {
         let profile = config.resolve_profile(default_user);
         // Attempts cannot exceed reserved capacity. Capping at Tokio's limit
@@ -198,6 +209,7 @@ impl ConnectionWarmPool {
             attempt_permits,
             cancellation: CancellationToken::new(),
             changed: Notify::new(),
+            startup_changed: Notify::new(),
             scheduler_running: AtomicBool::new(false),
             scheduler_drain: TaskTracker::new(),
         }
@@ -236,7 +248,7 @@ impl ConnectionWarmPool {
         };
         drop(state_lock);
         if registered {
-            self.changed.notify_one();
+            self.notify_changed();
         }
         registered
     }
@@ -273,7 +285,7 @@ impl ConnectionWarmPool {
         drop(state);
         cancellation.cancel();
         drop(idle);
-        self.changed.notify_one();
+        self.notify_changed();
         true
     }
 
@@ -406,7 +418,7 @@ impl ConnectionWarmPool {
                 entry.idle.pop_front().expect("expected to obtain a session ready");
             state_lock.capacity_used = remaining_capacity;
             drop(state_lock);
-            self.changed.notify_one();
+            self.notify_changed();
 
             // The session is exclusively owned now. Close rejected sockets
             // outside the state lock and try the next spare without
@@ -508,7 +520,7 @@ impl WarmReservation {
         let delay = entry.retry_strategy.next().expect("exponential backoff is unbounded");
         entry.retry_at = Some(Instant::now() + delay);
         drop(state);
-        self.pool.changed.notify_one();
+        self.pool.notify_changed();
     }
 
     pub(crate) fn publish(mut self, session: UpstreamSession) -> bool {
@@ -547,7 +559,7 @@ impl WarmReservation {
         entry.retry_strategy = warm_retry_strategy();
         self.active = false;
         drop(state_lock);
-        self.pool.changed.notify_one();
+        self.pool.notify_changed();
 
         true
     }
@@ -576,7 +588,7 @@ impl Drop for WarmReservation {
         entry.in_flight = in_flight;
         state_lock.capacity_used = capacity_used;
         drop(state_lock);
-        self.pool.changed.notify_one();
+        self.pool.notify_changed();
     }
 }
 

@@ -13,7 +13,8 @@ Idle health monitoring and checkout probes discard unhealthy spares. Cleanup
 now waits for warm resources to drain before physical database deletion. Pool-wide
 shutdown cancels admission and drains warm resources and scheduler ownership,
 including databases that never received a lease.
-CLI/server runtime warming is not wired yet.
+CLI/server startup now installs the shared pool, waits for bounded initial warm-up
+or starts in background-only mode, and drains warming during shutdown.
 
 ## Working agreement
 
@@ -81,6 +82,11 @@ The user then delegated step 16. The assistant implemented pool-wide shutdown,
 scheduler lifetime tracking, and connected shutdown regressions. CLI/server
 runtime installation remains part of the later startup integration.
 
+The user subsequently delegated step 17. The assistant implemented initial warm-up,
+an owned runtime wrapper, CLI/server and shared-listener installation, and connected
+startup regressions. The broader step 18 validation and step 19 performance
+comparison remain separate work.
+
 For step 8 onward, the user prefers integration coverage over isolated unit
 tests. Split the implementation into small parts and defer new lifecycle tests
 until the structure supports testing the connected behavior. Maintain existing
@@ -124,13 +130,15 @@ with uninstrumented timing runs.
   database creation and before retirement cleanup submission.
 - Each cleanup worker job awaits that same hook's drain barrier before issuing
   PostgreSQL deletion. The warm pool implements registration, retirement, and
-  draining; CLI/server startup still uses the default no-op hook.
+  draining. CLI/server startup installs it before initial creation when enabled,
+  and uses the no-op hook when disabled.
 - `LeaseSession` carries the physical `DatabaseId`, database name, and lease
   cancellation token.
 - `WarmReservation::establish` connects using the registered name and resolved
   profile under the pool's semaphore, then publishes the completed session.
-  The scheduler drives these attempts, but runtime startup and lifecycle
-  callbacks do not install or run it yet.
+  `ConnectionWarmer` owns the scheduler and shares the pool with both listener
+  types. Startup waits only for the configured initial budget, and later
+  lifecycle notifications wake background replenishment.
 
 ## Agreed behavior
 
@@ -252,7 +260,7 @@ assistant to write the implementation. Add focused tests alongside each behavior
 - [x] 14. Monitor unused-socket health and replace dead spares.
 - [x] 15. Drain unused sockets and warm attempts before database deletion.
 - [x] 16. Drain pool resources and background work during shutdown.
-- [ ] 17. Add bounded initial warm-up and background-only startup mode.
+- [x] 17. Add bounded initial warm-up and background-only startup mode.
 - [ ] 18. Validate integration, isolation, races, failures, and both listener types.
 - [ ] 19. Compare disabled, bounded-wait, and background-only performance.
 
@@ -2325,3 +2333,60 @@ Validation: all 126 wire library tests pass, including local socket and Docker
 PostgreSQL coverage. Formatting and whitespace checks pass. Step 16 is complete.
 Step 17 adds bounded initial warm-up and background-only startup; CLI/server
 runtime installation remains pending.
+
+### Completed step: 17 — bounded initial warm-up and runtime installation
+
+`ConnectionWarmer` owns the optional pool and its scheduler task. Both the CLI and
+environment-configured server construct it from validated settings, resolve the
+default PostgreSQL user, and install its lifecycle hook before manager
+initialization. Once initial databases exist, `start()` launches replenishment
+and waits according to the startup policy. Disabled warming allocates neither a
+pool nor a scheduler task and installs the no-op lifecycle hook.
+
+For a positive startup wait, the pool snapshots the initial database identities
+and targets `min(initial_database_count * per_database_target, max_total)` ready
+sockets, with saturating multiplication. Only published idle sessions count;
+reservations and connections still in startup do not. An empty initial population
+completes immediately. Later database registrations do not extend this target.
+The wait has one deadline for the whole initial population, independent of the
+five-second per-attempt timeout. A deadline returns the current ready/target
+counts, logs incomplete warm-up, and permits listening with cold fallback.
+Pending attempts and retries continue in the background.
+
+A zero startup wait returns `BackgroundOnly` immediately after launching the
+scheduler. It does not wait for an attempt or idle session. Successful bounded
+startup returns `Ready`; disabled mode, deadline expiry, and stopped warming have
+distinct outcomes. Warm-up failure does not become an engine creation error.
+An independent broadcast notification wakes startup observers without consuming
+the scheduler's notification. Observers register before checking inventory to
+avoid missing a concurrent publication.
+
+The runtime exposes owned TCP and Unix listener methods that pass the same pool
+to client handlers. Existing standalone listener functions retain their cold
+behavior. Both applications wait for the startup outcome before opening their
+listeners. Runtime database creation uses lifecycle notifications and background
+replenishment without waiting for warm-up.
+
+Normal application shutdown and listener-bind failures stop owned listeners,
+drain the warmer, and then shut down the manager. The environment-configured
+server now owns its TCP listener as well as its Unix listener. Interrupting
+warm-up in the CLI or server uses the same cleanup path. Dropping the warmer
+also closes admission, retires idle inventory, and aborts its owned scheduler;
+explicit `shutdown()` waits for resource disposal. No scheduler task is detached
+on cancellation of the initial wait.
+
+Seven new regressions cover the global startup cap, shared TCP/Unix warm backend
+handoff, background-only progress, deadline expiry with cold fallback, empty
+initial populations followed by runtime creation, disabled allocation, interrupted
+startup, partial readiness with attempts continuing after timeout, and concurrent
+startup observers. The CLI subprocess suite additionally verifies that warm
+backends exist before listener readiness is announced, a client receives an
+initial backend, signals close sessions/listeners, and a Unix bind failure cleans
+up an already-running TCP listener with warming enabled.
+
+Validation: 133 wire library tests, 11 CLI and 10 server configuration tests, and
+7 CLI subprocess tests pass (161 total), including Docker PostgreSQL and local
+TCP/Unix sockets. Formatting and whitespace checks pass. The READMEs now describe
+enabled warming, exact startup-profile matching, startup modes, and additional
+backend-slot usage. Step 18 remains the broader integration/race validation;
+performance comparison with the external Vitest suite remains step 19.
