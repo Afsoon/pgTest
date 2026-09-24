@@ -23,6 +23,12 @@ pgtest-core = { version = "=0.1.0", path = "../../crates/pgtest-core" }
 pgtest-wire = { version = "=0.1.0", path = "../../crates/pgtest-wire" }
 pgtest-database-operations = { version = "=0.1.0", path = "../../crates/pgtest-database-operations" }
 
+[dev-dependencies]
+pgtest-database-operations = { version = "=0.1.0", path = "../../crates/pgtest-database-operations", features = ["test-support"] }
+tokio = { workspace = true, features = ["process"] }
+tokio-postgres = "0.7.18"
+tempfile = "3"
+
 [features]
 default = []
 hotpath = ["hotpath/hotpath", "pgtest-core/hotpath", "pgtest-wire/hotpath"]

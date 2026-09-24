@@ -15,6 +15,8 @@ shutdown cancels admission and drains warm resources and scheduler ownership,
 including databases that never received a lease.
 CLI/server startup now installs the shared pool, waits for bounded initial warm-up
 or starts in background-only mode, and drains warming during shutdown.
+Integration validation is complete on macOS arm64 with Docker PostgreSQL 18;
+the external Vitest performance comparison remains step 19.
 
 ## Working agreement
 
@@ -86,6 +88,11 @@ The user subsequently delegated step 17. The assistant implemented initial warm-
 an owned runtime wrapper, CLI/server and shared-listener installation, and connected
 startup regressions. The broader step 18 validation and step 19 performance
 comparison remain separate work.
+
+The user then delegated step 18. The assistant added runtime race/isolation and
+environment-server subprocess coverage and ran the full correctness/build checks.
+This step required no production behavior changes. Performance measurements
+remain outside this step.
 
 For step 8 onward, the user prefers integration coverage over isolated unit
 tests. Split the implementation into small parts and defer new lifecycle tests
@@ -261,7 +268,7 @@ assistant to write the implementation. Add focused tests alongside each behavior
 - [x] 15. Drain unused sockets and warm attempts before database deletion.
 - [x] 16. Drain pool resources and background work during shutdown.
 - [x] 17. Add bounded initial warm-up and background-only startup mode.
-- [ ] 18. Validate integration, isolation, races, failures, and both listener types.
+- [x] 18. Validate integration, isolation, races, failures, and both listener types.
 - [ ] 19. Compare disabled, bounded-wait, and background-only performance.
 
 ## Completed step: 1a (reference)
@@ -2390,3 +2397,72 @@ TCP/Unix sockets. Formatting and whitespace checks pass. The READMEs now describ
 enabled warming, exact startup-profile matching, startup modes, and additional
 backend-slot usage. Step 18 remains the broader integration/race validation;
 performance comparison with the external Vitest suite remains step 19.
+
+### Completed step: 18 — integration, isolation, and race validation
+
+Four new runtime integration tests use the real lifecycle hook, scheduler,
+PostgreSQL manager, and owned TCP/Unix listeners together. The concurrent cases
+run on a four-thread Tokio runtime and release clients through a shared barrier.
+
+- A twelve-client burst across two leases and both listener types consumes all
+  four initial spares, gives every client a distinct backend, keeps each lease
+  on its own database, and verifies table isolation. Pool accounting remains
+  within the global, per-database, and scheduler concurrency limits at observed
+  checkpoints; the existing scheduler tests exercise the limits directly.
+- A used session leaves a temporary table, changed application name, prepared
+  statement, and open transaction. The next connection to the same lease uses
+  a different backend with clean session state and no uncommitted rows.
+- Explicit release races eight connection attempts across both listeners while
+  an existing client is active. Either admission outcome is accepted during
+  the race, but every successful handoff must close, physical deletion must
+  finish, and future requests for the released ID must return `55000`. Another
+  lease remains usable.
+- Lease expiry closes an active client and drains replenished idle spares before
+  database deletion. Reusing the expired lease ID gets a different physical
+  identity and database; dropping the old attachment preserves the new session.
+  Expiry permits ID reuse by existing core design, whereas explicit release
+  permanently closes the ID. The test advances the armed lease timer with
+  Tokio's test clock, then resumes real time for socket and DDL work.
+
+A new environment-server subprocess test runs both bounded-wait and
+background-only startup. It verifies the configured warm profile, shared TCP/Unix
+operation, distinct client backends, and initial backend reuse in bounded mode.
+SIGINT must close active sessions, remove the Unix socket, stop TCP acceptance,
+and leave no warm-profile backends. The server's test dependencies reuse packages
+already in the workspace lockfile.
+
+The complete coverage now spans these layers:
+
+| Behavior | Coverage |
+| --- | --- |
+| Exact database/profile selection, mismatches, control and replication requests | Handler integration and checkout tests |
+| One consumer per backend, clean session state, independent lease data | Concurrent runtime bursts and state-isolation integration |
+| Capacity, fair replenishment, backoff, deadlines, cancellation | Scheduler and connected attempt tests |
+| ErrorResponse, malformed/non-idle readiness, upstream death | Protocol, attempt, idle-health, and cold-fallback tests |
+| Stale completion, retirement during warming/checkout, cleanup barriers | Publication, lifecycle, scheduler, and release-race tests |
+| Lease expiry and physical identity on reuse | Runtime expiry integration and core generation tests |
+| Shutdown, partial startup, listener failure, both listener types | Pool/runtime tests plus CLI and server subprocess suites |
+
+Validation on macOS arm64 using `nightly-2026-09-10` and Docker PostgreSQL 18:
+
+- Workspace tests: 245 passed; doctests: 2 passed and 1 previously ignored.
+- Separate Rust example: build/default tests passed; its normally ignored
+  `users_are_isolated_by_lease` correctness test was explicitly run and passed.
+  The ignored latency benchmark was not run.
+- Workspace and example formatting checks passed, as did whitespace checks.
+- Workspace Clippy with all targets completed successfully, with warnings from
+  the broad pedantic/restriction lint configuration (including test `unwrap`,
+  indexing, naming, and style warnings). This is not a warning-free lint result.
+- Workspace compilation with all targets and all features passed, including
+  timing, allocation, and Prometheus profiling features. This was a compile
+  check, not a profiled test run.
+
+The full workspace command was `cargo test --offline --workspace`; it updated
+only the server package's dependency list for the added test dependencies.
+Subsequent lint, profiling, and example commands used `--locked --offline`.
+The Rust example used the newly built CLI through `PGTEST_BIN`.
+
+No production fix was required. Step 18 is complete; Linux execution and the
+external Vitest suite were not run in this local validation. Step 19 compares
+disabled, bounded-wait, and background-only performance with that external suite.
+Warming remains opt-in; these correctness results establish no latency gain.

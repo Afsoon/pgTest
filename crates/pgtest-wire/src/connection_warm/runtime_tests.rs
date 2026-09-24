@@ -4,6 +4,9 @@ use tokio_postgres::{Client, Config, NoTls};
 
 use super::*;
 
+#[path = "integration_tests.rs"]
+mod integration;
+
 fn config(count: u16, cap: usize, wait: Duration) -> ConnectionWarmConfig {
     ConnectionWarmConfig::try_new(
         count,
