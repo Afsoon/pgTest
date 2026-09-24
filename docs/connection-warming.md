@@ -8,8 +8,9 @@ attempts now establish and publish sessions with shared concurrency limits,
 timeouts, and cancellation. Round-robin reservation selection and per-database
 retry backoff are complete. Retirement eligibility, cancellation ownership,
 and scheduler wakeups are implemented. The bounded asynchronous scheduler is
-complete. Client handling now supports warm checkout and immediate cold
-fallback; runtime warming is not wired yet.
+complete. Client handling supports warm checkout and immediate cold fallback.
+Idle health monitoring and checkout probes discard unhealthy spares; runtime
+warming is not wired yet.
 
 ## Working agreement
 
@@ -64,6 +65,9 @@ integration steps remain outside this request.
 The user subsequently delegated step 13. The assistant integrated optional
 pool checkout into client handling and added PostgreSQL integration tests.
 Enabling the pool in CLI/server startup remains later integration work.
+
+The user then delegated step 14. The assistant added idle socket monitoring,
+nonblocking checkout probes, and connected health/fallback regressions.
 
 For step 8 onward, the user prefers integration coverage over isolated unit
 tests. Split the implementation into small parts and defer new lifecycle tests
@@ -134,8 +138,10 @@ closed afterward. Never transfer it to another database or return it to the pool
 A miss, parameter mismatch, or known unhealthy spare uses the existing cold path
 without waiting for replenishment. Replenish eligible databases in the background.
 Monitor unused sockets for closure/errors, without a health-query round trip on
-checkout. Failures can still race with handoff; never replay queries once client
-traffic has been forwarded.
+checkout. Conservatively discard a spare that sends unsolicited data, including
+notices or partial error frames; no client has used that backend yet. Failures
+can still race with handoff; never replay queries once client traffic has been
+forwarded.
 
 ### Architecture and lifetime
 
@@ -228,7 +234,7 @@ assistant to write the implementation. Add focused tests alongside each behavior
   - [x] 12c. Add retirement eligibility, cancellation ownership, and scheduler wakeups.
   - [x] 12d. Drive attempts with one bounded asynchronous scheduler.
 - [x] 13. Integrate checkout and cold fallback with client connection handling.
-- [ ] 14. Monitor unused-socket health and replace dead spares.
+- [x] 14. Monitor unused-socket health and replace dead spares.
 - [ ] 15. Drain unused sockets and warm attempts before database deletion.
 - [ ] 16. Drain pool resources and background work during shutdown.
 - [ ] 17. Add bounded initial warm-up and background-only startup mode.
@@ -2160,3 +2166,51 @@ Validation: all six connection tests (including the five new integration tests)
 and all five existing TCP/Unix listener tests pass against the Docker PostgreSQL
 harness. Formatting and whitespace checks pass. Step 13 is complete. Step 14
 adds unused-socket health monitoring.
+
+### Completed step: 14 — idle socket health
+
+The existing scheduler now polls idle sockets alongside attempt completions,
+state notifications, retry deadlines, and cancellation. `poll_idle_health`
+registers its waker through a nonblocking one-byte read on each unused socket.
+EOF, an I/O error, or any received byte evicts the spare, releases its capacity
+once, and wakes normal fair replenishment. Pending reads park until readiness;
+there is no periodic timer, health query, or extra task per connection.
+
+The monitor conservatively discards unsolicited data instead of buffering or
+decoding it. This includes benign notices and incomplete error frames. An unused
+session with unexpected activity is replaced without affecting client traffic.
+Connection attempts still use the existing concurrency limits and failure
+backoff; idle eviction itself does not advance startup-failure backoff.
+
+The nonblocking read poll runs under the pool state mutex to serialize it with
+checkout and retirement. This narrowly extends the earlier step 7 guidance:
+the health monitor may probe sockets under the lock, but must never await,
+perform a blocking operation, send a query, or retain a socket reference beyond
+that lock. Removed sockets are closed after unlocking. Once checkout removes a
+session, even a stale monitor wakeup cannot read its client-owned traffic.
+
+Checkout also probes the removed socket without waiting, so it can reject an
+unhealthy spare before the scheduler notices it. It closes rejected sockets
+outside the lock and tries remaining spares, bounded by the per-database target.
+If none are usable, the handler immediately takes its existing cold path.
+Healthy startup bytes and sockets transfer unchanged. Failure after this last
+check remains possible; relay errors never trigger reconnection or query replay.
+
+Four new connected tests verify:
+
+- TCP/Unix checkout skips EOF and partial error data, preserves a healthy spare,
+  releases capacity, and sends no health query.
+- Socket activity alone triggers background replacement for EOF, partial
+  ErrorResponse, and Notice data; retirement prevents another refill.
+- An armed monitor cannot consume traffic from a checked-out socket, and
+  retirement/scheduler cancellation preserve its client ownership.
+- A PostgreSQL backend terminated with `pg_terminate_backend` is rejected by
+  checkout and replaced through the real handler's cold path.
+
+The earlier closed-lease regression now checks that rejected attachment leaves
+the warm slot occupied, without expecting health-aware checkout to return a
+backend that physical cleanup may already have terminated.
+
+All 116 wire library tests pass against local sockets and Docker PostgreSQL.
+Formatting and whitespace checks pass. Step 14 is complete; step 15 adds the
+drain-before-delete barrier. CLI/server runtime installation remains pending.

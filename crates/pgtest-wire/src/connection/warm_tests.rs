@@ -300,7 +300,10 @@ async fn rejected_and_control_connections_do_not_consume_spares() {
         h.manager.release(lease.lease_id.clone()).await.unwrap();
         let error = h.connect(&h.config("one")).await.err().expect("closed lease must be rejected");
         assert_eq!(error.as_db_error().unwrap().code().code(), "55000");
-        assert!(h.pool.try_checkout(lease.database_id, &profile()).is_some());
+        assert!(
+            h.pool.try_reserve(lease.database_id).is_none(),
+            "rejected attach must leave the spare occupying its slot"
+        );
         drop(lease);
         h.shutdown().await;
     })

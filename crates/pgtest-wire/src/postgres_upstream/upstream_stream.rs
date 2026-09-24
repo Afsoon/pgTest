@@ -15,6 +15,21 @@ pub(crate) enum UpstreamStream {
     Unix(tokio::net::UnixStream),
 }
 
+impl UpstreamStream {
+    /// A fresh idle backend should have nothing to read. EOF, errors, and
+    /// unsolicited data all make the spare unsuitable for handoff. Never wait
+    /// or send a health query; readiness can still race with later client use.
+    pub(crate) fn is_idle(&self) -> bool {
+        let mut byte = [0];
+        let result = match self {
+            Self::Tcp(stream) => stream.try_read(&mut byte),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.try_read(&mut byte),
+        };
+        matches!(result, Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+    }
+}
+
 impl AsyncRead for UpstreamStream {
     fn poll_read(
         self: Pin<&mut Self>,

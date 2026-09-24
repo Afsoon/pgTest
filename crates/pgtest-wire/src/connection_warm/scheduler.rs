@@ -1,4 +1,7 @@
-use std::{future::pending, sync::atomic::Ordering};
+use std::{
+    future::{pending, poll_fn},
+    sync::atomic::Ordering,
+};
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 
@@ -81,6 +84,7 @@ impl ConnectionWarmPool {
                 Some((database_id, result)) = attempts.next(), if !attempts.is_empty() => {
                     handle_completion(database_id, result)?;
                 }
+                result = poll_fn(|cx| self.poll_idle_health(cx)) => result?,
                 // notify_one retains a permit when no waiter is registered:
                 // changes between state inspection and this wait are not lost.
                 _ = self.changed.notified() => {}

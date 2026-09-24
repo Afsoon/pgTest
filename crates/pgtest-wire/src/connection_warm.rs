@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::postgres_upstream::{self, UpstreamSession};
 
 mod attempt;
+mod health;
 pub(crate) use attempt::WarmAttemptError;
 mod scheduler;
 
@@ -360,34 +361,44 @@ impl ConnectionWarmPool {
             return None;
         }
 
-        let Ok(mut state_lock) = self.state.lock() else {
-            tracing::error!("lock poisoned during checkout");
-            return None;
-        };
+        for _ in 0..usize::from(self.config.per_database) {
+            let Ok(mut state_lock) = self.state.lock() else {
+                tracing::error!("lock poisoned during checkout");
+                return None;
+            };
 
-        let current_capacity = state_lock.capacity_used;
+            let current_capacity = state_lock.capacity_used;
 
-        if self.cancellation.is_cancelled() {
-            return None;
+            if self.cancellation.is_cancelled() {
+                return None;
+            }
+
+            let Some(entry) = state_lock.databases.get_mut(&database_id) else {
+                return None;
+            };
+
+            if entry.retiring || entry.cancellation.is_cancelled() || entry.idle.is_empty() {
+                return None;
+            }
+
+            let remaining_capacity =
+                current_capacity.checked_sub(1).expect("idle session must occupy capacity");
+
+            let warmed_session =
+                entry.idle.pop_front().expect("expected to obtain a session ready");
+            state_lock.capacity_used = remaining_capacity;
+            drop(state_lock);
+            self.changed.notify_one();
+
+            // The session is exclusively owned now. Close rejected sockets
+            // outside the state lock and try the next spare without
+            // waiting for warm-up.
+            if warmed_session.stream.is_idle() {
+                return Some(warmed_session);
+            }
+            drop(warmed_session);
         }
-
-        let Some(entry) = state_lock.databases.get_mut(&database_id) else {
-            return None;
-        };
-
-        if entry.retiring || entry.cancellation.is_cancelled() || entry.idle.is_empty() {
-            return None;
-        }
-
-        let remaining_capacity =
-            current_capacity.checked_sub(1).expect("idle session must occupy capacity");
-
-        let warmed_session = entry.idle.pop_front().expect("expected to obtain a session ready");
-        state_lock.capacity_used = remaining_capacity;
-        drop(state_lock);
-        self.changed.notify_one();
-
-        Some(warmed_session)
+        None
     }
 }
 
@@ -553,6 +564,9 @@ mod attempt_tests;
 
 #[cfg(test)]
 mod scheduler_tests;
+
+#[cfg(test)]
+mod health_tests;
 
 #[cfg(test)]
 mod checkout_tests;

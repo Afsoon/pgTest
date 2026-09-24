@@ -285,3 +285,75 @@ async fn disabled_or_closed_scheduler_does_not_open_connections() {
     assert_eq!(closed_pool.state.lock().unwrap().capacity_used, 0);
     assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
 }
+
+#[tokio::test]
+async fn scheduler_replaces_closed_or_noisy_idle_sockets_and_stops_at_retirement() {
+    let pool = pool(1, 1, 1);
+    register(&pool, [1]);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut scheduler = scheduler(&pool, &listener);
+    let (_, mut peer) = drive(&mut scheduler, accept_startup(&listener)).await;
+    reply(&mut peer, true).await;
+    drive(&mut scheduler, until(|| idle_count(&pool) == 1)).await;
+
+    for data in [None, Some(b"E\0".as_slice()), Some(b"N\0".as_slice())] {
+        // Arm idle monitoring, then change only the socket: no checkout,
+        // registration, or timer should be required to trigger replenishment.
+        assert!(futures::poll!(scheduler.as_mut()).is_pending());
+        assert!(futures::poll!(Box::pin(peer.read(&mut [0])).as_mut()).is_pending());
+        if let Some(data) = data {
+            peer.write_all(data).await.unwrap();
+        } else {
+            peer.shutdown().await.unwrap();
+        }
+        let (name, mut replacement) = drive(&mut scheduler, accept_startup(&listener)).await;
+        assert_eq!(name, "physical_1");
+        closed(peer).await;
+        assert_eq!(pool.state.lock().unwrap().capacity_used, 1);
+        reply(&mut replacement, true).await;
+        drive(&mut scheduler, until(|| idle_count(&pool) == 1)).await;
+        peer = replacement;
+    }
+
+    assert!(futures::poll!(scheduler.as_mut()).is_pending());
+    peer.shutdown().await.unwrap();
+    pool.retire_database(DatabaseId(1));
+    assert!(futures::poll!(scheduler.as_mut()).is_pending());
+    assert_eq!(pool.state.lock().unwrap().capacity_used, 0);
+    assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
+    closed(peer).await;
+    stop(&pool, &mut scheduler).await;
+}
+
+#[tokio::test]
+async fn armed_monitor_never_consumes_handed_off_traffic_or_closes_client_socket() {
+    let pool = pool(1, 1, 1);
+    register(&pool, [1]);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut scheduler = scheduler(&pool, &listener);
+    let (_, mut peer) = drive(&mut scheduler, accept_startup(&listener)).await;
+    reply(&mut peer, true).await;
+    drive(&mut scheduler, until(|| idle_count(&pool) == 1)).await;
+    assert!(futures::poll!(scheduler.as_mut()).is_pending());
+    let mut client = pool.try_checkout(DatabaseId(1), pool.profile.parameters()).unwrap();
+    peer.write_all(b"backend traffic").await.unwrap();
+    // Force another scheduler iteration after the old idle socket becomes
+    // readable. Its stale wakeup must not grant the monitor access to it.
+    let (_, replacement) = drive(&mut scheduler, accept_startup(&listener)).await;
+    let mut data = [0; 15];
+    drive(&mut scheduler, client.stream.read_exact(&mut data)).await.unwrap();
+    assert_eq!(&data, b"backend traffic");
+    assert_eq!(pool.state.lock().unwrap().capacity_used, 1);
+    pool.retire_database(DatabaseId(1));
+    stop(&pool, &mut scheduler).await;
+    closed(replacement).await;
+    client.stream.write_all(b"still owned").await.unwrap();
+    let mut data = [0; 11];
+    tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut data))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&data, b"still owned");
+    drop(client);
+    closed(peer).await;
+}
