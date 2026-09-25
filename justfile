@@ -43,6 +43,33 @@ docker-build tag="latest":
 docker-build-profile tag="latest":
     docker build --build-arg CARGO_FEATURES=hotpath -t {{quote("pgtest-server-hotpath:" + tag)}} .
 
+# Build three warming modes from the same release binary; pass hotpath for diagnostic images
+docker-build-warm-comparison tag="step19" features="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base={{quote("pgtest-server:" + tag + "-base")}}
+    prefix={{quote("pgtest-server:" + tag)}}
+    docker build --build-arg CARGO_FEATURES={{quote(features)}} -t "$base" .
+    for mode in disabled bounded background; do
+        count=1
+        wait_ms=5000
+        if [ "$mode" = disabled ]; then count=0; fi
+        if [ "$mode" = background ]; then wait_ms=0; fi
+        docker build --build-arg "BASE_IMAGE=$base" \
+            --build-arg "WARM_COUNT=$count" --build-arg "WARM_WAIT_MS=$wait_ms" \
+            -t "$prefix-$mode" - <<'DOCKERFILE'
+    ARG BASE_IMAGE
+    FROM ${BASE_IMAGE}
+    ARG WARM_COUNT
+    ARG WARM_WAIT_MS
+    ENV PGTEST_CONNECTION_WARM_COUNT=${WARM_COUNT} \
+        PGTEST_CONNECTION_WARM_MAX_TOTAL=32 \
+        PGTEST_CONNECTION_WARM_CONCURRENCY=4 \
+        PGTEST_CONNECTION_WARM_STARTUP_WAIT_MS=${WARM_WAIT_MS} \
+        PGTEST_CONNECTION_WARM_PARAMS='{"client_encoding":"UTF8"}'
+    DOCKERFILE
+    done
+
 # Run cargo clean on the workspace members
 clean:
     cargo clean

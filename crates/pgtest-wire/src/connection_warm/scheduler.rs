@@ -68,7 +68,10 @@ impl ConnectionWarmPool {
             if self.attempt_permits.is_closed() {
                 return Err(WarmSchedulerError::ConcurrencyClosed);
             }
-            if self.state.is_poisoned() {
+            // Hotpath's mutex wrapper exposes try_lock rather than is_poisoned.
+            // Contention is harmless here; later state access checks poison
+            // too.
+            if matches!(self.state.try_lock(), Err(std::sync::TryLockError::Poisoned(_))) {
                 return Err(WarmSchedulerError::StatePoisoned);
             }
 

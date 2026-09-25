@@ -247,7 +247,7 @@ async fn poisoned_checkout_misses_without_recovering_or_consuming_state() {
     let before = snapshot(&pool);
     let result = catch_unwind(AssertUnwindSafe(|| pool.try_checkout(DatabaseId(1), &params())));
     assert!(matches!(result, Ok(None)));
-    assert!(pool.state.is_poisoned());
+    assert!(pool.state.lock().is_err());
     assert_eq!(snapshot(&pool), before);
     drop(pool);
     assert_peer_closed(peer).await;
@@ -262,7 +262,7 @@ async fn checkout_detects_capacity_underflow_before_removing_the_session() {
     let before = snapshot(&pool);
     let result = catch_unwind(AssertUnwindSafe(|| pool.try_checkout(DatabaseId(1), &params())));
     assert!(result.is_err(), "an idle session must occupy capacity");
-    assert!(pool.state.is_poisoned(), "validate while the checkout lock is held");
+    assert!(pool.state.lock().is_err(), "validate while the checkout lock is held");
     assert_eq!(snapshot(&pool), before, "underflow must not remove or close the spare");
     drop(result);
     drop(pool);

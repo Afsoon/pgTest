@@ -16,7 +16,8 @@ including databases that never received a lease.
 CLI/server startup now installs the shared pool, waits for bounded initial warm-up
 or starts in background-only mode, and drains warming during shutdown.
 Integration validation is complete on macOS arm64 with Docker PostgreSQL 18;
-the external Vitest performance comparison remains step 19.
+the external Vitest performance comparison remains step 19. Docker comparison
+variants and run instructions are prepared; measurements are pending from the user.
 
 ## Working agreement
 
@@ -93,6 +94,10 @@ The user then delegated step 18. The assistant added runtime race/isolation and
 environment-server subprocess coverage and ran the full correctness/build checks.
 This step required no production behavior changes. Performance measurements
 remain outside this step.
+
+For step 19, the user chose to run the external Vitest suite themselves with
+Docker. The assistant prepares the image variants and result checklist, then
+analyzes the supplied measurements. Do not mark step 19 complete before results.
 
 For step 8 onward, the user prefers integration coverage over isolated unit
 tests. Split the implementation into small parts and defer new lifecycle tests
@@ -2466,3 +2471,189 @@ No production fix was required. Step 18 is complete; Linux execution and the
 external Vitest suite were not run in this local validation. Step 19 compares
 disabled, bounded-wait, and background-only performance with that external suite.
 Warming remains opt-in; these correctness results establish no latency gain.
+
+### Step 19 — user-run Docker comparison (measurements pending)
+
+The user will run the existing external Vitest suite. Its inspected setup is
+`/Users/said/Documents/demo-post-node-integresql`: `pnpm test` selects the server
+image through `PGTEST_IMAGE`, creates a new server container per run, and saves
+shutdown logs under `logs/`. The server reaches TimescaleDB through its shared
+Unix socket volume; Vitest normally reaches the server through TCP. This setup
+uses 32 initial databases and a CREATE connection pool of 60. Keep those settings,
+PostgreSQL options, worker count, per-test connection-pool size, and transport
+identical in every run.
+
+The existing `.withEnvironment(...)` block does not forward warming variables
+from the host process. Merely prefixing `pnpm test` with a
+`PGTEST_CONNECTION_WARM_*` variable would therefore leave the container unchanged.
+The comparison recipe stores the settings in each image's Docker `ENV`; the
+inspected harness does not override those keys. No external repository edits are
+needed.
+
+#### Build once, outside the measured runs
+
+From this repository:
+
+```sh
+just docker-build-warm-comparison step19
+```
+
+This builds one release server without Hotpath, then derives three images from
+that exact base. Their binary and filesystem are identical; only warming settings
+and image metadata differ.
+
+| `PGTEST_IMAGE` | Count per database | Global cap | Attempt concurrency | Initial wait |
+| --- | ---: | ---: | ---: | ---: |
+| `pgtest-server:step19-disabled` | 0 | 32 | 4 | 5000 ms (ignored when disabled) |
+| `pgtest-server:step19-bounded` | 1 | 32 | 4 | 5000 ms maximum |
+| `pgtest-server:step19-background` | 1 | 32 | 4 | 0 ms |
+
+All three set `PGTEST_CONNECTION_WARM_PARAMS={"client_encoding":"UTF8"}`.
+Although `pg`'s `getStartupConf()` supplies only user and database by default,
+the installed `pg-protocol` 1.16.0 serializer adds `client_encoding=UTF8` to the
+actual startup packet. PgTest resolves the warm user from the container's
+`PGTEST_PG_USER=metered`, and filters database out of matching. If URL options or
+environment defaults add application name, timeouts, or options, include their
+exact forwarded string values in the warm profile, consistently for all images.
+
+The original comparison recipe incorrectly used `{}` after inspecting only
+`getStartupConf()`. Both user-supplied modes subsequently reported zero successful
+warm checkouts. The omitted encoding prevents every default `pg` client from
+matching that profile. Those runs measure unused warming overhead, not the
+benefit of successful warm handoffs. Rebuild all comparison images with the
+corrected recipe before repeating the comparison. The serializer was exercised
+locally with explicit fixture parameters to verify the actual wire packet;
+successful handoffs in the external Docker workload still require a rerun.
+
+The Hotpath build now reports the warm pool's state mutex under
+`mutexes` with label `connection-warm-state`, including wait and hold timings.
+Hotpath 0.25.1 has no semaphore wrapper, so the attempt semaphore is measured
+with `measure_block!` and `future!`:
+
+- `connection_warm::attempt_permit_wait`: elapsed acquisition time, including
+  time suspended waiting for a permit (or until cancellation).
+- `connection_warm::attempt_permit_hold`: elapsed time owning the permit,
+  including connection startup and publication, ending on success, error, or
+  cancellation.
+- `connection_warm::attempt_permit_acquire`: future polling statistics. Poll
+  duration alone does not measure semaphore wait time.
+
+Rebuild the comparison images to include this instrumentation. It compiles away
+when Hotpath is disabled. These measurements cover the application's warm pool;
+SQLx's internal synchronization is not wrapped.
+
+The Hotpath `debug` section also contains the gauge
+`connection_warm::successful_checkouts`. Its `last_value` is the cumulative
+number of healthy warm connections handed to clients, across all warm pools in
+the process. Each successful checkout increments it once, after profile and
+socket-health checks; misses and discarded sockets do not increment it. A warm
+pool registers a zero value even if it never has a hit. With warming disabled
+and no pool constructed, the entry is absent. This counts connection handoffs,
+not distinct leases or successfully completed client sessions. Read `last_value`,
+not `log_count` (which also counts zero-value registration updates).
+
+`connection_warm::unused_closed_on_retirement` counts idle warm connections
+closed without ever being handed to a client, during database retirement or
+pool shutdown. Its `last_value` is cumulative across pools and counts sockets,
+not retirement calls; repeated retirement/shutdown does not count them again.
+It excludes failed or cancelled in-flight attempts, rejected late publications,
+and sockets discarded by health checks. Like the checkout counter, it is
+registered at zero when a pool is constructed. Use `last_value`, not `log_count`,
+because one update can account for multiple closed connections.
+
+Upstream startup rejection logs now retain PostgreSQL's SQLSTATE and primary
+message, at both authentication and ReadyForQuery stages. Client fallback
+failures also log the physical database name and ID. The earlier generic
+`upstream rejected the startup request` warning from a non-clean run discarded
+the upstream reason, so it cannot establish the cause of that failure. Preserve
+the richer warning and PostgreSQL logs on the next occurrence; this diagnostics
+change does not claim to fix the reliability issue.
+
+#### Run the same suite in all three modes
+
+From the external suite directory, using its usual supported Node/pnpm setup:
+
+```sh
+PGTEST_IMAGE=pgtest-server:step19-disabled /usr/bin/time -p pnpm test
+PGTEST_IMAGE=pgtest-server:step19-bounded /usr/bin/time -p pnpm test
+PGTEST_IMAGE=pgtest-server:step19-background /usr/bin/time -p pnpm test
+```
+
+Use the suite's managed-container path. An existing `PGTEST_DATABASE_URL` selects
+an external server and bypasses `PGTEST_IMAGE`; that would not test these variants.
+Keep existing Timescale reuse policy and all other environment settings fixed.
+Run one unrecorded pass of each mode to remove first-use effects, then record
+three rounds in this order:
+
+| Round | First | Second | Third |
+| --- | --- | --- | --- |
+| 1 | disabled | bounded | background |
+| 2 | background | disabled | bounded |
+| 3 | bounded | background | disabled |
+
+Run them sequentially. Preserve the raw Vitest summaries and the corresponding
+saved server logs. `/usr/bin/time`'s `real` is the whole command duration, including
+container setup, migrations, PgTest startup, and teardown; label it accordingly.
+Keep Vitest's own duration and phase breakdown separate. Neither is a standalone
+PgTest startup measurement. Record startup duration separately only if an
+existing timer measures that boundary. Image building is excluded.
+
+#### Collect diagnostic profiles separately
+
+Build the same matrix with profiling enabled:
+
+```sh
+just docker-build-warm-comparison step19-hotpath hotpath
+```
+
+Then run one pass per mode from the suite directory:
+
+```sh
+PGTEST_IMAGE=pgtest-server:step19-hotpath-disabled pnpm test
+PGTEST_IMAGE=pgtest-server:step19-hotpath-bounded pnpm test
+PGTEST_IMAGE=pgtest-server:step19-hotpath-background pnpm test
+```
+
+The existing harness already sets `HOTPATH_LIMIT=0` and
+`HOTPATH_OUTPUT_FORMAT=json`, stops the server with SIGINT, and saves shutdown
+output. Send those three reports with the uninstrumented timing results. Keep
+profiled durations in a separate group; they are diagnostic runs, not additional
+samples of uninstrumented performance.
+
+#### Results to send back
+
+For each recorded run, send the mode, pass/fail and test counts, Vitest summary
+(including its phase durations), whole-command `real` time, and saved log filename.
+Also include fixed worker count, `TEST_PG_POOL_MAX`, Timescale reuse setting,
+Docker CPU/memory allocation, architecture, and any deviations from the settings
+above. Retain warnings about incomplete warm-up, upstream failures, or connection
+limits; a failed run is not a valid speedup sample.
+
+| Mode | Round | Tests passed | Vitest duration | Whole command `real` | Startup if measured | Server log |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| disabled | 1–3 | pending | pending | pending | unavailable/pending | pending |
+| bounded | 1–3 | pending | pending | pending | unavailable/pending | pending |
+| background | 1–3 | pending | pending | pending | unavailable/pending | pending |
+
+Include client connection samples/percentiles, warm hits/misses, and backend-count
+samples if the suite already records them. The server's profiled build now emits
+successful warm checkouts as described above; miss counts, client latency samples,
+and backend-count samples are not currently emitted by the inspected helpers.
+Mark them unavailable when absent. Hotpath's upstream-connect totals include both
+warm attempts and cold connections; they cannot establish hit rate, client
+p50/p95/p99, or saved wall time. Relay duration includes session lifetime and is
+not connection latency. Do not pool or average per-run percentiles as though they
+were raw samples.
+
+Compare the median and range across the three runs of each mode, using identical
+duration boundaries. Assess whole-run cost alongside any available client latency
+and backend usage. Use profiles to explain where work moved and whether creation,
+cleanup, or upstream startup got slower; nested/concurrent timings are not
+additive. Keep warming disabled by default until repeated representative results
+justify a different choice.
+
+Preparation validation: Just renders the recipe and its generated Bash passes
+syntax checking. Docker images and suite runs are intentionally left to the user;
+no new measurements or speedup claims have been made. Step 19 stays unchecked
+until the supplied results have been compared and any missing measurements have
+been explicitly recorded as limitations.

@@ -56,6 +56,9 @@ impl ConnectionWarmPool {
         // Socket tokens remain live until these sockets actually close. Other
         // shutdown/drain callers cannot mistake inventory removal for disposal.
         drop(idle);
+        if idle_count > 0 {
+            hotpath::gauge!("connection_warm::unused_closed_on_retirement").inc(idle_count);
+        }
         self.notify_changed();
         Ok(drains)
     }

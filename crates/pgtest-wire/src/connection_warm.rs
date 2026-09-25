@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry},
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
+use hotpath::wrap::std::sync::Mutex;
 use pgtest::worker_engine::database_jobs::DatabaseId;
 use tokio::{
     sync::{Notify, Semaphore},
@@ -198,6 +199,9 @@ impl ConnectionWarmPool {
     }
 
     pub(crate) fn new(config: ConnectionWarmConfig, default_user: &str) -> Self {
+        // Register zero counters without resetting counts from other pools.
+        hotpath::gauge!("connection_warm::successful_checkouts").inc(0);
+        hotpath::gauge!("connection_warm::unused_closed_on_retirement").inc(0);
         let profile = config.resolve_profile(default_user);
         // Attempts cannot exceed reserved capacity. Capping at Tokio's limit
         // also keeps very large, otherwise valid settings from panicking.
@@ -205,7 +209,10 @@ impl ConnectionWarmPool {
         Self {
             config,
             profile,
-            state: Mutex::new(WarmPoolState::default()),
+            state: hotpath::mutex!(
+                std::sync::Mutex::new(WarmPoolState::default()),
+                label = "connection-warm-state"
+            ),
             attempt_permits,
             cancellation: CancellationToken::new(),
             changed: Notify::new(),
@@ -284,7 +291,11 @@ impl ConnectionWarmPool {
         // after draining finishes.
         drop(state);
         cancellation.cancel();
+        let unused_count = idle.len();
         drop(idle);
+        if unused_count > 0 {
+            hotpath::gauge!("connection_warm::unused_closed_on_retirement").inc(unused_count);
+        }
         self.notify_changed();
         true
     }
@@ -426,6 +437,7 @@ impl ConnectionWarmPool {
             if warmed_session.session.stream.is_idle() {
                 // Handoff ends warm ownership; the lease/relay owns the
                 // connection from here. The drain token drops outside the lock.
+                hotpath::gauge!("connection_warm::successful_checkouts").inc(1);
                 return Some(warmed_session.session);
             }
             drop(warmed_session);
@@ -468,38 +480,50 @@ impl WarmReservation {
         // Keep the pool alive independently of self so publication can consume
         // the reservation while the borrowed permit remains held.
         let pool = self.pool.clone();
-        let _permit = tokio::select! {
+        let permit = tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => return Err(WarmAttemptError::Cancelled),
             _ = cancellation.cancelled() => return Err(WarmAttemptError::Cancelled),
-            permit = pool.attempt_permits.acquire() => {
+            permit = async {
+                hotpath::measure_block!("connection_warm::attempt_permit_wait", {
+                    hotpath::future!(
+                        pool.attempt_permits.acquire(),
+                        label = "connection_warm::attempt_permit_acquire"
+                    ).await
+                })
+            } => {
                 permit.map_err(|_| WarmAttemptError::ConcurrencyClosed)?
             }
         };
 
-        let session = tokio::select! {
-            biased;
-            _ = self.cancellation.cancelled() => return Err(WarmAttemptError::Cancelled),
-            result = attempt::connect_warm_session(
-                self.database_name(),
-                &pool.profile,
-                upstream_host,
-                upstream_port,
-                cancellation,
-            ) => result,
-        }
-        .inspect_err(|error| {
-            if matches!(error, WarmAttemptError::TimedOut | WarmAttemptError::Upstream(_)) {
-                self.record_failure();
+        // Keep the permit inside the measured scope so cancellation and errors
+        // end both the hold measurement and permit ownership together.
+        hotpath::measure_block!("connection_warm::attempt_permit_hold", {
+            let _permit = permit;
+            let session = tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err(WarmAttemptError::Cancelled),
+                result = attempt::connect_warm_session(
+                    self.database_name(),
+                    &pool.profile,
+                    upstream_host,
+                    upstream_port,
+                    cancellation,
+                ) => result,
             }
-        })?;
+            .inspect_err(|error| {
+                if matches!(error, WarmAttemptError::TimedOut | WarmAttemptError::Upstream(_)) {
+                    self.record_failure();
+                }
+            })?;
 
-        // Publication also checks retirement under the state lock, covering
-        // cancellation that races with a successful connection attempt.
-        if cancellation.is_cancelled() || self.cancellation.is_cancelled() {
-            return Err(WarmAttemptError::Cancelled);
-        }
-        Ok(self.publish(session))
+            // Publication also checks retirement under the state lock, covering
+            // cancellation that races with a successful connection attempt.
+            if cancellation.is_cancelled() || self.cancellation.is_cancelled() {
+                return Err(WarmAttemptError::Cancelled);
+            }
+            Ok(self.publish(session))
+        })
     }
 
     fn record_failure(&self) {
@@ -846,7 +870,7 @@ mod tests {
                 catch_unwind(AssertUnwindSafe(|| pool.try_reserve(DatabaseId(2)).is_none()));
             let release = catch_unwind(AssertUnwindSafe(|| drop(reservation)));
             assert!(poisoned.is_err());
-            assert!(pool.state.is_poisoned());
+            assert!(pool.state.lock().is_err());
             assert!(matches!(attempt, Ok(true)));
             assert!(release.is_ok());
         }

@@ -155,7 +155,7 @@ pub(crate) async fn handle_connection(
         } => match result {
             Ok(session) => session,
             Err(error) => {
-                tracing::warn!(%error, host = %manager.pg_client.host, port = manager.pg_client.port, "upstream connection failed");
+                tracing::warn!(%error, database_id = ?lease_session.database_id, database = %lease_session.database_name, host = %manager.pg_client.host, port = manager.pg_client.port, "upstream connection failed");
                 reject_connection(&mut framed, "08006", "unable to connect to PostgreSQL").await;
                 return;
             }

@@ -163,7 +163,7 @@ async fn poisoned_publication_closes_the_session_without_recovering_state() {
     let result = catch_unwind(AssertUnwindSafe(|| reservation.publish(session)));
     assert!(poisoned.is_err());
     assert!(matches!(result, Ok(false)));
-    assert!(pool.state.is_poisoned());
+    assert!(pool.state.lock().is_err());
     assert_eq!(snapshot(&pool), before);
     assert_peer_closed(peer).await;
 }
@@ -179,7 +179,7 @@ async fn assert_invalid_publication(corrupt: impl FnOnce(&mut WarmPoolState)) {
     let before = snapshot(&pool);
     let result = catch_unwind(AssertUnwindSafe(|| reservation.publish(session)));
     assert!(result.is_err(), "broken reservation invariants must be detected");
-    assert!(pool.state.is_poisoned(), "an invalid transition must disable further pool access");
+    assert!(pool.state.lock().is_err(), "an invalid transition must disable further pool access");
     assert_eq!(snapshot(&pool), before, "validation must precede queue and counter changes");
     assert_peer_closed(peer).await;
 }

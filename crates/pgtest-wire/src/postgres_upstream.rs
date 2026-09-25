@@ -27,8 +27,8 @@ pub(crate) enum UpstreamError {
     Protocol(#[from] PgWireError),
     #[error("upstream requires authentication; only trust authentication is supported")]
     UnsupportedAuthentication,
-    #[error("upstream rejected the startup request")]
-    StartupRejected,
+    #[error("upstream rejected the startup request (SQLSTATE {code}): {message}")]
+    StartupRejected { code: String, message: String },
     #[error("unexpected upstream authentication message tag {0:#x}")]
     UnexpectedMessage(u8),
     #[error("invalid upstream message length {0}")]
@@ -136,9 +136,32 @@ async fn authenticate(
                 None => Err(UpstreamError::InvalidFrameLength(length)),
             }
         }
-        b'E' => Err(UpstreamError::StartupRejected),
+        b'E' => Err(startup_rejection(&decode_buffer[5..frame_end])),
         tag => Err(UpstreamError::UnexpectedMessage(tag)),
     }
+}
+
+// Read only the diagnostic fields from this ErrorResponse's body. Do not use
+// the general decoder here: malformed/unterminated fields must not panic, and
+// bytes from following frames must never become part of the error message.
+fn startup_rejection(mut body: &[u8]) -> UpstreamError {
+    let mut code = "unknown".to_owned();
+    let mut message = "no upstream error message".to_owned();
+    while let Some((&field, rest)) = body.split_first() {
+        if field == 0 {
+            break;
+        }
+        let Some(end) = rest.iter().position(|&byte| byte == 0) else {
+            break;
+        };
+        match field {
+            b'C' => code = String::from_utf8_lossy(&rest[..end]).into_owned(),
+            b'M' => message = String::from_utf8_lossy(&rest[..end]).into_owned(),
+            _ => {}
+        }
+        body = &rest[end + 1..];
+    }
+    UpstreamError::StartupRejected { code, message }
 }
 
 #[hotpath::measure(future = true)]
@@ -192,7 +215,7 @@ async fn wait_for_ready_for_query(
 
                 return Ok(RawBytes::from(buf.split_to(frame_end)));
             }
-            b'E' => return Err(UpstreamError::StartupRejected),
+            b'E' => return Err(startup_rejection(&buf[cursor + 5..frame_end])),
             _ => {}
         }
         cursor = frame_end;
@@ -304,7 +327,7 @@ mod tests {
         ));
         assert!(matches!(
             connect_with_reply(b"E\0\0\0\x04".to_vec()).await,
-            Err(UpstreamError::StartupRejected)
+            Err(UpstreamError::StartupRejected { .. })
         ));
         assert!(matches!(
             connect_with_reply(b"R\0\0\0\x08\0\0\0\x03".to_vec()).await,
@@ -355,7 +378,43 @@ mod tests {
             let mut reply = b"R\0\0\0\x08\0\0\0\0".to_vec();
             reply.extend_from_slice(burst);
             let session = connect_with_reply(reply).await;
-            assert!(matches!(session, Err(UpstreamError::StartupRejected)));
+            assert!(matches!(session, Err(UpstreamError::StartupRejected { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_rejection_preserves_postgres_diagnostics_at_both_stages() {
+        use pgwire::messages::response::ErrorResponse;
+
+        for (code, message) in [
+            ("53300", "sorry, too many clients already"),
+            ("3D000", "database \"retired_database\" does not exist"),
+        ] {
+            let response = ErrorResponse::new(vec![
+                (b'S', "FATAL".into()),
+                (b'C', code.into()),
+                (b'M', message.into()),
+                (b'D', "detail not included in startup diagnostics".into()),
+            ]);
+            let mut encoded = BytesMut::new();
+            response.encode(&mut encoded).unwrap();
+            for prefix in [b"".as_slice(), b"R\0\0\0\x08\0\0\0\0S\0\0\0\x08a\0b\0".as_slice()] {
+                let mut reply = prefix.to_vec();
+                reply.extend_from_slice(&encoded);
+                reply.extend_from_slice(b"Z\0\0\0\x05I");
+                let error = connect_with_reply(reply).await.err().unwrap();
+                assert_eq!(
+                    error.to_string(),
+                    format!("upstream rejected the startup request (SQLSTATE {code}): {message}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_startup_diagnostics_do_not_panic() {
+        for body in [b"".as_slice(), b"Munterminated", b"C53300\0Munterminated", b"M\xff\0\0"] {
+            assert!(matches!(startup_rejection(body), UpstreamError::StartupRejected { .. }));
         }
     }
 

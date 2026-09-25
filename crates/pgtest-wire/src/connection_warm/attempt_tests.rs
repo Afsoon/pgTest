@@ -199,7 +199,9 @@ async fn rejected_startup_releases_the_reservation_and_permit() {
         peer.write_all(b"E\0\0\0\x04").await.unwrap();
         assert!(matches!(
             task.await.unwrap(),
-            Err(WarmAttemptError::Upstream(postgres_upstream::UpstreamError::StartupRejected))
+            Err(WarmAttemptError::Upstream(
+                postgres_upstream::UpstreamError::StartupRejected { .. }
+            ))
         ));
         assert_closed(peer).await;
         assert_empty(&pool);
@@ -258,7 +260,9 @@ async fn reject_with_backoff(
         peer.write_all(b"E\0\0\0\x04").await.unwrap();
         assert!(matches!(
             task.await.unwrap(),
-            Err(WarmAttemptError::Upstream(postgres_upstream::UpstreamError::StartupRejected))
+            Err(WarmAttemptError::Upstream(
+                postgres_upstream::UpstreamError::StartupRejected { .. }
+            ))
         ));
         let after = Instant::now();
         let deadline = pool.state.lock().unwrap().databases[&DatabaseId(1)].retry_at.unwrap();
