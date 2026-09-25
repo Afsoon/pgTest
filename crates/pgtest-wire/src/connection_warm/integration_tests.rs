@@ -173,7 +173,9 @@ async fn concurrent_listener_bursts_use_unique_backends_and_keep_databases_isola
             let state = h.pool().state.lock().unwrap();
             assert!(state.capacity_used <= 4);
             assert!(state.databases.values().map(|e| e.in_flight).sum::<usize>() <= 2);
-            assert!(state.databases.values().all(|e| e.idle.len() + e.in_flight <= 2));
+            assert!(
+                state.databases.values().all(|e| e.checked_out + e.idle.len() + e.in_flight <= 2)
+            );
             drop(state);
             sessions.push((lease, client, task));
         }
@@ -306,8 +308,11 @@ async fn lease_expiry_closes_active_sessions_and_idle_spares_before_deletion() {
         let lease = h.manager.attach(&h.template, LeaseId::new("expiry").unwrap()).await.unwrap();
         let (client, task) = connect(h.client_config("expiry", true)).await;
         assert!(backend(&client).await > 0);
-        while h.pool().state.lock().unwrap().databases[&lease.database_id].idle.len() != 2 {
-            tokio::task::yield_now().await;
+        {
+            let state = h.pool().state.lock().unwrap();
+            let entry = &state.databases[&lease.database_id];
+            assert_eq!(entry.checked_out, 1);
+            assert_eq!(entry.idle.len(), 1);
         }
         // Advance only the already-armed lease timer; keep socket/DDL work on
         // real time so the outer timeout doesn't auto-advance during network

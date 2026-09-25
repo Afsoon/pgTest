@@ -6,7 +6,7 @@ use pgtest::{
         core::LeaseId,
         errors::{AttachError, InvalidLeaseId},
     },
-    worker_manager::WorkerEngineManager,
+    worker_manager::{WorkerEngineManager, worker_io::LeaseSession},
 };
 use pgwire::{
     api::auth::protocol_negotiation,
@@ -88,9 +88,32 @@ pub(crate) async fn handle_connection(
         return;
     }
 
-    if let Err(error) = protocol_negotiation(&mut framed, &startup).await {
-        tracing::debug!(%error, "client protocol negotiation failed");
+    // End startup timing after writing ReadyForQuery, before the relay starts
+    // waiting for client queries. Control sessions are excluded above.
+    let Some((upstream_session, lease_session)) = hotpath::measure_block!(
+        "connection::client_startup_to_ready",
+        start_session(&mut framed, &startup, &manager, warm_pool.as_deref()).await
+    ) else {
         return;
+    };
+    if let Err(error) =
+        session_relay::run(framed.into_inner(), upstream_session, lease_session).await
+    {
+        tracing::debug!(%error, "session relay ended with an I/O error");
+    }
+}
+
+async fn start_session(
+    framed: &mut ClientConnection,
+    startup: &Startup,
+    manager: &WorkerEngineManager,
+    warm_pool: Option<&ConnectionWarmPool>,
+) -> Option<(postgres_upstream::UpstreamSession, LeaseSession)> {
+    let params = &startup.parameters;
+    let database = params.get("database")?;
+    if let Err(error) = protocol_negotiation(framed, startup).await {
+        tracing::debug!(%error, "client protocol negotiation failed");
+        return None;
     }
 
     if let Err(error) = framed
@@ -98,7 +121,7 @@ pub(crate) async fn handle_connection(
         .await
     {
         tracing::debug!(%error, "unable to send client authentication response");
-        return;
+        return None;
     }
 
     tracing::debug!("connection string is {database}");
@@ -106,13 +129,9 @@ pub(crate) async fn handle_connection(
     let (database_name, lease_id) = match parse_connection_field(&database) {
         Ok(parse_result) => parse_result,
         Err(_) => {
-            reject_connection(
-                &mut framed,
-                "22023",
-                "expected template/lease-id with a valid lease ID",
-            )
-            .await;
-            return;
+            reject_connection(framed, "22023", "expected template/lease-id with a valid lease ID")
+                .await;
+            return None;
         }
     };
     tracing::debug!("database name {database_name} and lease_id {lease_id}");
@@ -127,46 +146,80 @@ pub(crate) async fn handle_connection(
                 AttachError::TemplateMismatch => "3D000",
                 _ => "08006",
             };
-            reject_connection(&mut framed, code, &error.to_string()).await;
-            return;
+            reject_connection(framed, code, &error.to_string()).await;
+            return None;
         }
     };
     let cancellation = lease_session.cancellation_token();
-    let upstream_session = tokio::select! {
+    let warm_session = tokio::select! {
         biased;
         _ = cancellation.cancelled() => {
-            reject_connection(&mut framed, "55000", "lease was closed during connection startup").await;
-            return;
+            reject_connection(framed, "55000", "lease was closed during connection startup").await;
+            return None;
         }
-        result = async {
+        session = async {
             // Checkout belongs inside the cancellation race: a closed lease
             // must not consume a spare. A miss never waits for replenishment.
-            if let Some(session) = warm_pool.as_ref().and_then(|pool| {
-                pool.try_checkout(lease_session.database_id, params)
-            }) {
-                return Ok(session);
-            }
-            postgres_upstream::connect(
-                &lease_session.database_name,
-                params,
-                &manager.pg_client.host,
-                manager.pg_client.port,
-            ).await
-        } => match result {
-            Ok(session) => session,
-            Err(error) => {
-                tracing::warn!(%error, database_id = ?lease_session.database_id, database = %lease_session.database_name, host = %manager.pg_client.host, port = manager.pg_client.port, "upstream connection failed");
-                reject_connection(&mut framed, "08006", "unable to connect to PostgreSQL").await;
-                return;
-            }
-        }
+            hotpath::measure_block!("connection::warm_checkout", {
+                warm_pool.and_then(|pool| pool.try_checkout(lease_session.database_id, params))
+            })
+        } => session,
     };
-    let parts = framed.into_parts();
-    if let Err(error) =
-        session_relay::run(parts.io, upstream_session, parts.read_buf, lease_session).await
-    {
-        tracing::debug!(%error, "session relay ended with an I/O error");
-    }
+    let is_warm = warm_session.is_some();
+    let startup = async {
+        let mut session = match warm_session {
+            Some(session) => session,
+            None => {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        reject_connection(framed, "55000", "lease was closed during connection startup").await;
+                        return None;
+                    }
+                    result = async { hotpath::measure_block!(
+                        "connection::cold_upstream_startup",
+                        postgres_upstream::connect(
+                            &lease_session.database_name,
+                            params,
+                            &manager.pg_client.host,
+                            manager.pg_client.port,
+                        ).await
+                    ) } => result,
+                };
+                match result {
+                    Ok(session) => session,
+                    Err(error) => {
+                        tracing::warn!(%error, database_id = ?lease_session.database_id, database = %lease_session.database_name, host = %manager.pg_client.host, port = manager.pg_client.port, "upstream connection failed");
+                        reject_connection(framed, "08006", "unable to connect to PostgreSQL").await;
+                        return None;
+                    }
+                }
+            }
+        };
+        let remaining_stream = std::mem::take(framed.read_buffer_mut());
+        let result = tokio::select! {
+            biased;
+            // Once response forwarding starts, close on cancellation without
+            // appending an ErrorResponse to a possibly partial protocol frame.
+            _ = cancellation.cancelled() => return None,
+            result = session_relay::write_startup(
+                framed.get_mut(), &mut session, &remaining_stream,
+            ) => result,
+        };
+        if let Err(error) = result {
+            tracing::debug!(%error, "unable to write client startup responses");
+            return None;
+        }
+        Some(session)
+    };
+    // These comparable tails begin after attach/checkout and include sending
+    // ReadyForQuery. The cold tail also establishes/authenticates its backend.
+    let upstream_session = if is_warm {
+        hotpath::measure_block!("connection::warm_startup_to_ready", startup.await)
+    } else {
+        hotpath::measure_block!("connection::cold_startup_to_ready", startup.await)
+    }?;
+    Some((upstream_session, lease_session))
 }
 
 #[cfg(test)]

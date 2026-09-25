@@ -44,6 +44,7 @@ pub(super) async fn assert_peer_closed(mut peer: UpstreamStream) {
 pub(super) struct DatabaseSnapshot {
     pub(super) name: String,
     pub(super) in_flight: usize,
+    pub(super) checked_out: usize,
     pub(super) bursts: Vec<Vec<u8>>,
 }
 
@@ -68,6 +69,7 @@ pub(super) fn snapshot(pool: &ConnectionWarmPool) -> PoolSnapshot {
                     DatabaseSnapshot {
                         name: entry.database_name.clone(),
                         in_flight: entry.in_flight,
+                        checked_out: entry.checked_out,
                         bursts: entry
                             .idle
                             .iter()

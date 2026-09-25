@@ -36,7 +36,7 @@ impl ConnectionWarmer {
         }
     }
 
-    /// Start background replenishment and optionally wait for initial
+    /// Start background warming and optionally wait for initial
     /// inventory. Call once after the manager has created its initial
     /// databases. Warm-up errors and deadlines are logged and leave cold
     /// connections available.

@@ -102,6 +102,24 @@ async fn attempt_publishes_complete_startup_and_preserves_the_connected_socket()
         assert_eq!(pool.attempt_permits.available_permits(), 1);
 
         let mut session = pool.try_checkout(DatabaseId(1), pool.profile.parameters()).unwrap();
+        // Finishing client startup must use the cached responses and preserve
+        // pipelined bytes without another upstream handshake or waiting for
+        // subsequent query traffic. Both sockets remain open after it returns.
+        let frontend = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (client, accepted) =
+            tokio::join!(TcpStream::connect(frontend.local_addr().unwrap()), frontend.accept(),);
+        let mut client = client.unwrap();
+        let mut frontend = pgwire::tokio::server::MaybeTls::Plain(accepted.unwrap().0);
+        crate::session_relay::write_startup(&mut frontend, &mut session, b"pipelined query")
+            .await
+            .unwrap();
+        let mut response = vec![0; BURST.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, BURST);
+        let mut pipelined = [0; 15];
+        peer.read_exact(&mut pipelined).await.unwrap();
+        assert_eq!(&pipelined, b"pipelined query");
+
         session.stream.write_all(b"client traffic").await.unwrap();
         let mut bytes = [0; 14];
         peer.read_exact(&mut bytes).await.unwrap();
@@ -321,7 +339,10 @@ async fn failures_back_off_per_database_and_success_resets_the_strategy() {
         peer.write_all(BURST).await.unwrap();
         assert!(task.await.unwrap().unwrap());
         assert!(pool.state.lock().unwrap().databases[&DatabaseId(1)].retry_at.is_none());
-        drop(pool.try_checkout(DatabaseId(1), pool.profile.parameters()).unwrap());
+        // Lose an unused spare: replacement may retry, but a successful
+        // checkout would permanently consume this database's warm budget.
+        peer.shutdown().await.unwrap();
+        std::future::poll_fn(|cx| pool.poll_idle_health(cx)).await.unwrap();
         assert_closed(peer).await;
     })
     .await;

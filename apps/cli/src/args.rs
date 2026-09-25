@@ -90,7 +90,8 @@ pub struct ServeOptions {
         fallback(100000)
     )]
     pub max_lease_records: usize,
-    /// Target spare connections per database; zero disables warming.
+    /// Lifetime warm handoff budget per physical database; zero disables
+    /// warming.
     #[bpaf(long, argument("COUNT"), fallback(0))]
     pub connection_warm_count: u16,
     /// Global cap on idle connections plus in-flight warm attempts; must be

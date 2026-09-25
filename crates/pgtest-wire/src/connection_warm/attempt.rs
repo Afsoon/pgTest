@@ -31,12 +31,16 @@ pub(super) async fn connect_warm_session(
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(WarmAttemptError::Cancelled),
-        connection_result = tokio::time::timeout(WARM_ATTEMPT_TIMEOUT,  postgres_upstream::connect(
-            database_name,
-            profile.parameters(),
-            upstream_host,
-            upstream_port,
-        )) => {
+        connection_result = async {
+            hotpath::measure_block!("connection_warm::upstream_startup", {
+                tokio::time::timeout(WARM_ATTEMPT_TIMEOUT, postgres_upstream::connect(
+                    database_name,
+                    profile.parameters(),
+                    upstream_host,
+                    upstream_port,
+                )).await
+            })
+        } => {
             match connection_result {
                 Ok(Ok(session)) => Ok(session),
                 Ok(Err(error)) => Err(WarmAttemptError::Upstream(error)),

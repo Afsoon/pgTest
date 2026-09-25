@@ -19,7 +19,22 @@ Integration validation is complete on macOS arm64 with Docker PostgreSQL 18;
 the external Vitest performance comparison remains step 19. Docker comparison
 variants and run instructions are prepared; measurements are pending from the user.
 
+Current scheduling policy: `connection-warm-count` is a lifetime successful
+handoff budget per physical `DatabaseId`. Successful checkouts are not replenished.
+Failed attempts and unhealthy unused spares can still be replaced. This supersedes
+the continuous-refill behavior recorded in the earlier implementation steps below.
+
+The subsequent proposal for PgBouncer/PgDog-style reusable connections is in
+[connection-pooling.md](connection-pooling.md). It records the physical-database
+reuse boundary and the required ownership/protocol changes; it has not replaced
+the runtime policy above.
+
 ## Working agreement
+
+The user subsequently requested implementation of the scheduling policy described
+below: successful checkouts consume a lifetime budget per physical database and
+are not replenished. This request authorizes the assistant's implementation,
+focused tests, and documentation for that change.
 
 The user writes all implementation code and tests. The assistant maintains this
 document, gives one small step at a time, and reviews the resulting diff without
@@ -171,7 +186,11 @@ and hand it to the existing relay. Each backend serves exactly one client and is
 closed afterward. Never transfer it to another database or return it to the pool.
 
 A miss, parameter mismatch, or known unhealthy spare uses the existing cold path
-without waiting for replenishment. Replenish eligible databases in the background.
+without waiting for warming. Each physical database has a lifetime budget equal
+to `connection-warm-count`. Successful checkouts permanently consume that budget;
+idle spares and in-flight attempts reserve the remaining slots. Fill eligible
+slots in the background, retrying failed attempts and replacing unhealthy unused
+spares, but never replenishing successful handoffs.
 Monitor unused sockets for closure/errors, without a health-query round trip on
 checkout. Conservatively discard a spare that sends unsolicited data, including
 notices or partial error frames; no client has used that backend yet. Failures
@@ -212,12 +231,12 @@ that the CLI uses arguments and the server uses PGTEST_ environment variables.
 | `--connection-warm-params`          | `PGTEST_CONNECTION_WARM_PARAMS`          | JSON string-to-string map, default `{}`; missing user uses configured pg-user |
 
 Reject database and replication keys in the configured profile. Require positive
-global capacity and concurrency. A per-database target larger than available
+global capacity and concurrency. A per-database budget larger than available
 global capacity is best-effort, constrained by that capacity. Other client
 profiles connect normally.
 
 Count idle sockets and in-flight warm attempts against the global warm cap;
-active client sessions do not count against it. Use fair replenishment across
+active client sessions do not count against it. Use fair scheduling across
 eligible databases. Bound each attempt to five seconds; back off failed attempts
 from one second, doubling to a thirty-second maximum, and cancel retries at
 retirement. Reset backoff after success.
@@ -2637,9 +2656,10 @@ limits; a failed run is not a valid speedup sample.
 
 Include client connection samples/percentiles, warm hits/misses, and backend-count
 samples if the suite already records them. The server's profiled build now emits
-successful warm checkouts as described above; miss counts, client latency samples,
-and backend-count samples are not currently emitted by the inspected helpers.
-Mark them unavailable when absent. Hotpath's upstream-connect totals include both
+successful warm checkouts as described above and server-side startup timings as
+described below. End-to-end client latency and backend-count samples still need
+client/PostgreSQL measurements; mark them unavailable when absent.
+Hotpath's upstream-connect totals include both
 warm attempts and cold connections; they cannot establish hit rate, client
 p50/p95/p99, or saved wall time. Relay duration includes session lifetime and is
 not connection latency. Do not pool or average per-run percentiles as though they
@@ -2657,3 +2677,62 @@ syntax checking. Docker images and suite runs are intentionally left to the user
 no new measurements or speedup claims have been made. Step 19 stays unchecked
 until the supplied results have been compared and any missing measurements have
 been explicitly recorded as limitations.
+
+### Scheduling policy after the first profiles
+
+One supplied profile recorded 309 successful warm checkouts and 246 unused
+connections closed on retirement. To avoid recreating spares after each handoff,
+the scheduler now reserves work only when:
+
+```text
+successful handoffs + idle spares + in-flight attempts < connection-warm-count
+```
+
+Each successful checkout increments its database's handoff count under the same
+mutex that removes the spare. The checkout health probe is a single nonblocking
+read under that mutex; socket disposal remains outside it. This prevents a racing
+scheduler from reserving a replacement between removal and handoff. Health
+rejections and failed attempts do not consume the handoff budget.
+
+The global cap continues to count only idle spares and in-flight attempts. A
+checkout frees global capacity for other databases or for unfilled slots within
+the same database's remaining budget. Duplicate registration cannot reset the
+budget; a new physical `DatabaseId` receives a new budget. Cold fallback, startup
+waiting, retry backoff, retirement, and shutdown retain their existing behavior.
+
+This policy applies to both bounded-startup and background-only warming and needs
+no additional setting. Rebuild the comparison images before collecting new
+profiles. The existing successful-checkout and unused-on-retirement gauges remain
+available; performance and non-clean-run reliability still require measurement.
+
+### Separating warm and cold startup in Hotpath
+
+Timing-enabled builds emit these additional function/block measurements:
+
+| Label | Measured interval |
+| --- | --- |
+| `connection::client_startup_to_ready` | After a normal application Startup message has been decoded and routed, through protocol negotiation, frontend AuthenticationOk, lease attachment, upstream selection/startup, and writing the saved responses through ReadyForQuery. |
+| `connection::warm_checkout` | The synchronous pool lookup and health check, including misses. |
+| `connection::warm_startup_to_ready` | After a successful warm checkout, through forwarding any pipelined client bytes and writing the cached startup responses through ReadyForQuery. |
+| `connection::cold_startup_to_ready` | After a warm miss (or with warming disabled), through opening/authenticating the upstream and the same response forwarding. |
+| `connection::cold_upstream_startup` | Foreground socket connection, authentication, and receipt of upstream ReadyForQuery. Nested within the cold startup interval. |
+| `connection_warm::upstream_startup` | Background socket connection, authentication, and receipt of upstream ReadyForQuery. Excludes waiting for a warm-attempt permit. |
+
+Compare the warm/cold tail averages and percentiles to see whether avoiding an
+upstream handshake reduces startup time. Both tails exclude the preceding
+frontend negotiation, lease attachment, and pool lookup; the common
+`client_startup_to_ready` measurement includes those stages, but aggregates both
+paths. It excludes frontend socket establishment, SSL negotiation, and waiting
+for the client's Startup packet. Completion means the server finished its write,
+not that the client has received or processed it.
+
+Control connections to `pgtest` do not enter these startup measurements. As with
+other Hotpath timing scopes, failed or cancelled attempts are recorded up to
+exit/drop too; timing call counts alone are not successful-connection counts.
+Use runs without connection failures when comparing successful startup latency.
+
+The existing `postgres_upstream::connect` and `authenticate` rows still aggregate
+both foreground and background calls. The new upstream rows show where that work
+happens; do not add nested timings or subtract percentiles. `session_relay::run`
+and its I/O counters now begin after startup response forwarding, so they describe
+the subsequent session rather than its initialization.

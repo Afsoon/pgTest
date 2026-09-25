@@ -82,7 +82,10 @@ For example, append `--pool-initial-size 32 --creation-pool-connection 8
 --log-filter debug` to a `serve` command. Zero growth batch size disables growth.
 Pool connection counts and maximum lease records must be greater than zero.
 
-Set `--connection-warm-count 1` to prepare fresh, single-use upstream sessions.
+Set `--connection-warm-count 1` to prepare at most one successful warm handoff per
+physical database. Successful checkouts consume the database's lifetime budget
+and are not replenished. Failed attempts and unhealthy unused spares can still
+be retried; connections beyond the budget use cold fallback.
 TCP and Unix listeners share the pool. Startup waits for the initial target,
 limited by the global cap, or the configured deadline. On timeout, it logs
 incomplete warm-up and serves clients with cold fallback while warming continues.

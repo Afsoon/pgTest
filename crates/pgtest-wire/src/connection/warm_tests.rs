@@ -296,14 +296,18 @@ async fn rejected_and_control_connections_do_not_consume_spares() {
         close(client, task).await;
 
         // The handler must attach successfully before touching the pool.
-        h.seed(&lease).await;
-        h.manager.release(lease.lease_id.clone()).await.unwrap();
-        let error = h.connect(&h.config("one")).await.err().expect("closed lease must be rejected");
+        // Use another physical database: the first one's warm budget is spent.
+        let closed_lease = h.attach("closed").await;
+        h.seed(&closed_lease).await;
+        h.manager.release(closed_lease.lease_id.clone()).await.unwrap();
+        let error =
+            h.connect(&h.config("closed")).await.err().expect("closed lease must be rejected");
         assert_eq!(error.as_db_error().unwrap().code().code(), "55000");
         assert!(
-            h.pool.try_reserve(lease.database_id).is_none(),
+            h.pool.try_reserve(closed_lease.database_id).is_none(),
             "rejected attach must leave the spare occupying its slot"
         );
+        drop(closed_lease);
         drop(lease);
         h.shutdown().await;
     })

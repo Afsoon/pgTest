@@ -29,7 +29,9 @@ impl Drop for SchedulerGuard<'_> {
 }
 
 impl ConnectionWarmPool {
-    /// Drive bounded replenishment until pool cancellation or a terminal error.
+    /// Fill each database's lifetime warm budget until pool cancellation or a
+    /// terminal error. Replace failed/unhealthy spares, not successful
+    /// handoffs.
     ///
     /// The caller owns this future; no attempt tasks are detached. Returning or
     /// dropping it releases all pending attempt resources. Published idle
@@ -124,7 +126,7 @@ impl ConnectionWarmPool {
             .filter(|entry| {
                 !entry.retiring
                     && !entry.cancellation.is_cancelled()
-                    && entry.idle.len() + entry.in_flight < usize::from(self.config.per_database)
+                    && entry.has_warm_budget(self.config.per_database)
             })
             .filter_map(|entry| entry.retry_at)
             .min())

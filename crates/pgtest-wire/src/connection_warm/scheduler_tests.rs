@@ -102,7 +102,7 @@ async fn advance(scheduler: &mut Scheduler, duration: Duration) {
 }
 
 #[tokio::test]
-async fn scheduler_warms_round_robin_and_replenishes_after_checkout_and_registration() {
+async fn scheduler_warms_round_robin_without_replenishing_successful_checkouts() {
     let pool = pool(2, 6, 1);
     register(&pool, [1, 2, 3]);
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -119,15 +119,15 @@ async fn scheduler_warms_round_robin_and_replenishes_after_checkout_and_registra
     assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
 
     drop(pool.try_checkout(DatabaseId(2), pool.profile.parameters()).unwrap());
-    let (name, mut replacement) = drive(&mut scheduler, accept_startup(&listener)).await;
-    assert_eq!(name, "physical_2");
-    reply(&mut replacement, true).await;
-    drive(&mut scheduler, until(|| idle_count(&pool) == 6)).await;
-    peers.push(replacement);
+    assert!(!pool.register_database(DatabaseId(2), "duplicate".into()));
+    assert!(futures::poll!(scheduler.as_mut()).is_pending());
+    assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
+    assert_eq!(idle_count(&pool), 5);
+    assert!(pool.try_reserve(DatabaseId(2)).is_none());
 
     assert!(pool.retire_database(DatabaseId(1)));
     register(&pool, [4]);
-    for expected_idle in [5, 6] {
+    for expected_idle in [4, 5] {
         let (name, mut peer) = drive(&mut scheduler, accept_startup(&listener)).await;
         assert_eq!(name, "physical_4");
         reply(&mut peer, true).await;
@@ -141,6 +141,38 @@ async fn scheduler_warms_round_robin_and_replenishes_after_checkout_and_registra
     for peer in peers {
         closed(peer).await;
     }
+}
+
+#[tokio::test]
+async fn scheduler_spends_lifetime_budget_even_when_global_capacity_is_smaller() {
+    let pool = pool(2, 1, 1);
+    register(&pool, [1]);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let mut scheduler = scheduler(&pool, &listener);
+
+    for handed_out in 1..=2 {
+        let (name, mut peer) = drive(&mut scheduler, accept_startup(&listener)).await;
+        assert_eq!(name, "physical_1");
+        reply(&mut peer, true).await;
+        drive(&mut scheduler, until(|| idle_count(&pool) == 1)).await;
+        drop(pool.try_checkout(DatabaseId(1), pool.profile.parameters()).unwrap());
+        closed(peer).await;
+        assert_eq!(pool.state.lock().unwrap().databases[&DatabaseId(1)].checked_out, handed_out);
+    }
+
+    assert!(futures::poll!(scheduler.as_mut()).is_pending());
+    assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
+    assert!(pool.try_reserve(DatabaseId(1)).is_none());
+    // A new physical identity gets its own budget, even if its name is reused.
+    pool.retire_database(DatabaseId(1));
+    assert!(pool.register_database(DatabaseId(2), "physical_1".into()));
+    let (name, mut peer) = drive(&mut scheduler, accept_startup(&listener)).await;
+    assert_eq!(name, "physical_1");
+    reply(&mut peer, true).await;
+    drive(&mut scheduler, until(|| idle_count(&pool) == 1)).await;
+    stop(&pool, &mut scheduler).await;
+    pool.retire_database(DatabaseId(2));
+    closed(peer).await;
 }
 
 #[tokio::test]
@@ -210,8 +242,9 @@ async fn scheduler_retries_on_deadline_while_other_databases_progress_and_retire
     closed(retried).await;
 
     drop(pool.try_checkout(DatabaseId(2), pool.profile.parameters()).unwrap());
+    register(&pool, [3]);
     let (name, mut replacement) = drive(&mut scheduler, accept_startup(&listener)).await;
-    assert_eq!(name, "physical_2", "cooldown must not block another database");
+    assert_eq!(name, "physical_3", "cooldown must not block a new database");
     reply(&mut replacement, true).await;
     drive(&mut scheduler, until(|| idle_count(&pool) == 1)).await;
     pool.retire_database(DatabaseId(1));
@@ -220,6 +253,7 @@ async fn scheduler_retries_on_deadline_while_other_databases_progress_and_retire
     assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
     stop(&pool, &mut scheduler).await;
     pool.retire_database(DatabaseId(2));
+    pool.retire_database(DatabaseId(3));
     closed(healthy).await;
     closed(replacement).await;
 }
@@ -339,14 +373,14 @@ async fn armed_monitor_never_consumes_handed_off_traffic_or_closes_client_socket
     peer.write_all(b"backend traffic").await.unwrap();
     // Force another scheduler iteration after the old idle socket becomes
     // readable. Its stale wakeup must not grant the monitor access to it.
-    let (_, replacement) = drive(&mut scheduler, accept_startup(&listener)).await;
+    assert!(futures::poll!(scheduler.as_mut()).is_pending());
+    assert!(futures::poll!(Box::pin(listener.accept()).as_mut()).is_pending());
     let mut data = [0; 15];
     drive(&mut scheduler, client.stream.read_exact(&mut data)).await.unwrap();
     assert_eq!(&data, b"backend traffic");
-    assert_eq!(pool.state.lock().unwrap().capacity_used, 1);
+    assert_eq!(pool.state.lock().unwrap().capacity_used, 0);
     pool.retire_database(DatabaseId(1));
     stop(&pool, &mut scheduler).await;
-    closed(replacement).await;
     client.stream.write_all(b"still owned").await.unwrap();
     let mut data = [0; 11];
     tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut data))

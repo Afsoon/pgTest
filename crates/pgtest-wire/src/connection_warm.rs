@@ -38,7 +38,8 @@ mod scheduler;
 /// is supplied later when resolving the warm profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionWarmConfig {
-    /// Target number of spare connections per database. Zero disables warming.
+    /// Lifetime budget of warm handoffs per physical database. Zero disables
+    /// warming. Successful checkouts are not replenished.
     per_database: u16,
     /// Global cap on idle connections plus in-flight warm attempts.
     /// Connections already handed to clients do not count toward this cap.
@@ -82,8 +83,9 @@ impl ConnectionWarmConfig {
     /// `startup_params` contains `database` or `replication`. These checks
     /// also apply when warming is disabled.
     ///
-    /// - `per_database` sets the spare-connection target; zero disables
-    ///   warming.
+    /// - `per_database` sets the lifetime warm-handoff budget per physical
+    ///   database; successful checkouts are not replenished. Zero disables
+    ///   warming. Failed attempts and unhealthy unused spares can be retried.
     /// - `max_total` caps idle connections plus in-flight warm attempts
     ///   globally, excluding connections already handed to clients.
     /// - `concurrency` limits simultaneous warm connection attempts.
@@ -174,11 +176,18 @@ struct DatabaseWarmState {
     database_name: String,
     idle: VecDeque<IdleSession>,
     in_flight: usize,
+    checked_out: usize,
     retry_at: Option<Instant>,
     retry_strategy: ExponentialFactorBackoff,
     retiring: bool,
     cancellation: CancellationToken,
     drain: TaskTracker,
+}
+
+impl DatabaseWarmState {
+    fn has_warm_budget(&self, per_database: u16) -> bool {
+        self.checked_out + self.idle.len() + self.in_flight < usize::from(per_database)
+    }
 }
 
 // Field order matters: close the socket before releasing its drain token.
@@ -243,6 +252,7 @@ impl ConnectionWarmPool {
                     database_name,
                     idle: VecDeque::default(),
                     in_flight: 0,
+                    checked_out: 0,
                     retry_at: None,
                     retry_strategy: warm_retry_strategy(),
                     retiring: false,
@@ -321,7 +331,7 @@ impl ConnectionWarmPool {
             return None;
         }
 
-        if entry.idle.len() + entry.in_flight >= usize::from(self.config.per_database) {
+        if !entry.has_warm_budget(self.config.per_database) {
             return None;
         }
 
@@ -357,7 +367,8 @@ impl ConnectionWarmPool {
     }
 
     /// Reserve one slot in round-robin registration order, scanning at most
-    /// one pass and skipping databases whose spare target is already covered.
+    /// one pass and skipping databases whose lifetime warm budget is covered
+    /// by successful handoffs, idle spares, and in-flight attempts.
     pub(crate) fn reserve_next(self: &Arc<Self>) -> Option<WarmReservation> {
         if !self.config.is_enabled() {
             return None;
@@ -427,6 +438,14 @@ impl ConnectionWarmPool {
 
             let warmed_session =
                 entry.idle.pop_front().expect("expected to obtain a session ready");
+            // Check health and consume the lifetime budget before releasing
+            // the lock. Otherwise the scheduler could reserve a replacement
+            // between removal and handoff. This is one nonblocking read, like
+            // the idle monitor; socket disposal remains outside the lock.
+            let healthy = warmed_session.session.stream.is_idle();
+            if healthy {
+                entry.checked_out += 1;
+            }
             state_lock.capacity_used = remaining_capacity;
             drop(state_lock);
             self.notify_changed();
@@ -434,7 +453,7 @@ impl ConnectionWarmPool {
             // The session is exclusively owned now. Close rejected sockets
             // outside the state lock and try the next spare without
             // waiting for warm-up.
-            if warmed_session.session.stream.is_idle() {
+            if healthy {
                 // Handoff ends warm ownership; the lease/relay owns the
                 // connection from here. The drain token drops outside the lock.
                 hotpath::gauge!("connection_warm::successful_checkouts").inc(1);

@@ -341,7 +341,7 @@ TCP; its Unix listener is optional.
 | `--pool-grow-batch-size`      | `PGTEST_POOL_GROW_BATCH_SIZE`      | `16`                   | Databases created per growth batch; `0` disables growth.                                |
 | `--lease-claim-timeout-ms`    | `PGTEST_LEASE_CLAIM_TIMEOUT_MS`    | `30000`                | Lease lifetime and pending-claim timeout, in milliseconds; `0` disables these timeouts. |
 | `--max-lease-records`         | `PGTEST_MAX_LEASE_RECORDS`         | `100000`               | Maximum admitted lease IDs, including pending and closed leases.                        |
-| `--connection-warm-count` | `PGTEST_CONNECTION_WARM_COUNT` | `0` | Target spare connections per database; `0` disables warming. |
+| `--connection-warm-count` | `PGTEST_CONNECTION_WARM_COUNT` | `0` | Lifetime warm handoff budget per physical database; `0` disables warming. |
 | `--connection-warm-max-total` | `PGTEST_CONNECTION_WARM_MAX_TOTAL` | `32` | Global cap on idle connections plus in-flight warm attempts. |
 | `--connection-warm-concurrency` | `PGTEST_CONNECTION_WARM_CONCURRENCY` | `4` | Maximum simultaneous warm attempts. |
 | `--connection-warm-startup-wait-ms` | `PGTEST_CONNECTION_WARM_STARTUP_WAIT_MS` | `5000` | Initial warm-up wait in milliseconds; `0` selects background-only warming. |
@@ -358,6 +358,12 @@ Listeners start when the initial target is ready (limited by the global cap) or
 the startup wait expires. Incomplete warm-up is logged; clients can connect cold
 while warming continues. A zero startup wait starts listeners without waiting
 for warm connections. Databases created later warm in the background.
+
+The count is a lifetime budget for each physical database. A successful warm
+checkout consumes one slot permanently; it does not trigger a replacement.
+Failed attempts and unhealthy unused spares can be retried within the remaining
+budget. With count `1`, each physical database supplies at most one warm connection;
+later connections use the cold path. Freed global capacity can warm other databases.
 
 Warm capacity and concurrency must be positive, even when the count is zero.
 The startup profile must exactly match the client's forwarded parameters to use

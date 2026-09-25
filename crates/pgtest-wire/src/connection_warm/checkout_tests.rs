@@ -62,6 +62,7 @@ async fn disabled_checkout_preserves_even_a_seeded_idle_session() {
                 database_name: "physical".to_owned(),
                 idle: VecDeque::from([IdleSession { session, _drain: TaskTracker::new().token() }]),
                 in_flight: 0,
+                checked_out: 0,
                 retry_at: None,
                 retry_strategy: warm_retry_strategy(),
                 retiring: false,
@@ -217,8 +218,9 @@ async fn checkout_releases_capacity_once_without_changing_in_flight_attempts() {
     assert!(after.databases[&1].bursts.is_empty());
     assert_eq!(after.databases[&1].name, before.databases[&1].name);
     assert_eq!(after.databases[&2], before.databases[&2]);
-    let replacement =
-        pool.try_reserve(DatabaseId(1)).expect("checkout frees both limits immediately");
+    assert_eq!(after.databases[&1].checked_out, 1);
+    assert!(pool.try_reserve(DatabaseId(1)).is_none(), "handoff spends the per-database budget");
+    let replacement = pool.try_reserve(DatabaseId(2)).expect("checkout frees global capacity");
     let after_refill = snapshot(&pool);
     assert_eq!(after_refill.capacity_used, 3);
     // Client-owned sessions never return to the pool or release a replacement's
@@ -285,7 +287,12 @@ async fn simultaneous_checkouts_hand_each_session_to_exactly_one_caller() {
             let barrier = barrier.clone();
             thread::spawn(move || {
                 barrier.wait();
-                pool.try_checkout(DatabaseId(1), &params())
+                let session = pool.try_checkout(DatabaseId(1), &params());
+                assert!(
+                    pool.try_reserve(DatabaseId(1)).is_none(),
+                    "no racing refill after handoff"
+                );
+                session
             })
         })
         .collect();
@@ -302,6 +309,8 @@ async fn simultaneous_checkouts_hand_each_session_to_exactly_one_caller() {
     let after = snapshot(&pool);
     assert_eq!(after.capacity_used, 0);
     assert_eq!(after.databases[&1].in_flight, 0);
+    assert_eq!(after.databases[&1].checked_out, 2);
+    assert!(pool.try_reserve(DatabaseId(1)).is_none());
     assert!(after.databases[&1].bursts.is_empty());
     assert!(pool.try_checkout(DatabaseId(1), &params()).is_none());
     drop(sessions);
