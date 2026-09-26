@@ -4,7 +4,7 @@ use pgtest_utils::read_string::ReadString;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::worker_engine::{
-    database_jobs::{CleanupDatabase, CreateDatabase, DatabaseId},
+    database_jobs::{CleanupDatabase, CreateDatabases, DatabaseId},
     errors::PostgresDDLClientError,
 };
 
@@ -12,6 +12,40 @@ use crate::worker_engine::{
 pub struct Database {
     pub database_id: DatabaseId,
     pub database_name: ReadString,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserves_ranges_without_reusing_cancelled_ids() {
+        let mut inventory = DatabaseInventory::default();
+        assert!(inventory.reserve_creations(0).is_none());
+        let batch = inventory.reserve_creations(3).unwrap();
+        assert_eq!(batch.first_database_id, DatabaseId(1));
+        assert_eq!(inventory.creating.len(), 3);
+        for index in 0..batch.amount {
+            assert!(inventory.cancel_creation(batch.database_id(index)));
+        }
+        let next = inventory.reserve_creations(2).unwrap();
+        assert_eq!(next.first_database_id, DatabaseId(4));
+        assert_eq!(next.database_id(1), DatabaseId(5));
+    }
+
+    #[test]
+    fn overflowing_range_does_not_partially_reserve_ids() {
+        let mut inventory =
+            DatabaseInventory { next_database_id: u64::MAX - 1, ..DatabaseInventory::default() };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inventory.reserve_creations(2);
+        }));
+        assert!(result.is_err());
+        assert!(inventory.creating.is_empty());
+        assert_eq!(inventory.next_database_id, u64::MAX - 1);
+        assert!(inventory.reserve_creations(0).is_none());
+        assert_eq!(inventory.reserve_creations(1).unwrap().first_database_id, DatabaseId(u64::MAX));
+    }
 }
 
 #[derive(Default)]
@@ -24,14 +58,19 @@ pub struct DatabaseInventory {
 }
 
 impl DatabaseInventory {
-    pub fn reserve_creation(&mut self) -> CreateDatabase {
-        self.next_database_id =
-            self.next_database_id.checked_add(1).expect("database identity exhausted");
-
-        let database_id = DatabaseId(self.next_database_id);
-        self.creating.insert(database_id);
-
-        CreateDatabase { database_id }
+    pub fn reserve_creations(&mut self, amount: usize) -> Option<CreateDatabases> {
+        if amount == 0 {
+            return None;
+        }
+        let last = self
+            .next_database_id
+            .checked_add(u64::try_from(amount).expect("database identity exhausted"))
+            .expect("database identity exhausted");
+        let request =
+            CreateDatabases { first_database_id: DatabaseId(self.next_database_id + 1), amount };
+        self.creating.extend((0..amount).map(|index| request.database_id(index)));
+        self.next_database_id = last;
+        Some(request)
     }
 
     /// Release a reservation when its creation request cannot be submitted.

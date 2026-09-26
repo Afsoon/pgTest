@@ -19,7 +19,6 @@ sqlx = { version = "=0.9.0", features = ["postgres", "runtime-tokio"] }
 rand = "0.10.2"
 rustc-hash = "2.1.3"
 tokio-util = { version = "0.7.19", features = ["rt"] }
-tokio-retry2 =  { version = "0.9.1", features = ["jitter", "tracing"] }
 envconfig = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -33,8 +32,8 @@ pgtest-database-operations = { version = "=0.1.0", path = "../pgtest-database-op
 
 [features]
 default = []
-hotpath = ["hotpath/hotpath"]
-hotpath-alloc = ["hotpath/hotpath-alloc"]
-hotpath-prometheus = ["hotpath/hotpath-prometheus"]
+hotpath = ["hotpath/hotpath", "pgtest-database-operations/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "pgtest-database-operations/hotpath-alloc"]
+hotpath-prometheus = ["hotpath", "hotpath/hotpath-prometheus", "pgtest-database-operations/hotpath-prometheus"]
 # Expose configuration defaults to other crates' tests.
 test-support = []

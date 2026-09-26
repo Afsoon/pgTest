@@ -1,10 +1,9 @@
 use std::time::Duration;
 
 use deadpool_postgres::{Client, Config, Pool, PoolConfig, PoolError, Runtime, Timeouts};
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
 use pgtest_utils::read_string::ReadString;
 use tokio_postgres::NoTls;
-use tokio_retry2::RetryError;
 
 use crate::manager::{
     config::PostgresConfig,
@@ -13,8 +12,10 @@ use crate::manager::{
 };
 
 pub mod config;
+mod creation;
 pub mod database_name;
 pub mod errors;
+mod sql_profile;
 
 pub struct PostgresManager {
     pub version: u8,
@@ -22,6 +23,7 @@ pub struct PostgresManager {
     pub port: u16,
     pub template_database_name: PostgresDatabaseName,
     create_pool: Pool,
+    creation_concurrency: usize,
     cleanup_pool: Pool,
 }
 
@@ -80,6 +82,7 @@ impl PostgresManager {
         Ok(Self {
             version,
             create_pool,
+            creation_concurrency: config.pgtest_pg_creation_pool_connection as usize,
             cleanup_pool,
             template_database_name: PostgresDatabaseName::new(config.pgtest_pg_database),
             host: config.pgtest_pg_host,
@@ -123,10 +126,12 @@ impl PostgresManager {
     async fn database_exists(pool: &Pool, database_name: &str) -> Result<(), PostgresClientError> {
         let client =
             pool.get().await.map_err(|_| PostgresClientError::UnableToFetchDatabaseList)?;
-        let rows = client
-            .query("SELECT datname FROM pg_database WHERE datname LIKE $1", &[&database_name])
-            .await
-            .map_err(|_| PostgresClientError::UnableToFetchDatabaseList)?;
+        let rows = sql_profile::query(
+            sql_profile::LIST_DATABASES,
+            client.query(sql_profile::LIST_DATABASES, &[&database_name]),
+        )
+        .await
+        .map_err(|_| PostgresClientError::UnableToFetchDatabaseList)?;
         if rows.is_empty() {
             return Err(PostgresClientError::DatabaseDoesNotExist(database_name.to_owned()));
         }
@@ -136,10 +141,12 @@ impl PostgresManager {
     async fn is_valid_version(pool: &Pool) -> Result<u8, PostgresClientError> {
         let client =
             pool.get().await.map_err(|_| PostgresClientError::UnableToFetchPostgresVersion)?;
-        let row = client
-            .query_one("SELECT current_setting('server_version_num')::int8", &[])
-            .await
-            .map_err(|_| PostgresClientError::UnableToFetchPostgresVersion)?;
+        let row = sql_profile::query(
+            sql_profile::SERVER_VERSION,
+            client.query_one(sql_profile::SERVER_VERSION, &[]),
+        )
+        .await
+        .map_err(|_| PostgresClientError::UnableToFetchPostgresVersion)?;
         let number: i64 =
             row.try_get(0).map_err(|_| PostgresClientError::UnableToFetchPostgresVersion)?;
         let version = u8::try_from(number / 10000)
@@ -153,7 +160,7 @@ impl PostgresManager {
     pub async fn drop_ddl_database(
         &self,
         database_name: &str,
-    ) -> Result<(), RetryError<PostgresOperationsError>> {
+    ) -> Result<(), PostgresOperationsError> {
         let client = self
             .acquire_drop_connection()
             .await
@@ -161,46 +168,84 @@ impl PostgresManager {
         Self::drop_on_connection(&client, database_name).await
     }
 
-    fn drop_error(database_name: &str, error: PoolError) -> RetryError<PostgresOperationsError> {
-        tracing::warn!(database_name, %error, "PostgreSQL DROP DATABASE failed");
-        let error = PostgresOperationsError::classify_drop(database_name.to_owned(), error);
-        match error {
-            error @ PostgresOperationsError::NonTransientError { .. } => {
-                RetryError::Permanent(error)
+    /// Pipeline one attempt for each name through a single cleanup connection.
+    ///
+    /// Reports each result immediately, using its index in `database_names`.
+    /// An outer error means acquiring the connection failed and no drops were
+    /// submitted. Individual failures do not cancel the other drops.
+    pub async fn drop_ddl_databases(
+        &self,
+        database_names: &[&str],
+        mut on_result: impl FnMut(usize, Result<(), PostgresOperationsError>) + Send,
+    ) -> Result<(), PostgresOperationsError> {
+        if database_names.is_empty() {
+            return Ok(());
+        }
+        let client = self
+            .acquire_drop_connection()
+            .await
+            .map_err(|error| Self::drop_error("cleanup batch", error))?;
+        let mut names = database_names.iter().enumerate();
+        let mut drops = FuturesUnordered::new();
+        for (index, name) in names.by_ref().take(CLEANUP_PIPELINE_DEPTH) {
+            drops.push(Self::drop_indexed(&client, index, name));
+        }
+        while let Some((index, result)) = drops.next().await {
+            on_result(index, result);
+            if let Some((index, name)) = names.next() {
+                drops.push(Self::drop_indexed(&client, index, name));
             }
-            error => RetryError::Transient { err: error, retry_after: None },
+        }
+        Ok(())
+    }
+
+    async fn drop_indexed(
+        client: &tokio_postgres::Client,
+        index: usize,
+        database_name: &str,
+    ) -> (usize, Result<(), PostgresOperationsError>) {
+        (index, Self::drop_on_connection(client, database_name).await)
+    }
+
+    fn drop_error(database_name: &str, error: PoolError) -> PostgresOperationsError {
+        tracing::warn!(database_name, %error, "PostgreSQL DROP DATABASE failed");
+        PostgresOperationsError::UnableToDropDatabase {
+            database_name: database_name.to_owned(),
+            source: error,
         }
     }
 
     async fn drop_on_connection(
         client: &tokio_postgres::Client,
         database_name: &str,
-    ) -> Result<(), RetryError<PostgresOperationsError>> {
+    ) -> Result<(), PostgresOperationsError> {
         let quoted = PostgresDatabaseName::quote_ident(database_name);
         let query = format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)");
-        Self::execute_ddl(client, &query)
+        Self::execute_ddl(client, &query, sql_profile::DROP_DATABASE)
             .await
             .map_err(|error| Self::drop_error(database_name, error.into()))?;
         Ok(())
     }
 
-    pub async fn drop_ddl_templates_like(&self) -> Result<(), RetryError<PostgresOperationsError>> {
-        let client = self.acquire_drop_connection().await.map_err(|error| {
-            RetryError::Permanent(PostgresOperationsError::UnableToListDatabases(error))
-        })?;
-        let rows = client
-            .query(
-                "SELECT datname FROM pg_database WHERE datname LIKE $1",
-                &[&format!("{}_%", self.template_database_name.template_name())],
-            )
+    pub async fn drop_ddl_templates_like(&self) -> Result<(), PostgresOperationsError> {
+        let client = self
+            .acquire_drop_connection()
             .await
-            .map_err(|error| {
-                RetryError::Permanent(PostgresOperationsError::UnableToListDatabases(error.into()))
-            })?;
-        let names: Vec<String> =
-            rows.iter().map(|row| row.try_get(0)).collect::<Result<_, _>>().map_err(|error| {
-                RetryError::Permanent(PostgresOperationsError::UnableToListDatabases(error.into()))
-            })?;
+            .map_err(|error| PostgresOperationsError::UnableToListDatabases(error))?;
+        let rows = sql_profile::query(
+            sql_profile::LIST_DATABASES,
+            client.query(
+                sql_profile::LIST_DATABASES,
+                &[&format!("{}_%", self.template_database_name.template_name())],
+            ),
+        )
+        .await
+        .map_err(|error| PostgresOperationsError::UnableToListDatabases(error.into()))?;
+        let names: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get(0))
+            .collect::<Result<_, _>>()
+            .map_err(|error| PostgresOperationsError::UnableToListDatabases(error.into()))?;
 
         for batch in names.chunks(CLEANUP_PIPELINE_DEPTH) {
             let results =
@@ -212,40 +257,65 @@ impl PostgresManager {
         Ok(())
     }
 
-    pub async fn create_ddl_database(
-        &self,
-    ) -> Result<ReadString, RetryError<PostgresOperationsError>> {
+    pub async fn create_ddl_database(&self) -> Result<ReadString, PostgresOperationsError> {
         let database_name = self.template_database_name.generate_database_name();
+        let client = self
+            .acquire_create_connection()
+            .await
+            .map_err(|error| Self::create_error(database_name.clone(), error))?;
+        self.create_on_connection(&client, database_name).await
+    }
+
+    /// Run one creation attempt per index with pool-bounded concurrency.
+    /// Acquisition and execution failures are reported through `on_result`.
+    pub async fn create_ddl_databases(
+        &self,
+        amount: usize,
+        mut on_result: impl FnMut(usize, Result<ReadString, PostgresOperationsError>) + Send,
+    ) {
+        if amount == 0 {
+            return;
+        }
+        creation::run_bounded(
+            amount,
+            self.creation_concurrency,
+            |_| self.create_ddl_database(),
+            &mut on_result,
+        )
+        .await;
+    }
+
+    fn create_error(database_name: String, error: PoolError) -> PostgresOperationsError {
+        PostgresOperationsError::UnableToCreateDatabase { database_name, source: error }
+    }
+
+    async fn create_on_connection(
+        &self,
+        client: &tokio_postgres::Client,
+        database_name: String,
+    ) -> Result<ReadString, PostgresOperationsError> {
         let quoted_database = PostgresDatabaseName::quote_ident(&database_name);
         let quoted_template =
             PostgresDatabaseName::quote_ident(self.template_database_name.template_name());
         let mut query = format!("CREATE DATABASE {quoted_database} TEMPLATE {quoted_template}");
-        if self.version >= 15 {
+        let statement = if self.version >= 15 {
             query.push_str(" STRATEGY=FILE_COPY");
-        }
-        let result: Result<(), PoolError> = async {
-            let client = self.acquire_create_connection().await?;
-            Self::execute_ddl(&client, &query).await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|error| {
-            let error = PostgresOperationsError::classify_create(database_name.clone(), error);
-            match error {
-                error @ PostgresOperationsError::NonTransientError { .. } => {
-                    RetryError::Permanent(error)
-                }
-                error => RetryError::Transient { err: error, retry_after: None },
-            }
-        })?;
+            sql_profile::CREATE_DATABASE_FILE_COPY
+        } else {
+            sql_profile::CREATE_DATABASE
+        };
+        Self::execute_ddl(client, &query, statement)
+            .await
+            .map_err(|error| Self::create_error(database_name.clone(), error.into()))?;
         Ok(ReadString::from(database_name))
     }
 
     async fn execute_ddl(
         client: &tokio_postgres::Client,
         query: &str,
+        statement: &str,
     ) -> Result<(), tokio_postgres::Error> {
-        client.execute_typed(query, &[]).await?;
+        sql_profile::query(statement, client.execute_typed(query, &[])).await?;
         Ok(())
     }
 
@@ -337,7 +407,7 @@ mod postgres_manager_test {
         manager.drop_ddl_database(&database_name).await.unwrap();
         println!("Drop time {:.2?}", now_drop.elapsed());
 
-        // A cleanup retry may follow a lost response to a successful DROP.
+        // Dropping an already absent database remains idempotent.
         manager.drop_ddl_database(&database_name).await.unwrap();
     }
 
@@ -382,7 +452,7 @@ mod postgres_manager_test {
             })
             .collect();
         for result in futures_util::future::join_all(
-            queries.iter().map(|sql| PostgresManager::execute_ddl(&client, sql)),
+            queries.iter().map(|sql| PostgresManager::execute_ddl(&client, sql, sql)),
         )
         .await
         {
@@ -413,7 +483,7 @@ mod postgres_manager_test {
         let database = manager.create_ddl_database().await.unwrap();
         let client = manager.acquire_drop_connection().await.unwrap();
         let (failure, success) = tokio::join!(
-            PostgresManager::execute_ddl(&client, "SELECT 1 / 0"),
+            PostgresManager::execute_ddl(&client, "SELECT 1 / 0", "SELECT 1 / 0"),
             PostgresManager::drop_on_connection(&client, &database),
         );
         assert_eq!(failure.unwrap_err().code().unwrap().code(), "22012");
@@ -422,38 +492,195 @@ mod postgres_manager_test {
     }
 
     #[tokio::test]
-    async fn driver_errors_and_closed_pools_keep_retry_classification() {
-        use tokio_retry2::RetryError;
+    async fn cleanup_batch_reports_every_result_and_drains_failures_on_one_connection() {
+        let manager = PostgresManager::start(PostgresConfig {
+            pgtest_pg_cleanup_pool_connection: 1,
+            ..pg_container_config().await
+        })
+        .await
+        .unwrap();
+        let client = manager.acquire_create_connection().await.unwrap();
+        let names: Vec<_> = (0..=super::CLEANUP_PIPELINE_DEPTH)
+            .map(|index| {
+                format!("{}_Batch \"{index}", manager.template_database_name.template_name())
+            })
+            .collect();
+        for name in &names {
+            PostgresManager::execute_ddl(
+                &client,
+                &format!("CREATE DATABASE {}", super::PostgresDatabaseName::quote_ident(name)),
+                "CREATE DATABASE \"<database>\"",
+            )
+            .await
+            .unwrap();
+        }
+        // Both errors are safe: PostgreSQL refuses to drop a template database
+        // or the database to which this cleanup connection is connected.
+        let mut batch = vec!["template0", "postgres"];
+        batch.extend(names.iter().map(String::as_str));
+        let mut results = std::collections::BTreeMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            manager.drop_ddl_databases(&batch, |index, result| {
+                assert!(results.insert(index, result).is_none(), "duplicate result");
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(results.len(), batch.len());
+        assert!(matches!(
+            results.remove(&0).unwrap(),
+            Err(super::errors::PostgresOperationsError::UnableToDropDatabase { .. })
+        ));
+        assert!(matches!(
+            results.remove(&1).unwrap(),
+            Err(super::errors::PostgresOperationsError::UnableToDropDatabase { .. })
+        ));
+        assert!(results.into_values().all(|result| result.is_ok()));
+        let cleanup = manager.acquire_drop_connection().await.unwrap();
+        let row = cleanup
+            .query_one("SELECT count(*) FROM pg_database WHERE datname::text = ANY($1)", &[&names])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), 0);
+        drop(cleanup);
 
+        manager.cleanup_pool.close();
+        manager
+            .drop_ddl_databases(&[], |_, _| panic!("empty batch must not report results"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.drop_ddl_databases(&["unused"], |_, _| panic!("no drops were submitted")).await,
+            Err(super::errors::PostgresOperationsError::UnableToDropDatabase { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_pools_report_operation_errors() {
         use super::errors::PostgresOperationsError;
 
         let manager = PostgresManager::start(pg_container_config().await).await.unwrap();
-        let client = manager.acquire_create_connection().await.unwrap();
-        for (code, transient) in [("55006", true), ("42501", false), ("42P04", false)] {
-            let error = client
-                .batch_execute(&format!(
-                    "DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '{code}', MESSAGE = 'test'; END \
-                     $$"
-                ))
-                .await
-                .unwrap_err();
-            let classified = PostgresOperationsError::classify_create("db".into(), error.into());
-            assert_eq!(
-                matches!(classified, PostgresOperationsError::UnableToCreateDatabase { .. }),
-                transient
-            );
-        }
-        drop(client);
         manager.create_pool.close();
         manager.cleanup_pool.close();
         assert!(matches!(
             manager.create_ddl_database().await,
-            Err(RetryError::Permanent(PostgresOperationsError::NonTransientError { .. }))
+            Err(PostgresOperationsError::UnableToCreateDatabase {
+                source: deadpool_postgres::PoolError::Closed,
+                ..
+            })
         ));
         assert!(matches!(
             manager.drop_ddl_database("db").await,
-            Err(RetryError::Permanent(PostgresOperationsError::NonTransientError { .. }))
+            Err(PostgresOperationsError::UnableToDropDatabase {
+                source: deadpool_postgres::PoolError::Closed,
+                ..
+            })
         ));
         assert!(manager.drop_ddl_templates_like().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_creation_with_one_connection_and_quoted_names_recovers_from_errors() {
+        let mut manager = PostgresManager::start(PostgresConfig {
+            pgtest_pg_creation_pool_connection: 1,
+            ..pg_container_config().await
+        })
+        .await
+        .unwrap();
+        let template = format!("{}_\"Template", manager.template_database_name.template_name());
+        let client = manager.acquire_create_connection().await.unwrap();
+        client
+            .execute_typed(
+                &format!("CREATE DATABASE {}", super::PostgresDatabaseName::quote_ident(&template)),
+                &[],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        manager.template_database_name = super::PostgresDatabaseName::new(template.clone());
+        let mut created = std::collections::BTreeMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            manager.create_ddl_databases(33, |index, result| {
+                assert!(created.insert(index, result.unwrap()).is_none());
+                assert_eq!(manager.create_pool.status().available, 1, "release before callback");
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.keys().copied().collect::<Vec<_>>(), (0..33).collect::<Vec<_>>());
+        let names: Vec<String> = created.values().map(ToString::to_string).collect();
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), names.len());
+        let client = manager.acquire_create_connection().await.unwrap();
+        let count = client
+            .query_one("SELECT count(*) FROM pg_database WHERE datname::text = ANY($1)", &[&names])
+            .await
+            .unwrap();
+        assert_eq!(count.get::<_, i64>(0), names.len() as i64);
+        let extra = manager.template_database_name.generate_database_name();
+        let (failure, success) = tokio::join!(
+            manager.create_on_connection(&client, names[0].clone()),
+            manager.create_on_connection(&client, extra),
+        );
+        assert!(matches!(
+            failure,
+            Err(super::errors::PostgresOperationsError::UnableToCreateDatabase { .. })
+        ));
+        success.expect("failed CREATE must not skip the next request's Sync boundary");
+        drop(client);
+        manager.drop_ddl_templates_like().await.unwrap();
+        manager.drop_ddl_database(&template).await.unwrap();
+
+        manager.create_pool.close();
+        manager.create_ddl_databases(0, |_, _| panic!("zero amount must not execute")).await;
+        let mut failed = Vec::new();
+        manager
+            .create_ddl_databases(3, |index, result| {
+                assert!(matches!(
+                    result,
+                    Err(super::errors::PostgresOperationsError::UnableToCreateDatabase { .. })
+                ));
+                failed.push(index);
+            })
+            .await;
+        failed.sort_unstable();
+        assert_eq!(failed, [0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn overlapping_creation_batches_and_single_create_share_pool_capacity() {
+        let manager = PostgresManager::start(PostgresConfig {
+            pgtest_pg_creation_pool_connection: 2,
+            ..pg_container_config().await
+        })
+        .await
+        .unwrap();
+        let mut first = std::collections::BTreeMap::new();
+        let mut second = std::collections::BTreeMap::new();
+        let ((), (), single) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                manager.create_ddl_databases(7, |index, result| {
+                    assert!(first.insert(index, result.unwrap()).is_none());
+                    assert!(manager.create_pool.status().size <= 2);
+                }),
+                manager.create_ddl_databases(8, |index, result| {
+                    assert!(second.insert(index, result.unwrap()).is_none());
+                    assert!(manager.create_pool.status().size <= 2);
+                }),
+                manager.create_ddl_database(),
+            )
+        })
+        .await
+        .expect("overlapping batches must drain without holding connections while waiting");
+        let single = single.unwrap();
+        assert_eq!(first.keys().copied().collect::<Vec<_>>(), (0..7).collect::<Vec<_>>());
+        assert_eq!(second.keys().copied().collect::<Vec<_>>(), (0..8).collect::<Vec<_>>());
+        let names: std::collections::HashSet<_> =
+            first.values().chain(second.values()).chain([&single]).collect();
+        assert_eq!(names.len(), 16);
+        assert_eq!(manager.create_pool.status().size, 2);
+        manager.drop_ddl_templates_like().await.unwrap();
     }
 }

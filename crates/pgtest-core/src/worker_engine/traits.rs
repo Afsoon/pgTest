@@ -2,7 +2,7 @@ use pgtest_utils::read_string::ReadString;
 use tokio_util::sync::CancellationToken;
 
 use crate::worker_engine::{
-    database_jobs::{CleanupDatabase, CreateDatabase},
+    database_jobs::{CleanupDatabase, CreateDatabases},
     errors::{IOError, PostgresDDLClientError},
     messages::{ConsumerReply, EngineMessage},
 };
@@ -12,7 +12,7 @@ pub trait ConsumerIO: Send + 'static {
 }
 
 pub trait EngineIO<C: ConsumerIO> {
-    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError>;
+    fn request_creation(&self, request: CreateDatabases) -> Result<(), IOError>;
     fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError>;
 
     fn send_delayed_message(
@@ -29,6 +29,13 @@ pub trait EngineInbox<C: ConsumerIO> {
 }
 
 pub trait PostgresClient {
+    /// Report one final result per index in `0..amount`; cancellation stops
+    /// delivery.
+    fn create_databases(
+        &self,
+        amount: usize,
+        on_finished: impl FnMut(usize, Result<ReadString, PostgresDDLClientError>) + Send,
+    ) -> impl Future<Output = ()> + Send;
     fn create_database(
         &self,
     ) -> impl Future<Output = Result<ReadString, PostgresDDLClientError>> + Send;
@@ -36,7 +43,11 @@ pub trait PostgresClient {
         &self,
         database_name: &str,
     ) -> impl Future<Output = Result<(), PostgresDDLClientError>> + Send;
-    fn drop_templates_like(
+    /// Report exactly one final result per input index, as each drop finishes.
+    /// Cancelling the returned future cancels delivery of remaining results.
+    fn drop_databases(
         &self,
-    ) -> impl Future<Output = Result<(), PostgresDDLClientError>> + Send;
+        database_names: &[ReadString],
+        on_finished: impl FnMut(usize, Result<(), PostgresDDLClientError>) + Send,
+    ) -> impl Future<Output = ()> + Send;
 }

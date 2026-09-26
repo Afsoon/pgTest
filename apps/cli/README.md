@@ -80,6 +80,9 @@ Pool connection counts and maximum lease records must be greater than zero.
 Profiling is off by default. Build with `--features hotpath` to enable it;
 `hotpath-alloc` and `hotpath-prometheus` are also available alongside `hotpath`.
 Hotpath's own environment controls, such as `HOTPATH_OUTPUT_FORMAT=json`, still apply.
+The SQL report includes `tokio-postgres` query timings, with generated database
+names grouped under stable CREATE/DROP labels. Pool waits are measured separately
+by the database manager's acquisition functions.
 
 ## Shell completion
 

@@ -114,25 +114,29 @@ where
 
     #[hotpath::measure]
     pub async fn try_init(&mut self) -> Result<(), PostgresDDLClientError> {
-        for _ in 0..self.config.initial_slots {
-            let request = self.inventory.reserve_creation();
-            let database_id = request.database_id;
-
-            let result = self.pg_client.create_database().await;
-
-            if let Ok(database_name) = &result {
-                tracing::info!(?database_id, %database_name, "created initial database");
-            }
-            if let Err(error) = self
-                .inventory
-                .complete_creation(database_id, result)
-                .expect("initial creation must have a pending reservation")
-            {
-                tracing::error!(?database_id, %error, "initial database creation failed");
-                return Err(error);
-            }
-        }
-        Ok(())
+        let Some(request) =
+            self.inventory.reserve_creations(usize::from(self.config.initial_slots))
+        else {
+            return Ok(());
+        };
+        let mut first_error = None;
+        let inventory = &mut self.inventory;
+        self.pg_client
+            .create_databases(request.amount, |index, result| {
+                let database_id = request.database_id(index);
+                if let Ok(database_name) = &result {
+                    tracing::info!(?database_id, %database_name, "created initial database");
+                }
+                if let Err(error) = inventory
+                    .complete_creation(database_id, result)
+                    .expect("initial creation must have a pending reservation")
+                {
+                    tracing::error!(?database_id, %error, "initial database creation failed");
+                    first_error.get_or_insert(error);
+                }
+            })
+            .await;
+        first_error.map_or(Ok(()), Err)
     }
 
     #[hotpath::measure]
@@ -431,22 +435,14 @@ where
 
         let count = deficit.div_ceil(batch_size) * batch_size;
 
-        for _ in 0..count {
-            let request = self.inventory.reserve_creation();
-            let database_id = request.database_id;
-
-            if let Err(error) = self.engine_io.request_creation(request) {
-                self.inventory.cancel_creation(database_id);
-                self.counters.unable_to_start_database_slots += 1;
-
-                tracing::error!(
-                    ?database_id,
-                    %error,
-                    "unable to enqueue database creation"
-                );
-
-                return;
+        let request = self.inventory.reserve_creations(count).expect("growth count is nonzero");
+        if let Err(error) = self.engine_io.request_creation(request) {
+            for index in 0..request.amount {
+                self.inventory.cancel_creation(request.database_id(index));
             }
+            self.counters.unable_to_start_database_slots +=
+                u64::try_from(count).expect("creation count fits database identity");
+            tracing::error!(?request, %error, "unable to enqueue database creation batch");
         }
     }
 

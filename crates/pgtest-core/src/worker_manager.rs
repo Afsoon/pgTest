@@ -202,7 +202,7 @@ mod worker_engine_manager_test {
     use crate::{
         worker_engine::{
             core::{LeaseId, WorkerEngineConfig},
-            database_jobs::{CleanupDatabase, CreateDatabase},
+            database_jobs::{CleanupDatabase, CreateDatabases},
             messages::EngineMessage,
             traits::{EngineIO, PostgresClient},
         },
@@ -238,23 +238,28 @@ mod worker_engine_manager_test {
     // results so timeout and cancellation tests do not depend on database
     // creation speed.
     struct DeferredWorkers {
-        creation_rx: UnboundedReceiver<CreateDatabase>,
+        creation_rx: UnboundedReceiver<CreateDatabases>,
         _cleanup_rx: UnboundedReceiver<CleanupDatabase>,
+        pending: std::collections::VecDeque<crate::worker_engine::database_jobs::DatabaseId>,
     }
 
     impl DeferredWorkers {
         async fn complete_creation(&mut self, manager: &WorkerEngineManager) -> ReadString {
-            let request = tokio::time::timeout(Duration::from_secs(5), self.creation_rx.recv())
-                .await
-                .expect("creation must be queued")
-                .expect("creation channel must be open");
+            if self.pending.is_empty() {
+                let request = tokio::time::timeout(Duration::from_secs(5), self.creation_rx.recv())
+                    .await
+                    .expect("creation must be queued")
+                    .expect("creation channel must be open");
+                self.pending.extend((0..request.amount).map(|index| request.database_id(index)));
+            }
+            let database_id = self.pending.pop_front().expect("creation batch must be nonempty");
             let database_name =
                 manager.pg_client.create_database().await.expect("test database must be created");
             manager
                 .worker_inbox_tx
                 .send(EngineMessage::DatabaseWorker(
                     crate::worker_engine::database_jobs::DatabaseWorkerMessages::CreationFinished {
-                        database_id: request.database_id,
+                        database_id,
                         result: Ok(database_name.clone()),
                     },
                 ))
@@ -308,7 +313,10 @@ mod worker_engine_manager_test {
             tracker,
             shutdown_token,
         };
-        (manager, DeferredWorkers { creation_rx, _cleanup_rx: cleanup_rx })
+        (
+            manager,
+            DeferredWorkers { creation_rx, _cleanup_rx: cleanup_rx, pending: Default::default() },
+        )
     }
 
     async fn enqueue_attach<F: Future>(manager: &WorkerEngineManager, mut attach: Pin<&mut F>) {
@@ -323,6 +331,29 @@ mod worker_engine_manager_test {
     #[tokio::test]
     async fn immediate_available_templates() {
         start_manager(WorkerEngineConfig::default()).await.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_prefills_a_large_batch_on_one_connection() {
+        let manager = WorkerEngineManager::start(
+            PostgresConfig { pgtest_pg_creation_pool_connection: 1, ..pg_container_config().await },
+            WorkerEngineConfig { initial_slots: 33, ..WorkerEngineConfig::default() },
+        )
+        .await
+        .unwrap();
+        let engine = manager.drain_and_snapshot().await;
+        assert_eq!(engine.inventory.ready().len(), 33);
+        assert!(engine.inventory.creating().is_empty());
+        assert_eq!(
+            engine
+                .inventory
+                .ready()
+                .iter()
+                .map(|db| db.database_id)
+                .collect::<rustc_hash::FxHashSet<_>>()
+                .len(),
+            33
+        );
     }
 
     #[tokio::test]

@@ -404,7 +404,7 @@ mod grow_test {
                 grow_batch_size: 2,
                 ..WorkerEngineConfig::default()
             },
-            vec![Ok(()), Ok(())],
+            vec![Ok(())],
         )
         .await;
         assert_eq!(
@@ -424,7 +424,7 @@ mod grow_test {
                 grow_batch_size: 4,
                 ..WorkerEngineConfig::default()
             },
-            vec![Ok(()), Ok(()), Ok(()), Ok(())],
+            vec![Ok(())],
         )
         .await;
         assert_eq!(worker.inventory.ready().len(), 7);

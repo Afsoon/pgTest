@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     core::{LeaseId, WorkerEngine, WorkerEngineConfig},
-    database_jobs::{CleanupDatabase, CreateDatabase, DatabaseId, DatabaseWorkerMessages},
+    database_jobs::{CleanupDatabase, CreateDatabases, DatabaseId, DatabaseWorkerMessages},
     errors::{AttachError, IOError, PostgresDDLClientError, ReleaseError},
     messages::{ConsumerReply, EngineMessage},
     test_support::{ConsumerWorker, PostgresConnection, WorkerInboxImpl, past_instant},
@@ -25,6 +25,7 @@ type Engine = WorkerEngine<ConsumerWorker, DeferredIO, WorkerInboxImpl, Postgres
 struct Operations {
     // Histories include attempts whose submission was rejected.
     creates: Vec<DatabaseId>,
+    creation_batches: Vec<CreateDatabases>,
     cleanups: Vec<CleanupDatabase>,
     timers: Vec<(EngineMessage<ConsumerWorker>, CancellationToken)>,
     create_results: VecDeque<Result<(), IOError>>,
@@ -40,9 +41,10 @@ struct DeferredIO {
 }
 
 impl EngineIO<ConsumerWorker> for DeferredIO {
-    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
+    fn request_creation(&self, request: CreateDatabases) -> Result<(), IOError> {
         let mut operations = self.operations.lock().unwrap();
-        operations.creates.push(request.database_id);
+        operations.creates.extend((0..request.amount).map(|index| request.database_id(index)));
+        operations.creation_batches.push(request);
         operations.create_results.pop_front().unwrap_or(Ok(()))
     }
 
@@ -477,6 +479,10 @@ async fn covered_burst_does_not_schedule_redundant_batches() {
     fixture.process(vec![fixture.attach("holder"), fixture.attach("a"), fixture.attach("b")]).await;
     assert_eq!(fixture.engine.inventory.creating().len(), 4);
     assert_eq!(fixture.creation_ids(), (2..=5).map(DatabaseId).collect::<Vec<_>>());
+    let batches = &fixture.io.operations.lock().unwrap().creation_batches;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].first_database_id, DatabaseId(2));
+    assert_eq!(batches[0].amount, 4);
     assert!(fixture.engine.inventory.ready().is_empty());
     assert_eq!(fixture.consumer.messages().len(), 1);
 }
@@ -601,7 +607,7 @@ async fn failed_creation_keeps_waiter_and_replenishes_without_reusing_failed_ids
 }
 
 fn creation_failure() -> PostgresDDLClientError {
-    PostgresDDLClientError::NonRecoverableError("injected creation failure".into())
+    PostgresDDLClientError::OperationFailed("injected creation failure".into())
 }
 
 #[tokio::test]
@@ -715,17 +721,17 @@ async fn failed_creation_submission_releases_reservation_without_retrying_inline
     fixture.process(vec![fixture.attach("a")]).await;
     let rejected_id = fixture.creation_ids()[0];
     assert!(fixture.engine.inventory.creating().is_empty());
-    assert_eq!(fixture.creation_ids().len(), 1);
-    assert_eq!(fixture.engine.counters.unable_to_start_database_slots, 1);
+    assert_eq!(fixture.creation_ids().len(), 2);
+    assert_eq!(fixture.engine.counters.unable_to_start_database_slots, 2);
     assert_eq!(fixture.engine.waiters.len(), 1);
 
     fixture.process(vec![fixture.attach("a")]).await;
     let ids = fixture.creation_ids();
-    assert_eq!(ids.len(), 3);
-    assert!(ids[1].0 > rejected_id.0);
-    fixture.finish_creation(ids[1], Ok(ReadString::from("recovered"))).await;
+    assert_eq!(ids.len(), 4);
+    assert!(ids[2].0 > rejected_id.0);
+    fixture.finish_creation(ids[2], Ok(ReadString::from("recovered"))).await;
     assert_eq!(fixture.engine.leases["a"].conns, 2);
-    assert_eq!(fixture.engine.leases["a"].database.database_id, ids[1]);
+    assert_eq!(fixture.engine.leases["a"].database.database_id, ids[2]);
 }
 
 #[tokio::test]
@@ -747,11 +753,11 @@ async fn repeated_submission_failure_does_not_loop_or_accumulate_reservations() 
     for expected in 1..=3 {
         fixture.process(vec![fixture.attach("a")]).await;
         assert!(fixture.engine.inventory.creating().is_empty());
-        assert_eq!(fixture.creation_ids().len(), expected);
+        assert_eq!(fixture.creation_ids().len(), expected * 2);
         assert_eq!(fixture.engine.waiters.len(), 1);
     }
-    assert_eq!(fixture.engine.counters.unable_to_start_database_slots, 3);
-    assert_eq!(fixture.creation_ids(), vec![DatabaseId(1), DatabaseId(2), DatabaseId(3)]);
+    assert_eq!(fixture.engine.counters.unable_to_start_database_slots, 6);
+    assert_eq!(fixture.creation_ids(), (1..=6).map(DatabaseId).collect::<Vec<_>>());
     assert!(fixture.consumer.messages().is_empty());
 }
 
@@ -792,7 +798,7 @@ async fn duplicate_creation_completions_cannot_restore_an_assigned_database() {
     fixture
         .finish_creation(
             database_id,
-            Err(PostgresDDLClientError::NonRecoverableError("stale failure".into())),
+            Err(PostgresDDLClientError::OperationFailed("stale failure".into())),
         )
         .await;
 
@@ -856,9 +862,7 @@ async fn cleanup_failure_retains_database_identity_without_blocking_creation() {
             fixture
                 .finish_cleanup(
                     old.database_id,
-                    Err(PostgresDDLClientError::NonRecoverableError(
-                        "injected drop failure".into(),
-                    )),
+                    Err(PostgresDDLClientError::OperationFailed("injected drop failure".into())),
                 )
                 .await;
         }
