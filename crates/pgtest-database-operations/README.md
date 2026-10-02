@@ -12,10 +12,11 @@ emit a completion event.
 
 DDL labels replace database and template identifiers with placeholders to group
 leases into stable query buckets. Bound parameter values are not recorded.
-The adapter emits `sqlx::query` completion events with `db.driver=tokio-postgres`
-for Hotpath 0.25's `sqlx_tracing_layer`; this does not use the SQLx driver. The
-CLI and server already install that collector with console filtering kept
-separate. With profiling disabled, the adapter does not read the clock or emit
+The crate exposes `sql_tracing_layer` for the CLI, server, and profiling tests.
+Hotpath 0.25 requires the `sqlx` feature and `sqlx::query` event target for this
+collector. These compatibility names do not pull in the SQLx driver; operations
+use tokio-postgres, and events identify it with `db.driver=tokio-postgres`.
+Console filtering remains separate from the collector. With profiling disabled, the adapter does not read the clock or emit
 events.
 Profiling builds box each driver future to keep the startup stack bounded; that
 allocation is visible in allocation profiles. Builds without profiling return

@@ -15,7 +15,7 @@ async fn tokio_postgres_queries_reach_the_sql_report_with_console_logging_disabl
         .build();
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::new("off")))
-        .with(hotpath::sqlx_tracing_layer())
+        .with(pgtest_database_operations::sql_tracing_layer())
         .init();
 
     let manager = PostgresManager::start(pg_container_config().await).await.unwrap();

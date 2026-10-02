@@ -3,7 +3,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::*;
 use crate::worker_engine::{
-    database_jobs::{CleanupDatabase, CreateDatabase, DatabaseId, DatabaseWorkerMessages},
+    database_jobs::{CleanupDatabase, CreateDatabases, DatabaseId, DatabaseWorkerMessages},
     errors::{IOError, PostgresDDLClientError},
     traits::{EngineIO, PostgresClient},
 };
@@ -34,8 +34,35 @@ impl PostgresClient for ControlledPostgres {
         result.await.expect("test must finish or cancel every drop")
     }
 
-    async fn drop_templates_like(&self) -> DropResult {
-        unreachable!("workers do not run the startup sweep")
+    async fn create_databases(
+        &self,
+        amount: usize,
+        mut on_finished: impl FnMut(usize, CreateResult) + Send,
+    ) {
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+
+        let mut pending: FuturesUnordered<_> =
+            (0..amount).map(|index| async move { (index, self.create_database().await) }).collect();
+        while let Some((index, result)) = pending.next().await {
+            on_finished(index, result);
+        }
+    }
+
+    async fn drop_databases(
+        &self,
+        names: &[ReadString],
+        mut on_finished: impl FnMut(usize, DropResult) + Send,
+    ) {
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+
+        let mut pending: FuturesUnordered<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| async move { (index, self.drop_database(name).await) })
+            .collect();
+        while let Some((index, result)) = pending.next().await {
+            on_finished(index, result);
+        }
     }
 }
 
@@ -82,7 +109,7 @@ impl Fixture {
             .as_ref()
             .unwrap()
             .creation_tx
-            .send(CreateDatabase { database_id: DatabaseId(id) })
+            .send(CreateDatabases { first_database_id: DatabaseId(id), amount: 1 })
             .unwrap();
     }
 
@@ -233,12 +260,12 @@ async fn ddl_failures_are_reported_and_workers_accept_later_jobs() {
     fixture
         .next_creation()
         .await
-        .send(Err(PostgresDDLClientError::NonRecoverableError("create failed".into())))
+        .send(Err(PostgresDDLClientError::OperationFailed("create failed".into())))
         .unwrap();
     assert!(matches!(fixture.next_result().await,
         DatabaseWorkerMessages::CreationFinished {
             database_id: DatabaseId(1),
-            result: Err(PostgresDDLClientError::NonRecoverableError(reason)),
+            result: Err(PostgresDDLClientError::OperationFailed(reason)),
         } if reason == "create failed"));
 
     fixture.cleanup(2, "retired");
@@ -246,19 +273,13 @@ async fn ddl_failures_are_reported_and_workers_accept_later_jobs() {
         .next_drop()
         .await
         .finish
-        .send(Err(PostgresDDLClientError::OperationNotExecutedAfterCertainRetries {
-            operation: "drop retired".into(),
-            retries: 3,
-        }))
+        .send(Err(PostgresDDLClientError::OperationFailed("drop retired".into())))
         .unwrap();
     assert!(matches!(
         fixture.next_result().await,
         DatabaseWorkerMessages::CleanupFinished {
             database_id: DatabaseId(2),
-            result: Err(PostgresDDLClientError::OperationNotExecutedAfterCertainRetries {
-                retries: 3,
-                ..
-            }),
+            result: Err(PostgresDDLClientError::OperationFailed(_)),
         }
     ));
 
@@ -342,7 +363,7 @@ async fn closing_one_worker_queue_does_not_close_the_other() {
     let io = WorkerEngineIO::new(engine_tx, TaskTracker::new(), CancellationToken::new(), senders);
     drop(creation_rx);
     assert!(matches!(
-        io.request_creation(CreateDatabase { database_id: DatabaseId(1) }),
+        io.request_creation(CreateDatabases { first_database_id: DatabaseId(1), amount: 1 }),
         Err(IOError::FailedToSendTheMessage)
     ));
     io.request_cleanup(CleanupDatabase {
@@ -388,4 +409,41 @@ async fn startup_preserves_postgres_configuration_errors() {
             )
         ))
     ));
+}
+
+#[tokio::test]
+async fn creation_batch_maps_out_of_order_results_to_reserved_ids() {
+    let mut fixture = Fixture::new();
+    fixture
+        .senders
+        .as_ref()
+        .unwrap()
+        .creation_tx
+        .send(CreateDatabases { first_database_id: DatabaseId(40), amount: 3 })
+        .unwrap();
+    let first = fixture.next_creation().await;
+    let second = fixture.next_creation().await;
+    let third = fixture.next_creation().await;
+
+    second.send(Err(PostgresDDLClientError::OperationFailed("create failed".into()))).unwrap();
+    assert!(matches!(
+        fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished {
+            database_id: DatabaseId(41),
+            result: Err(PostgresDDLClientError::OperationFailed(_)),
+        }
+    ));
+    third.send(Ok(ReadString::from("third"))).unwrap();
+    assert!(matches!(fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished {
+            database_id: DatabaseId(42), result: Ok(name),
+        } if name.as_ref() == "third"));
+    first.send(Ok(ReadString::from("first"))).unwrap();
+    assert!(matches!(fixture.next_result().await,
+        DatabaseWorkerMessages::CreationFinished {
+            database_id: DatabaseId(40), result: Ok(name),
+        } if name.as_ref() == "first"));
+    fixture.finish().await;
+    assert!(fixture.creates.try_recv().is_err());
+    assert!(fixture.results.recv().await.is_none());
 }

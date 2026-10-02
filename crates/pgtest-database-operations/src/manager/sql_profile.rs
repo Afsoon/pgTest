@@ -1,8 +1,8 @@
 //! Bridge tokio-postgres completions to Hotpath's SQL collector.
 //!
-//! Hotpath 0.25 exposes its SQL collector through `sqlx_tracing_layer`, which
-//! consumes tracing events without depending on SQLx. Use its event schema
-//! until Hotpath exposes a driver-independent SQL recording API.
+//! The collector re-exported as `sql_tracing_layer` consumes completion events.
+//! Keep its required target and fields here; no database driver adapter is
+//! needed in the applications.
 
 pub(super) const LIST_DATABASES: &str = "SELECT datname FROM pg_database WHERE datname LIKE $1";
 pub(super) const SERVER_VERSION: &str = "SELECT current_setting('server_version_num')::int8";

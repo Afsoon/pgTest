@@ -373,15 +373,16 @@ mod worker_engine_manager_test {
     #[tokio::test]
     async fn startup_cleanup_is_isolated_between_test_managers() {
         use pgtest_database_operations::manager::PostgresManager;
-        use sqlx::{Connection, PgConnection, postgres::PgConnectOptions};
+        use tokio_postgres::{Config, NoTls};
 
         let first_config = pg_container_config().await;
-        let options = PgConnectOptions::new()
+        let mut options = Config::new();
+        options
             .host(&first_config.pgtest_pg_host)
             .port(first_config.pgtest_pg_port)
-            .username(&first_config.pgtest_pg_user)
+            .user(&first_config.pgtest_pg_user)
             .password("postgres")
-            .database("postgres");
+            .dbname("postgres");
         let first = WorkerEngineManager::start(first_config, no_growth_config(1)).await.unwrap();
         let session = first
             .attach(
@@ -407,12 +408,17 @@ mod worker_engine_manager_test {
         // Run startup cleanup after the first manager has assigned a database,
         // making the destructive interleaving deterministic.
         let second = WorkerEngineManager::start(second_config, no_growth_config(0)).await.unwrap();
-        let mut connection = PgConnection::connect_with(&options).await.unwrap();
-        let databases: Vec<String> = sqlx::query_scalar("SELECT datname FROM pg_database")
-            .fetch_all(&mut connection)
+        let (client, connection) = options.connect(NoTls).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let databases: Vec<String> = client
+            .query("SELECT datname FROM pg_database", &[])
             .await
-            .unwrap();
-        connection.close().await.unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        drop(client);
+        connection.await.unwrap().unwrap();
         first.shutdown().await;
         second.shutdown().await;
 
