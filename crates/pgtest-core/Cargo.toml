@@ -22,14 +22,14 @@ envconfig = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-pgtest-utils = { version = "=0.1.0", path = "../pgtest-utils"}
-pgtest-database-operations = { version = "=0.1.0", path = "../pgtest-database-operations"}
+pgtest-utils = { version = "=0.2.0", path = "../pgtest-utils"}
+pgtest-database-operations = { version = "=0.2.0", path = "../pgtest-database-operations"}
 
 [dev-dependencies]
 tokio-postgres = "0.7.18"
 futures-util = "0.3.34"
 tokio = { workspace = true, features = ["test-util"] }
-pgtest-database-operations = { version = "=0.1.0", path = "../pgtest-database-operations", features = ["test-support"]}
+pgtest-database-operations = { version = "=0.2.0", path = "../pgtest-database-operations", features = ["test-support"]}
 
 [features]
 default = []

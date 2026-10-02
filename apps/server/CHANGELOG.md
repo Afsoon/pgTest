@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/Afsoon/pgTest/compare/server-v0.1.0...server-v0.2.0) - 2026-10-02
+
+### Added
+
+- *(engine)* Database creation executed in batch instead of sequentially. ([#11](https://github.com/Afsoon/pgTest/pull/11))
+- *(postgres)* Migrated from SQLx to Tokyo-postgres ([#10](https://github.com/Afsoon/pgTest/pull/10))
+
 ## [0.1.0](https://github.com/Afsoon/pgTest/releases/tag/server-v0.1.0) - 2026-09-22
 
 ### Added
