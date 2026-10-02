@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::worker_engine::{
     core::{EngineCounters, LeaseEntry, LeaseId, WorkerEngine, WorkerEngineConfig},
     database_inventory::DatabaseInventory,
-    database_jobs::{CleanupDatabase, CreateDatabase, DatabaseWorkerMessages},
+    database_jobs::{CleanupDatabase, CreateDatabases, DatabaseWorkerMessages},
     errors::{IOError, PostgresDDLClientError},
     messages::{ConsumerReply, EngineMessage},
     traits::{ConsumerIO, EngineIO, EngineInbox, PostgresClient},
@@ -89,19 +89,24 @@ impl<'a> WorkerEngineIO<'a> {
 }
 
 impl<'a> EngineIO<ConsumerWorker> for WorkerEngineIO<'a> {
-    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
-        let request_number = self.messages_pushed.fetch_add(1, Ordering::SeqCst) + 1;
+    fn request_creation(&self, request: CreateDatabases) -> Result<(), IOError> {
+        for index in 0..request.amount {
+            let request_number = self.messages_pushed.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let result = if self.fail && request_number == self.operations_before_fail {
-            Err(PostgresDDLClientError::NonRecoverableError("injected creation failure".into()))
-        } else {
-            Ok(ReadString::from(self.database_progression_name.generate_database_name()))
-        };
+            let result = if self.fail && request_number == self.operations_before_fail {
+                Err(PostgresDDLClientError::OperationFailed("injected creation failure".into()))
+            } else {
+                Ok(ReadString::from(self.database_progression_name.generate_database_name()))
+            };
 
-        self.send_message(EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CreationFinished {
-            database_id: request.database_id,
-            result,
-        }))
+            self.send_message(EngineMessage::DatabaseWorker(
+                DatabaseWorkerMessages::CreationFinished {
+                    database_id: request.database_id(index),
+                    result,
+                },
+            ))?;
+        }
+        Ok(())
     }
 
     fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError> {
@@ -183,6 +188,16 @@ impl PostgresConnection {
 }
 
 impl PostgresClient for PostgresConnection {
+    async fn create_databases(
+        &self,
+        amount: usize,
+        mut on_finished: impl FnMut(usize, Result<ReadString, PostgresDDLClientError>) + Send,
+    ) {
+        for index in 0..amount {
+            on_finished(index, self.create_database().await);
+        }
+    }
+
     async fn create_database(&self) -> Result<ReadString, PostgresDDLClientError> {
         let database_name = self.template_database_name.generate_database_name();
         Ok(ReadString::from(database_name))
@@ -192,8 +207,14 @@ impl PostgresClient for PostgresConnection {
         Ok(())
     }
 
-    async fn drop_templates_like(&self) -> Result<(), PostgresDDLClientError> {
-        Ok(())
+    async fn drop_databases(
+        &self,
+        database_names: &[ReadString],
+        mut on_finished: impl FnMut(usize, Result<(), PostgresDDLClientError>) + Send,
+    ) {
+        for index in 0..database_names.len() {
+            on_finished(index, Ok(()));
+        }
     }
 }
 
@@ -223,8 +244,6 @@ impl EngineSimulator {
         );
         let config = PostgresConfig::default();
         let manager = Arc::from(PostgresConnection::start(config));
-
-        let _ = manager.drop_templates_like().await;
 
         let inbox_buffer: Arc<std::sync::Mutex<VecDeque<EngineMessage<ConsumerWorker>>>> =
             Arc::from(Mutex::new(VecDeque::new()));
@@ -261,8 +280,6 @@ impl EngineSimulator {
     ) -> Result<EngineOutcome, IOError> {
         let config = PostgresConfig::default();
         let manager = Arc::from(PostgresConnection::start(config));
-
-        let _ = manager.drop_templates_like().await;
 
         let inbox_buffer: Arc<std::sync::Mutex<VecDeque<EngineMessage<ConsumerWorker>>>> =
             Arc::from(Mutex::new(VecDeque::new()));
@@ -315,19 +332,24 @@ impl ScriptedWorkerIO {
 }
 
 impl EngineIO<ConsumerWorker> for ScriptedWorkerIO {
-    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
+    fn request_creation(&self, request: CreateDatabases) -> Result<(), IOError> {
         self.script
             .lock()
             .unwrap()
             .pop_front()
             .expect("request_creation called more times than scripted")?;
 
-        let database_name = ReadString::from(format!("grow_{}", request.database_id.0));
+        for index in 0..request.amount {
+            let database_name = ReadString::from(format!("grow_{}", request.database_id(index).0));
 
-        self.send_message(EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CreationFinished {
-            database_id: request.database_id,
-            result: Ok(database_name),
-        }))
+            self.send_message(EngineMessage::DatabaseWorker(
+                DatabaseWorkerMessages::CreationFinished {
+                    database_id: request.database_id(index),
+                    result: Ok(database_name),
+                },
+            ))?;
+        }
+        Ok(())
     }
 
     fn request_cleanup(&self, request: CleanupDatabase) -> Result<(), IOError> {

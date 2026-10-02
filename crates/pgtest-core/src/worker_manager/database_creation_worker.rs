@@ -6,7 +6,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     worker_engine::{
-        database_jobs::{CreateDatabase, DatabaseWorkerMessages},
+        database_jobs::{CreateDatabases, DatabaseWorkerMessages},
         messages::EngineMessage,
         traits::PostgresClient,
     },
@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub(super) struct DatabaseCreationWorker<P = PostgresManager> {
-    inbox_rx: UnboundedReceiver<CreateDatabase>,
+    inbox_rx: UnboundedReceiver<CreateDatabases>,
     engine_tx: UnboundedSender<EngineMessage<ConsumerWorker>>,
     tracker: TaskTracker,
     shutdown: CancellationToken,
@@ -27,7 +27,7 @@ impl<P: PostgresClient + Send + Sync + 'static> DatabaseCreationWorker<P> {
         tracker: TaskTracker,
         cancel_token: CancellationToken,
         postgres_manager: Arc<P>,
-        inbox_rx: UnboundedReceiver<CreateDatabase>,
+        inbox_rx: UnboundedReceiver<CreateDatabases>,
     ) -> Self {
         Self { engine_tx, tracker, shutdown: cancel_token, postgres_manager, inbox_rx }
     }
@@ -47,32 +47,35 @@ impl<P: PostgresClient + Send + Sync + 'static> DatabaseCreationWorker<P> {
                 }
             };
 
+            if request.amount == 0 {
+                continue;
+            }
+
             let postgres_manager = self.postgres_manager.clone();
             let engine_tx = self.engine_tx.clone();
             let shutdown = self.shutdown.clone();
 
             self.tracker.spawn(async move {
-                let database_id = request.database_id;
-
-                let result = tokio::select! {
+                let on_finished =
+                    |index, result| {
+                        if shutdown.is_cancelled() {
+                            return;
+                        }
+                        let database_id = request.database_id(index);
+                        let message = EngineMessage::DatabaseWorker(
+                            DatabaseWorkerMessages::CreationFinished { database_id, result },
+                        );
+                        if engine_tx.send(message).is_err() {
+                            tracing::warn!(
+                                ?database_id,
+                                "unable to deliver creation result: engine inbox closed"
+                            );
+                        }
+                    };
+                tokio::select! {
                     biased;
-
-                    _ = shutdown.cancelled() => return,
-
-                    result = postgres_manager.create_database() => result,
-                };
-
-                let message =
-                    EngineMessage::DatabaseWorker(DatabaseWorkerMessages::CreationFinished {
-                        database_id,
-                        result,
-                    });
-
-                if engine_tx.send(message).is_err() {
-                    tracing::warn!(
-                        ?database_id,
-                        "unable to deliver creation result: engine inbox closed"
-                    );
+                    _ = shutdown.cancelled() => {},
+                    () = postgres_manager.create_databases(request.amount, on_finished) => {},
                 }
             });
         }

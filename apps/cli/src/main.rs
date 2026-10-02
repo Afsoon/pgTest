@@ -26,7 +26,8 @@ fn main() -> Result<()> {
             .with_filter(filter),
     );
     #[cfg(feature = "hotpath")]
-    let subscriber = subscriber.with(hotpath::sqlx_tracing_layer());
+    // The tokio-postgres adapter emits the SQL completion schema this layer consumes.
+    let subscriber = subscriber.with(pgtest_database_operations::sql_tracing_layer());
     subscriber.init();
     run(options)
 }

@@ -6,7 +6,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::worker_engine::{
     core::LeaseId,
-    database_jobs::{CleanupDatabase, CreateDatabase},
+    database_jobs::{CleanupDatabase, CreateDatabases},
     errors::IOError,
     messages::{ConsumerReply, EngineMessage},
     traits::{ConsumerIO, EngineIO, EngineInbox},
@@ -98,15 +98,15 @@ impl ConsumerIO for ConsumerWorker {
 }
 
 pub struct DatabaseWorkerSenders {
-    pub creation_tx: UnboundedSender<CreateDatabase>,
+    pub creation_tx: UnboundedSender<CreateDatabases>,
     pub cleanup_tx: UnboundedSender<CleanupDatabase>,
 }
 
 impl DatabaseWorkerSenders {
     pub fn init_database_worker_channels()
-    -> (Self, UnboundedReceiver<CreateDatabase>, UnboundedReceiver<CleanupDatabase>) {
+    -> (Self, UnboundedReceiver<CreateDatabases>, UnboundedReceiver<CleanupDatabase>) {
         let (creation_tx, creation_rx) = hotpath::channel!(
-            tokio::sync::mpsc::unbounded_channel::<CreateDatabase>(),
+            tokio::sync::mpsc::unbounded_channel::<CreateDatabases>(),
             label = "database-creation"
         );
 
@@ -155,7 +155,7 @@ impl WorkerEngineIO {
 }
 
 impl EngineIO<ConsumerWorker> for WorkerEngineIO {
-    fn request_creation(&self, request: CreateDatabase) -> Result<(), IOError> {
+    fn request_creation(&self, request: CreateDatabases) -> Result<(), IOError> {
         let Err(error) = self.database_worker_senders.creation_tx.send(request) else {
             return Ok(());
         };

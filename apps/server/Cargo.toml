@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 mimalloc = "0.1.52"
-hotpath = { workspace = true, features = ["sqlx"] }
+hotpath = { workspace = true }
 anyhow = { workspace = true }
 envconfig = { workspace = true }
 tokio = { workspace = true }

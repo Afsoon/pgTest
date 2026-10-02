@@ -5,9 +5,22 @@ use crate::worker_engine::errors::PostgresDDLClientError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DatabaseId(pub u64);
 
-#[derive(Debug)]
-pub struct CreateDatabase {
-    pub database_id: DatabaseId,
+#[derive(Debug, Clone, Copy)]
+pub struct CreateDatabases {
+    pub first_database_id: DatabaseId,
+    pub amount: usize,
+}
+
+impl CreateDatabases {
+    pub fn database_id(&self, index: usize) -> DatabaseId {
+        assert!(index < self.amount, "creation index outside reserved batch");
+        DatabaseId(
+            self.first_database_id
+                .0
+                .checked_add(u64::try_from(index).expect("database identity exhausted"))
+                .expect("database identity exhausted"),
+        )
+    }
 }
 
 #[derive(Debug)]

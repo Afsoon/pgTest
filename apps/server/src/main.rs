@@ -35,10 +35,10 @@ async fn main() -> Result<()> {
     let subscriber = tracing_subscriber::registry()
         // Filter console logs separately so SQL query events reach the profiler.
         .with(tracing_subscriber::fmt::layer().with_filter(log_filter));
-    // Even an identity layer would enable events rejected by the console
-    // filter.
+    // The tokio-postgres adapter emits the SQL completion schema this layer
+    // consumes.
     #[cfg(feature = "hotpath")]
-    let subscriber = subscriber.with(hotpath::sqlx_tracing_layer());
+    let subscriber = subscriber.with(pgtest_database_operations::sql_tracing_layer());
     subscriber.init();
     hotpath::tokio_runtime!();
 

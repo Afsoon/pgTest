@@ -50,8 +50,14 @@ pub enum ConsumerIOError {
 
 #[derive(Error, Debug)]
 pub enum PostgresDDLClientError {
-    #[error("an unexpected error happened trying to {0}")]
-    NonRecoverableError(String),
-    #[error("unable to {operation} after {retries}")]
-    OperationNotExecutedAfterCertainRetries { operation: String, retries: usize },
+    #[error("{0}")]
+    OperationFailed(String),
+}
+
+impl From<pgtest_database_operations::manager::errors::PostgresOperationsError>
+    for PostgresDDLClientError
+{
+    fn from(error: pgtest_database_operations::manager::errors::PostgresOperationsError) -> Self {
+        Self::OperationFailed(error.to_string())
+    }
 }
