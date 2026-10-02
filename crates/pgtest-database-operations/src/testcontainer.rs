@@ -10,12 +10,12 @@ use std::{
     },
 };
 
-use sqlx::{Connection, PgConnection, postgres::PgConnectOptions};
 use testcontainers::{
     Container, CopyDataSource, CopyToContainer, Image, ImageExt,
     core::{ContainerPort, WaitFor},
     runners::SyncRunner,
 };
+use tokio_postgres::{Config, NoTls};
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::manager::{config::PostgresConfig, database_name::PostgresDatabaseName};
@@ -215,23 +215,29 @@ pub async fn pg_container_config() -> PostgresConfig {
     let id = NEXT_TEMPLATE_ID.fetch_add(1, Ordering::Relaxed);
 
     config.pgtest_pg_database = format!("pgt{id:016x}");
-    let options = PgConnectOptions::new()
+    let (client, connection) = Config::new()
         .host(&config.pgtest_pg_host)
         .port(config.pgtest_pg_port)
-        .username(&config.pgtest_pg_user)
+        .user(&config.pgtest_pg_user)
         .password("postgres")
-        .database("postgres");
-    let mut connection =
-        PgConnection::connect_with(&options).await.expect("connect to the shared test container");
+        .dbname("postgres")
+        .connect(NoTls)
+        .await
+        .expect("connect to the shared test container");
+    let connection_task = tokio::spawn(connection);
     let template = PostgresDatabaseName::quote_ident(&config.pgtest_pg_database);
-    sqlx::QueryBuilder::<sqlx::Postgres>::new(format!(
-        "CREATE DATABASE {template} TEMPLATE pgtest STRATEGY=FILE_COPY"
-    ))
-    .build()
-    .execute(&mut connection)
-    .await
-    .expect("create an isolated test template");
+    client
+        .execute_typed(
+            &format!("CREATE DATABASE {template} TEMPLATE pgtest STRATEGY=FILE_COPY"),
+            &[],
+        )
+        .await
+        .expect("create an isolated test template");
 
-    connection.close().await.expect("close the template creation connection");
+    drop(client);
+    connection_task
+        .await
+        .expect("join the template connection driver")
+        .expect("close the template creation connection");
     config
 }
